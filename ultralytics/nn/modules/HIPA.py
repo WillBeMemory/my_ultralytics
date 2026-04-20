@@ -103,7 +103,7 @@ class HIPABlock(nn.Module):
         pad_h = (grid_size - H % grid_size) % grid_size
         pad_w = (grid_size - W % grid_size) % grid_size
         if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, pad_w, 0, pad_h), mode='constant', value=0.0)
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
         H_pad, W_pad = H + pad_h, W + pad_w
         kernel_h = H_pad // grid_size
         kernel_w = W_pad // grid_size
