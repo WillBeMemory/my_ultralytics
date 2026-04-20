@@ -1,0 +1,7 @@
+names:
+  0: ship
+nc: 1
+path: D:\Study\PostGraduate\YOLO\datasets\SSDD
+train: images/train
+val: images/val
+test: images/val

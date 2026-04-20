@@ -1,0 +1,33 @@
+names:
+  0: ship_100000013
+  1: ship_100000001
+  2: ship_100000009
+  3: ship_100000019
+  4: ship_100000020
+  5: ship_100000007
+  6: ship_100000011
+  7: ship_100000025
+  8: ship_100000022
+  9: ship_100000003
+  10: ship_100000005
+  11: ship_100000006
+  12: ship_100000018
+  13: ship_100000010
+  14: ship_100000030
+  15: ship_100000026
+  16: ship_100000024
+  17: ship_100000016
+  18: ship_100000008
+  19: ship_100000027
+  20: ship_100000015
+  21: ship_100000028
+  22: ship_100000029
+  23: ship_100000004
+  24: ship_100000032
+  25: ship_100000002
+  26: ship_100000017
+  27: ship_100000012
+nc: 28
+path: D:\Study\PostGraduate\YOLOv11\datasets\HRSC2016_YOLO
+train: images/train
+val: images/val

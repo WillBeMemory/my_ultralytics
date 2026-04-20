@@ -1,0 +1,7 @@
+names:
+  0: ship
+nc: 1
+path: D:\Study\10_dataset\HRSID_RBOX_CPLX73
+train: images/train
+val: images/val
+test: images/val

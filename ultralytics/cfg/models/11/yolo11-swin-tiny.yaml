@@ -1,0 +1,42 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# YOLO11 object detection model with Swin-Tiny backbone (最终修正版)
+
+nc: 80  # 修改为你的类别数
+scales:
+  # 使用固定尺度，宽度系数为1.0，不进行缩放
+  l: [1.00, 1.00, 1024]
+
+# Backbone
+backbone:
+  # SwinTransformer: patch_size, embed_dim, depths, num_heads, window_size, out_indices
+  - [-1, 1, SwinTransformer, [4, 96, [2,2,6,2], [3,6,12,24], 7, [1,2,3]]]  # 0
+
+  # 拆分为独立输出（P3, P4, P5）
+  - [0, 1, Split, [0]]  # 1 -> P3 (stride 8, channels=192)
+  - [0, 1, Split, [1]]  # 2 -> P4 (stride 16, channels=384)
+  - [0, 1, Split, [2]]  # 3 -> P5 (stride 32, channels=768)
+
+# Head
+head:
+  # 上采样 P5 (层3) 与 P4 (层2) 融合
+  - [3, 1, nn.Upsample, [None, 2, "nearest"]]  # 4
+  - [[2, 4], 1, Concat, [1]]  # 5 (384+768=1152)
+  - [-1, 2, C3k2, [512, False]]  # 6  # 输入1152，输出512
+
+  # 上采样融合后的特征与 P3 (层1) 融合
+  - [6, 1, nn.Upsample, [None, 2, "nearest"]]  # 7
+  - [[1, 7], 1, Concat, [1]]  # 8 (192+512=704)
+  - [-1, 2, C3k2, [256, False]]  # 9  # 输入704，输出256
+
+  # 下采样构建 P4
+  - [9, 1, Conv, [256, 3, 2]]  # 10
+  - [[6, 10], 1, Concat, [1]]  # 11 (512+256=768)
+  - [-1, 2, C3k2, [512, False]]  # 12  # 输入768，输出512
+
+  # 下采样构建 P5
+  - [12, 1, Conv, [512, 3, 2]]  # 13
+  - [[3, 13], 1, Concat, [1]]  # 14 (768+512=1280)
+  - [-1, 2, C3k2, [1024, True]]  # 15  # 输入1280，输出1024
+
+  # 检测头
+  - [[9, 12, 15], 1, Detect, [nc]]
