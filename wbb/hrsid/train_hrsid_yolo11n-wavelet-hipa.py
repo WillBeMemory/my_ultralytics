@@ -81,7 +81,7 @@ def train_model():
             lr0=0.01,  # 初始学习率
             weight_decay=0.0005,
             warmup_epochs=3.0,
-            patience=20,  # 早停耐心值
+            patience=0,  # 早停耐心值
             save=True,
             exist_ok=True,  # 覆盖现有训练结果
             verbose=True,
