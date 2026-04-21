@@ -9,6 +9,7 @@ from ultralytics import YOLO
 # model = YOLO('yolo11n-moe-v7.yaml').model
 # model = YOLO('yolo11n-wtconv-ternary-hipa.yaml').model
 model = YOLO('yolo11n-wavelet-hipa.yaml').model
+model = YOLO('yolo11n-wavelet-hipa-dswtg.yaml').model
 # model = YOLO('yolo11n-dwwtconv-dyhead.yaml').model
 # model = YOLO('yolo11n.yaml').model
 model.eval()

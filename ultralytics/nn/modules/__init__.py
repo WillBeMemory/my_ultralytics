@@ -55,6 +55,7 @@ from ultralytics.nn.modules.WTGatedC3k2 import WTGatedC3k2
 from ultralytics.nn.modules.HIPA import HIPA
 from ultralytics.nn.modules.HIPAV2 import HIPAV2
 from ultralytics.nn.modules.WaveletStem import WaveletStem
+from ultralytics.nn.modules.DSWT_GhostConv import DSWT_GhostConv
 
 
 from .block import (

@@ -1,0 +1,15 @@
+name: pycharm
+channels:
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+  - https://repo.anaconda.com/pkgs/msys2
+dependencies:
+  - pytorch
+  - pytorch-cuda=11.8
+  - torchvision
+  - ultralytics
+  - lxml
+  - tqdm
+  - scikit-learn
+  - pywavelets
+prefix: D:\CustomInstall\miniconda\envs\pycharm
