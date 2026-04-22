@@ -42,7 +42,7 @@ from ultralytics.nn.modules.DyUpsample import DySample
 from ultralytics.nn.modules.MoE import MoEBlock,AttMoE,ConvMoE
 from ultralytics.nn.modules.DySPPF import DynamicSPPF
 from ultralytics.nn.modules.RFAConv import RFAConv
-from ultralytics.nn.modules.DPConv import DPConv,DPConvBlock
+from ultralytics.nn.modules.DPConv import DPConv
 from ultralytics.nn.modules.TernaryDPConv import TernaryDPConv
 from ultralytics.nn.modules.SmartAreaAttention import SmartAreaAttention
 from ultralytics.nn.modules.SaveFirstImage import SaveFirstImage
@@ -56,6 +56,7 @@ from ultralytics.nn.modules.HIPA import HIPA
 from ultralytics.nn.modules.HIPAV2 import HIPAV2
 from ultralytics.nn.modules.WaveletStem import WaveletStem
 from ultralytics.nn.modules.DSWT_GhostConv import DSWT_GhostConv
+from ultralytics.nn.modules.DynamicC3k2 import DynamicC3k2
 
 
 from .block import (

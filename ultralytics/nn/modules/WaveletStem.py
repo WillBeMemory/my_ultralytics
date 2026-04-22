@@ -134,7 +134,7 @@ class WaveletStem(nn.Module):
             x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
 
         # 第一次小波分解
-        x = wavelet_decompose(x, self.dec_filters_1)  # (B, 12, H/2, W/2)
+        x = wavelet_decompose(x, self.dec_filters_1)  # (B,             12, H/2, W/2)
 
         # 重塑为 (B, C, 4, H/2, W/2) 以便子带处理
         B, C4, H2, W2 = x.shape

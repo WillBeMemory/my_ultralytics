@@ -24,7 +24,7 @@ if __name__ == '__main__':
     results = model.val(
         data=data_yaml,
         split='test', #使用测试集合验证数据A
-        # imgsz=imgsz,
+        imgsz=imgsz,
         # batch=batch,
         # conf=conf,
         # iou=iou,
