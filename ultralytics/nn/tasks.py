@@ -53,6 +53,8 @@ from ultralytics.nn.modules.WaveletStem import WaveletStem
 from ultralytics.nn.modules.DSWT_GhostConv import DSWT_GhostConv
 from ultralytics.nn.modules.DynamicC3k2 import DynamicC3k2
 from ultralytics.nn.modules.CARAFE import CARAFE
+from ultralytics.nn.modules.BiFPN import BiFPN
+from ultralytics.nn.modules.SplitList import SplitList
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1658,6 +1660,8 @@ def parse_model(d, ch, verbose=True):
             WaveletStem,
             DSWT_GhostConv,
             DynamicC3k2,
+            SplitList,
+
 
             Classify,
             Conv,
@@ -1800,6 +1804,18 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is BiFPN:
+            raw_channels = args[0]  # [256, 512, 1024]
+            scaled_channels = [make_divisible(min(ch, max_channels) * width, 8) for ch in raw_channels]
+            args = [scaled_channels]  # 只传缩放后的列表
+            c2 = scaled_channels[0]  # 框架占位
+        # elif m is SplitList:
+        #     # SplitList 参数 [index, raw_out_channels]
+        #     # 对通道参数应用缩放，确保与 BiFPN 输出一致
+        #     idx, raw_ch = args[0], args[1]
+        #     scaled_ch = make_divisible(min(raw_ch, max_channels) * width, 8)
+        #     args[1] = scaled_ch
+        #     c2 = scaled_ch
         elif m is AdaptiveResidualFusion:
             # AdaptiveResidualFusion 的参数顺序: [target_channels, p2_channels, compress_channels(可选)]
             # 对通道参数应用缩放
