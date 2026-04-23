@@ -23,17 +23,19 @@ backbone:
   - [-1, 2, C3k2, [512, False]]
   - [-1, 1, Conv, [512, 3, 2]] # 4-P4/16
   - [-1, 2, C3k2, [512, True]]
-  - [-1, 1, HIPA, [512, 5, 0.5,[],8, True, 16, 'center', True, 'l2']] # 6
-  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
+  - [-1, 1, Conv, [1024, 3, 2]] # 6-P5/32
   - [-1, 2, C3k2, [1024, True]]
-  - [ -1, 1, nn.Identity, [ ] ]
+  - [-1, 1, nn.Identity, [] ]
+  - [-1, 1, nn.Identity, [] ]
   - [-1, 1, HIPA, [1024, 4, 0.25,[],8, True, 16, 'center', True, 'l2']] # 10
 
 # YOLO11n head
 head:
-  - [[3, 6, 10], 1, BiFPN, [[512, 512, 1024]]]  # 输入来自 Backbone P5, P4, P3
-  - [11, 1, SplitList, [256,0]]
-  - [11, 1, SplitList, [512,1]]
-  - [11, 1, SplitList, [1024,2]]
-  - [[12, 13 ,14], 1, Detect, [nc]] # Detect(P3, P4, P5)
+  - [[3, 5, 10], 1, BiFPN, [[512, 512, 1024]]]  # 输入来自 Backbone P5, P4, P3
+  - [11, 1, SplitList, [256,0]] #12
+  - [11, 1, SplitList, [512,1]] #13
+  - [11, 1, SplitList, [1024,2]] #14
+  - [12, 1, HIPA, [256, 4, 0.25,[],8, True, 16, 'center', True, 'l2']] # 15
+  - [13, 1, HIPA, [512, 4, 0.25,[],8, True, 16, 'center', True, 'l2']] # 16
+  - [[15, 16 ,14], 1, Detect, [nc]] # Detect(P3, P4, P5)
 
