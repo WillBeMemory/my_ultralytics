@@ -79,10 +79,12 @@ class HIPABlock(nn.Module):
         self.importance_mode = importance_mode
 
         # 处理 keep_ratios 参数
-        if keep_ratios is not None:
-            assert len(keep_ratios) == num_levels
+        if keep_ratios is not None and len(keep_ratios) > 0:
+            assert len(keep_ratios) == num_levels, \
+                f"keep_ratios length {len(keep_ratios)} != num_levels {num_levels}"
             self.keep_ratios = keep_ratios
         else:
+            # 未提供分层比例，或传入空列表时，所有层使用相同的 keep_ratio
             self.keep_ratios = [keep_ratio] * num_levels
 
         # 处理 min_keeps 参数
