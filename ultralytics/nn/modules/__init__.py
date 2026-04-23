@@ -57,6 +57,7 @@ from ultralytics.nn.modules.HIPAV2 import HIPAV2
 from ultralytics.nn.modules.WaveletStem import WaveletStem
 from ultralytics.nn.modules.DSWT_GhostConv import DSWT_GhostConv
 from ultralytics.nn.modules.DynamicC3k2 import DynamicC3k2
+from ultralytics.nn.modules.CARAFE import CARAFE
 
 
 from .block import (
