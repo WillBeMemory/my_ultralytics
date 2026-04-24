@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ultralytics.nn.modules.GSConv import GSConv
 from ultralytics.nn.modules.block import Conv
 
 class BiFPN_Add(nn.Module):
@@ -38,11 +40,11 @@ class BiFPN(nn.Module):
         self.p4_boost = nn.Parameter(torch.tensor(p4_boost_init, dtype=torch.float32))
 
         # ---- 通道投影 ----
-        self.p3_proj = nn.Conv2d(c3, o3, 1, bias=False)
-        self.p5_to_p4 = nn.Conv2d(c5, o4, 1, bias=False)
-        self.p4_to_p3 = nn.Conv2d(o4, o3, 1, bias=False)
-        self.p3_to_p4 = nn.Conv2d(o3, o4, 1, bias=False)
-        self.p4_to_p5 = nn.Conv2d(o4, o5, 1, bias=False)
+        self.p3_proj =  GSConv(c3, o3, 3,)
+        self.p5_to_p4 = GSConv(c5, o4, 3,)
+        self.p4_to_p3 = GSConv(o4, o3, 3,)
+        self.p3_to_p4 = GSConv(o3, o4, 3,)
+        self.p4_to_p5 = GSConv(o4, o5, 3,)
 
         # ---- 加权融合节点（P4分支初始权重更高） ----
         self.p4_td_fuse = BiFPN_Add(2, init_weights=[1.5, 1.0])  # [P4权重, P5_up权重]

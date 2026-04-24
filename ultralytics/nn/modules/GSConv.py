@@ -5,7 +5,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ultralytics.nn.modules import Conv
+from ultralytics.nn.modules.block import Conv
 
 
 class ChannelShuffle(nn.Module):
