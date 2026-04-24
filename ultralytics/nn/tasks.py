@@ -55,6 +55,7 @@ from ultralytics.nn.modules.DynamicC3k2 import DynamicC3k2
 from ultralytics.nn.modules.CARAFE import CARAFE
 from ultralytics.nn.modules.BiFPN import BiFPN
 from ultralytics.nn.modules.SplitList import SplitList
+from ultralytics.nn.modules.CCFPN import CCFPN
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1804,7 +1805,10 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m is BiFPN:
+        elif m in (
+            BiFPN,
+            CCFPN
+        ):
             raw_channels = args[0]  # [256, 512, 1024]
             scaled_channels = [make_divisible(min(ch, max_channels) * width, 8) for ch in raw_channels]
             args = [scaled_channels]  # 只传缩放后的列表

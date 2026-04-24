@@ -60,6 +60,7 @@ from ultralytics.nn.modules.DynamicC3k2 import DynamicC3k2
 from ultralytics.nn.modules.CARAFE import CARAFE
 from ultralytics.nn.modules.BiFPN import BiFPN
 from ultralytics.nn.modules.SplitList import SplitList
+from ultralytics.nn.modules.CCFPN import CCFPN
 
 
 from .block import (

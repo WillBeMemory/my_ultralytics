@@ -31,7 +31,7 @@ backbone:
 
 # YOLO11n head
 head:
-  - [[3, 5, 10], 1, BiFPN, [[512, 512, 1024]]]  # 输入来自 Backbone P5, P4, P3
+  - [[3, 5, 10], 1, CCFPN, [[512, 512, 1024]]]  # 输入来自 Backbone P5, P4, P3
   - [11, 1, SplitList, [256,0]] #12
   - [11, 1, SplitList, [512,1]] #13
   - [11, 1, SplitList, [1024,2]] #14
