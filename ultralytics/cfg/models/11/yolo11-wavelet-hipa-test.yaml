@@ -35,7 +35,5 @@ head:
   - [11, 1, SplitList, [256,0]] #12
   - [11, 1, SplitList, [512,1]] #13
   - [11, 1, SplitList, [1024,2]] #14
-  - [12, 1, HIPA, [256, 4, 0.25,[],8, True, 16, 'center', True, 'l2']] # 15
-  - [13, 1, HIPA, [512, 4, 0.25,[],8, True, 16, 'center', True, 'l2']] # 16
-  - [[15, 16 ,14], 1, Detect, [nc]] # Detect(P3, P4, P5)
+  - [[12, 13 ,14], 1, Detect, [nc]] # Detect(P3, P4, P5)
 
