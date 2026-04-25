@@ -1,62 +1,80 @@
-
-import torch
-import torch.nn as nn
-
+# ============================================
+# File: ultralytics/nn/modules/HWD.py
+# 功能：小波无损下采样模块 (HWD)
+# 使用：在 backbone 中替换 stride=2 的 Conv 层
+# ============================================
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-_all_ = ['HWD']
+
+class HaarDownsampling(nn.Module):
+    """Haar 小波分解下采样（无参数）"""
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.in_channels = in_channels
+
+        # 四个子带滤波器，每个形状 (2, 2)
+        w_ll = torch.tensor([[1., 1.],
+                             [1., 1.]]) / 2.0
+        w_lh = torch.tensor([[1., -1.],
+                             [1., -1.]]) / 2.0
+        w_hl = torch.tensor([[1., 1.],
+                             [-1., -1.]]) / 2.0
+        w_hh = torch.tensor([[1., -1.],
+                             [-1., 1.]]) / 2.0
+
+        # 堆叠并添加通道维度 → (4, 1, 2, 2)
+        filters = torch.stack([w_ll, w_lh, w_hl, w_hh], dim=0).unsqueeze(1)
+
+        # 为每个输入通道复制 → (4 * in_channels, 1, 2, 2)
+        self.register_buffer('haar_filter', filters.repeat(in_channels, 1, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # groups=in_channels: 每个输入通道单独滤波，输出 4 个通道
+        return F.conv2d(x, self.haar_filter, stride=2, groups=self.in_channels)
+
 
 class HWD(nn.Module):
-    def __init__(self, c1, c2):
-        # print(f"HWD __init__ called with: c1={c1}, c2={c2}, args={args}, kwargs={kwargs}")
+    """小波下采样模块 (Haar + 1x1 压缩)"""
+    def __init__(self, c1: int, c2: int, act: bool = True):
         super().__init__()
-        self.c1 = c1
-        self.c2 = c2
-        wavelet_kernels = torch.tensor([
-            [[[1, 1], [1, 1]]],
-            [[[1, 1], [-1, -1]]],
-            [[[1, -1], [1, -1]]],
-            [[[1, -1], [-1, 1]]]
-        ], dtype=torch.float32) / 2.0
-        self.register_buffer('weight', wavelet_kernels.repeat(c1, 1, 1, 1))
-        self.conv = nn.Conv2d(4 * c1, c2, 1, bias=False)
+        self.haar_down = HaarDownsampling(c1)
+        self.conv = nn.Conv2d(c1 * 4, c2, kernel_size=1, bias=False)
         self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.SiLU(inplace=True)
+        self.act = nn.SiLU(inplace=True) if act else nn.Identity()
 
-    def forward(self, x):
-        B, C, H, W = x.shape
-        # 可选断言
-        # assert C == self.c1, f"Input channels {C} != expected {self.c1}"
-        x_wavelet = F.conv2d(x, self.weight, stride=2, groups=self.c1)
-        out = self.conv(x_wavelet)
-        out = self.bn(out)
-        out = self.act(out)
-        return out
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.haar_down(x)      # (B, 4*C, H/2, W/2)
+        x = self.conv(x)
+        x = self.bn(x)
+        return self.act(x)
 
-# class HWD(nn.Module):
-#     def __init__(self, in_ch, out_ch):
-#         super(HWD, self).__init__()
-#         self.wt = DWTForward(J=1, mode='zero', wave='haar')
-#         self.conv_bn_relu = nn.Sequential(
-#             nn.Conv2d(in_ch * 4, out_ch, kernel_size=1, stride=1),
-#             nn.BatchNorm2d(out_ch),
-#             nn.ReLU(inplace=True),
-#         )
-#
-#     def forward(self, x):
-#         yL, yH = self.wt(x)
-#         y_HL = yH[0][:, :, 0, ::]
-#         y_LH = yH[0][:, :, 1, ::]
-#         y_HH = yH[0][:, :, 2, ::]
-#         x = torch.cat([yL, y_HL, y_LH, y_HH], dim=1)
-#         x = self.conv_bn_relu(x)
-#         return x
+# ============================================
+# 测试代码
+# ============================================
+if __name__ == "__main__":
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# 输入 B C H W,  输出 B C H W
-if __name__ == '__main__':
-    block = HWD(64, 64)  # 输入通道数，输出通道数
-    input = torch.rand(3, 64, 64, 64)
-    output = block(input)
-    print(output.size())
+    # 模拟 YOLO11n P4 特征 (C=128, 40x40)
+    x = torch.randn(2, 128, 40, 40).to(device)
+
+    # 标准下采样对比
+    conv_standard = nn.Conv2d(128, 256, 3, stride=2, padding=1, bias=False).to(device)
+    hwd = HWD(128, 256).to(device)
+
+    out_conv = conv_standard(x)
+    out_hwd = hwd(x)
+
+    print("=== 输出形状对比 ===")
+    print(f"标准 Conv: {out_conv.shape}")  # [2, 256, 20, 20]
+    print(f"HWD      : {out_hwd.shape}")   # [2, 256, 20, 20]
+
+    # 参数量对比
+    def count_params(module):
+        return sum(p.numel() for p in module.parameters())
+
+    print("\n=== 参数量对比 ===")
+    print(f"标准 Conv: {count_params(conv_standard):,}")
+    print(f"HWD      : {count_params(hwd):,}")
+    print(f"HWD 参数量仅为标准卷积的 {count_params(hwd)/count_params(conv_standard)*100:.1f}%")
