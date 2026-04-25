@@ -18,51 +18,45 @@ import torch.nn.functional as F
 
 class SparseSelfAttention(nn.Module):
     """
-    稀疏自注意力模块（QK-LayerNorm 变体）。
-
-    对 Q 和 K 分别使用 LayerNorm 进行归一化，保持注意力的区分度，
-    同时避免 FP16 溢出。该变体通常优于余弦归一化，精度损失极小。
+    稀疏自注意力模块（余弦注意力变体）。
+    通过对 Q 和 K 进行 L2 归一化，将点积值域限制在 [-1, 1]，彻底杜绝 FP16 溢出。
+    无任何裁剪，完整保留特征信息。
     """
 
     def __init__(self, embed_dim: int, num_heads: int = 8, dropout: float = 0.0):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim ** -0.5  # 保留缩放，虽归一化后值域已安全
 
         self.qkv = nn.Linear(embed_dim, embed_dim * 3)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
-
-        # 新增：对 Q 和 K 的归一化层（每个头独立归一化）
-        # 也可以对整个 head_dim 维度归一化，但独立归一化更灵活
-        self.q_norm = nn.LayerNorm(self.head_dim)
-        self.k_norm = nn.LayerNorm(self.head_dim)
-
-        self.norm = nn.LayerNorm(embed_dim)  # 最终残差连接的归一化
+        self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
 
-        # 1. 生成 Q, K, V
+        # 计算 Q、K、V
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, num_heads, N, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # 每个形状: (B, num_heads, N, head_dim)
 
-        # 2. QK 归一化 (LayerNorm 沿最后一个维度，即 head_dim)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        # 核心改进：对 Q 和 K 进行 L2 归一化，点积退化为余弦相似度，值域 [-1, 1]
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
 
-        # 3. 计算注意力权重（无 L2 归一化）
+        # 计算注意力权重
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.dropout(attn)
 
-        # 4. 加权求和 & 合并多头
+        # 加权求和
         out = torch.matmul(attn, v).transpose(1, 2).reshape(B, N, C)
         out = self.out_proj(out)
 
-        # 5. 残差 + LayerNorm
-        return self.norm(x + out)
+        # 残差连接 + LayerNorm
+        x = self.norm(x + out)
+        return x
 
 
 class HIPABlock(nn.Module):

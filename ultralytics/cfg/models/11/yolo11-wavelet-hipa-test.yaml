@@ -27,7 +27,7 @@ backbone:
   - [-1, 1, nn.Identity, [ ] ]
   - [ 6, 1, HWD, [1024, ]] # 8-P5/32
   - [-1, 2, C3k2, [1024, True]]
-  - [-1, 1, HIPA, [1024, 4, 0.25,[],8, True, 16, 'conv_smooth', True, 'l2']] # 10
+  - [-1, 1, HIPA, [1024, 4, 0.25,[],8, True, 16, 'center', True, 'l2']] # 10
 
 
 # YOLO11n head
