@@ -56,6 +56,7 @@ from ultralytics.nn.modules.CARAFE import CARAFE
 from ultralytics.nn.modules.BiFPN import BiFPN
 from ultralytics.nn.modules.SplitList import SplitList
 from ultralytics.nn.modules.CCFPN import CCFPN
+from ultralytics.nn.modules.WaveletCSP import WaveletCSP
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1662,6 +1663,7 @@ def parse_model(d, ch, verbose=True):
             DSWT_GhostConv,
             DynamicC3k2,
             SplitList,
+            WaveletCSP,
 
 
             Classify,
@@ -1735,6 +1737,7 @@ def parse_model(d, ch, verbose=True):
             HIPAV2,
             DSWT_GhostConv,
             DynamicC3k2,
+            WaveletCSP,
 
             BottleneckCSP,
             C1,
