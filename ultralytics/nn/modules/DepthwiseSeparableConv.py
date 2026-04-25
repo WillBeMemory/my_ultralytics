@@ -180,7 +180,7 @@ class DepthwiseSeparableConvWithWTConv2d(nn.Module):
     """
     default_act = nn.SiLU()
 
-    def __init__(self, c1, c2, k=3, s=1, p=None, g=1, d=1, act=True, wt_depth=2):
+    def __init__(self, c1, c2, k=3, s=1, p=None, g=1, d=1, act=True, wt_depth=1):
         super().__init__()
         # 深度小波卷积（c1 -> c1，尺寸不变，除非 stride 用池化处理）
         self.depthwise = WTConv2d(c1, c1, kernel_size=k, depth=wt_depth, bias=False)
