@@ -4,6 +4,8 @@ from ultralytics import YOLO
 import os
 import torch
 
+from ultralytics.utils.CustomLoss import CustomTrainer
+
 MODEL_NAME = "yolo11n-wavelet-hipa-test.yaml"
 DATASET_PATH = "../cfg/cplx.yaml"
 
@@ -85,6 +87,7 @@ def train_model():
             save=True,
             exist_ok=True,  # 覆盖现有训练结果
             verbose=True,
+            trainer=CustomTrainer,
             # 数据增强 - 针对船舶检测优化
             # degrees=5.0,  # 较小的旋转角度（船舶方向相对固定）
             # translate=0.1,
