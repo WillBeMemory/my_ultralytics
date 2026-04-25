@@ -70,7 +70,7 @@ class HWD(nn.Module):
         loss = 0.0
         for f in hf_filters:
             f_pad = F.pad(f, (0, 30, 0, 30))    # 零填充至 32x32
-            freq = torch.fft.fft2(f_pad)
+            freq = torch.fft.fft2(f_pad.float())
             freq_mag = torch.abs(freq)
             rows, cols = freq_mag.shape
             row_axis = torch.linspace(-1, 1, rows, device=freq_mag.device)
