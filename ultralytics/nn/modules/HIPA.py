@@ -26,15 +26,23 @@ class SparseSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
+        # 1. 生成 Q, K, V
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        q = F.normalize(q, p=2, dim=-1)
-        k = F.normalize(k, p=2, dim=-1)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)
-        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # 形状均为 (B, num_heads, N, head_dim)
+
+        # 2. 使用 PyTorch 原生高效注意力计算 (自动数值稳定、FP16安全)
+        #    ‼️ 移除了之前的 L2 归一化 (F.normalize)，恢复注意力的区分度
+        #    dropout 仅在训练时生效
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            scale=self.scale  # 默认为 head_dim ** -0.5
+        )  # 输出: (B, num_heads, N, head_dim)
+
+        # 3. 合并多头并投影
+        out = out.transpose(1, 2).reshape(B, N, C)
         out = self.out_proj(out)
+        # 4. 残差 + LayerNorm
         return self.norm(x + out)
 
 
