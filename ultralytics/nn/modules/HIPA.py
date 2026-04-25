@@ -11,8 +11,19 @@ from typing import List, Tuple, Optional, Union
 __all__ = ["HIPA"]
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
 class SparseSelfAttention(nn.Module):
-    """稀疏自注意力（余弦注意力），数值稳定，杜绝 FP16 溢出"""
+    """
+    稀疏自注意力模块（QK-LayerNorm 变体）。
+
+    对 Q 和 K 分别使用 LayerNorm 进行归一化，保持注意力的区分度，
+    同时避免 FP16 溢出。该变体通常优于余弦归一化，精度损失极小。
+    """
+
     def __init__(self, embed_dim: int, num_heads: int = 8, dropout: float = 0.0):
         super().__init__()
         self.num_heads = num_heads
@@ -22,27 +33,35 @@ class SparseSelfAttention(nn.Module):
         self.qkv = nn.Linear(embed_dim, embed_dim * 3)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(embed_dim)
+
+        # 新增：对 Q 和 K 的归一化层（每个头独立归一化）
+        # 也可以对整个 head_dim 维度归一化，但独立归一化更灵活
+        self.q_norm = nn.LayerNorm(self.head_dim)
+        self.k_norm = nn.LayerNorm(self.head_dim)
+
+        self.norm = nn.LayerNorm(embed_dim)  # 最终残差连接的归一化
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
+
         # 1. 生成 Q, K, V
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # 形状均为 (B, num_heads, N, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, num_heads, N, head_dim)
 
-        # 2. 使用 PyTorch 原生高效注意力计算 (自动数值稳定、FP16安全)
-        #    ‼️ 移除了之前的 L2 归一化 (F.normalize)，恢复注意力的区分度
-        #    dropout 仅在训练时生效
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            dropout_p=self.dropout.p if self.training else 0.0,
-            scale=self.scale  # 默认为 head_dim ** -0.5
-        )  # 输出: (B, num_heads, N, head_dim)
+        # 2. QK 归一化 (LayerNorm 沿最后一个维度，即 head_dim)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
-        # 3. 合并多头并投影
-        out = out.transpose(1, 2).reshape(B, N, C)
+        # 3. 计算注意力权重（无 L2 归一化）
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+
+        # 4. 加权求和 & 合并多头
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, N, C)
         out = self.out_proj(out)
-        # 4. 残差 + LayerNorm
+
+        # 5. 残差 + LayerNorm
         return self.norm(x + out)
 
 
