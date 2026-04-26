@@ -19,13 +19,13 @@ backbone:
   # [from, repeats, module, args]
   - [-1, 1, WaveletStem, [128] ] # 0
   - [-1, 2, C3k2, [256, False,0.25]]
-  - [-1, 1, DepthwiseSeparableConvWithWTConv2d, [256,3,2]] # 2-P3/8
+  - [-1, 1, HWD, [256,]] # 2-P3/8
   - [-1, 2, C3k2, [512, False,0.25]]
   - [-1, 1, nn.Identity, [ ] ]
-  - [ 3, 1, DepthwiseSeparableConvWithWTConv2d, [512,3,2]] # 5-P4/16
+  - [ 3, 1, HWD, [512,]] # 5-P4/16
   - [-1, 2, C3k2, [512, True]]
   - [-1, 1, nn.Identity, [ ] ]
-  - [ 6, 1, DepthwiseSeparableConvWithWTConv2d, [1024,3,2]] # 8-P5/32
+  - [ 6, 1, HWD, [1024, ]] # 8-P5/32
   - [-1, 2, C3k2, [1024, True]]
   - [-1, 1, HIPA, [1024, 4, 0.25,[],8, True, 16, 'center', True, 'l2']] # 10
 
