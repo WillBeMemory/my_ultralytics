@@ -1,7 +1,7 @@
 names:
   0: ship
 nc: 1
-path: D:\Study\10_dataset\HRSID_CPLX_6535
+path: ../datasets/HRSID_CPLX_6535
 train: images/train
 val: images/val
 test: images/val
