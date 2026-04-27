@@ -1,9 +1,3 @@
-# train_hrsc.py
-import copy
-from pathlib import Path
-
-from torch.optim import AdamW
-from torch.utils.data import Subset, DataLoader
 
 from ultralytics import YOLO
 import os

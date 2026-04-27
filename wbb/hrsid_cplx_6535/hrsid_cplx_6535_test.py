@@ -6,7 +6,7 @@ from thop import profile
 from torch.utils.flop_counter import FlopCounterMode
 
 # 配置参数
-model_path = "./runs/detect/train/weights/swa_best.pt"       # 训练好的模型权重文件
+model_path = "./runs/detect/train/weights/best.pt"       # 训练好的模型权重文件
 data_yaml = "../cfg/hrsid_cplx_6535.yaml"      # 数据集配置文件（包含验证集路径）
 imgsz = 800                              # 图像大小，需与训练一致
 # batch = 16                                # 批次大小
