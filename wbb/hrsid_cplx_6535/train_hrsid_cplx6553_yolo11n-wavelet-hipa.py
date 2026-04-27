@@ -115,7 +115,7 @@ def train_model():
             momentum=0.937,  # SGD 动量
             weight_decay=0.0005,  # 权重衰减
             cos_lr=True,  # 余弦退火
-            warmup_epochs=0.0,
+            warmup_epochs=3.0,
 
 
             patience=0,  # 早停耐心值
