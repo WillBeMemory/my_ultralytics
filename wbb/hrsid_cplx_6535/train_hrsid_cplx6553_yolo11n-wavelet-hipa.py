@@ -47,31 +47,37 @@ def check_dataset(config_path):
 
     print("==========================\n")
 
+# ========== 热重启 + 平坦区域恒定学习率 配置 ==========
+restart_epoch = 150          # 热重启点
+restart_lr = 0.005           # 重启后的学习率（可调）
+hold_epochs = 10             # 重启后保持恒定学习率的轮数
+restart_end = restart_epoch + hold_epochs   # 160
 
-# 配置
-restart_epochs = [150, 250]  # 需要重启的 epoch
-restart_lr = 0.01  # 重启时的学习率
-current_restart_lr = None  # 当前使用的学习率（用于在非重启阶段恢复原值）
+constant_start = 250         # 平坦区域恒定学习率开始轮次
+constant_lr = 0.001          # 恒定学习率值（可调，通常为初始 lr0 的 1/5 ~ 1/10）
 
+# ========== 回调函数 ==========
+def on_train_epoch_start(trainer):
+    """在 epoch 开始时打印关键信息"""
+    if trainer.epoch == restart_epoch:
+        print(f"🔥 Epoch {restart_epoch}: Hot restart, LR set to {restart_lr}, "
+              f"will hold for {hold_epochs} epochs")
+    if trainer.epoch == constant_start:
+        print(f"🔥 Epoch {constant_start}: Switched to constant LR = {constant_lr} "
+              f"for flat region exploration until end of training")
 
 def on_train_batch_start(trainer):
-    global current_restart_lr
-
-    # 检查是否需要在这个 epoch 启动热重启
-    if trainer.epoch in restart_epochs:
-        # 只在第一次进入时打印
-        if current_restart_lr != restart_lr:
-            print(f"🔥 Epoch {trainer.epoch}: Learning rate forcibly restarted to {restart_lr}")
-            current_restart_lr = restart_lr
-
-        # 强制所有参数组使用重启学习率
+    """每个 batch 前强制覆盖学习率，保证最高优先级"""
+    epoch = trainer.epoch
+    # 热重启保持期：epoch 150 ~ 159
+    if restart_epoch <= epoch < restart_end:
         for pg in trainer.optimizer.param_groups:
             pg['lr'] = restart_lr
-    else:
-        # 非重启阶段：清除重启标志，让调度器正常工作
-        if current_restart_lr is not None:
-            current_restart_lr = None
-
+    # 平坦区域恒定学习率：epoch 250 ~ 299
+    elif epoch >= constant_start:
+        for pg in trainer.optimizer.param_groups:
+            pg['lr'] = constant_lr
+    # 其他时间段：不做干预，让余弦退火调度器正常工作
 
 def train_model():
     """训练 hrsid 船舶检测模型"""
@@ -90,7 +96,8 @@ def train_model():
     print("加载 YOLO 模型...")
     model = YOLO(MODEL_NAME)  # 从配置文件开始
 
-    # 之后在训练前注册该回调
+    # ========== 注册回调 ==========
+    model.add_callback("on_train_epoch_start", on_train_epoch_start)
     model.add_callback("on_train_batch_start", on_train_batch_start)
 
     # 训练配置
