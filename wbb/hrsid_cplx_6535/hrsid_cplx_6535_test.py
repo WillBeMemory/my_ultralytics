@@ -6,7 +6,7 @@ from thop import profile
 from torch.utils.flop_counter import FlopCounterMode
 
 # 配置参数
-model_path = "./runs/detect/train/weights/best.pt"       # 训练好的模型权重文件
+model_path = "./runs/detect/train/weights/swa_best.pt"       # 训练好的模型权重文件
 data_yaml = "../cfg/hrsid_cplx_6535.yaml"      # 数据集配置文件（包含验证集路径）
 imgsz = 800                              # 图像大小，需与训练一致
 # batch = 16                                # 批次大小
@@ -14,10 +14,13 @@ imgsz = 800                              # 图像大小，需与训练一致
 # iou = 0.6                                  # IoU阈值（默认0.6）
 # device = 0                                 # GPU设备（设为'cpu'使用CPU）
 
+# 兼容 PyTorch 2.6+ 的 weights_only 问题
+if hasattr(torch.serialization, 'set_default_weights_only'):
+    torch.serialization.set_default_weights_only(False)
 
 if __name__ == '__main__':
     # 加载模型
-    model = YOLO(model_path)
+    model = YOLO(model_path,)
     # print(model.model)
 
     # 运行验证
