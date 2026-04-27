@@ -55,7 +55,7 @@ def check_dataset(config_path):
 
 
 # 配置
-restart_epochs = [3, 7]  # 需要重启的 epoch
+restart_epochs = [150, 250]  # 需要重启的 epoch
 restart_lr = 0.01  # 重启时的学习率
 current_restart_lr = None  # 当前使用的学习率（用于在非重启阶段恢复原值）
 
@@ -104,7 +104,7 @@ def train_model():
     try:
         results = model.train(
             data=DATASET_PATH,
-            epochs=10,
+            epochs=300,
             imgsz=800,
             batch=16,
             workers=0,  # Windows 下设为 0 避免多进程问题
