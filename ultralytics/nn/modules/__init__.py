@@ -62,6 +62,7 @@ from ultralytics.nn.modules.BiFPN import BiFPN
 from ultralytics.nn.modules.SplitList import SplitList
 from ultralytics.nn.modules.CCFPN import CCFPN
 from ultralytics.nn.modules.WaveletCSP import WaveletCSP
+from ultralytics.nn.modules.WaveletRefine import WaveletRefine
 
 
 from .block import (

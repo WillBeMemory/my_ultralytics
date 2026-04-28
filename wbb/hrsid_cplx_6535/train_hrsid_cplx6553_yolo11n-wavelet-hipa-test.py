@@ -1,8 +1,9 @@
-# train_hrsc.py
 
 from ultralytics import YOLO
 import os
 import torch
+
+
 
 MODEL_NAME = "yolo11n-wavelet-hipa-test.yaml"
 DATASET_PATH = "../cfg/hrsid_cplx_6535.yaml"
@@ -46,18 +47,39 @@ def check_dataset(config_path):
 
     print("==========================\n")
 
+#
+# # 配置
+# restart_epochs = [150, 250]  # 需要重启的 epoch
+# restart_lr = 0.01  # 重启时的学习率
+# current_restart_lr = None  # 当前使用的学习率（用于在非重启阶段恢复原值）
+#
+#
+# def on_train_batch_start(trainer):
+#     global current_restart_lr
+#
+#     # 检查是否需要在这个 epoch 启动热重启
+#     if trainer.epoch in restart_epochs:
+#         # 只在第一次进入时打印
+#         if current_restart_lr != restart_lr:
+#             print(f"🔥 Epoch {trainer.epoch}: Learning rate forcibly restarted to {restart_lr}")
+#             current_restart_lr = restart_lr
+#
+#         # 强制所有参数组使用重启学习率
+#         for pg in trainer.optimizer.param_groups:
+#             pg['lr'] = restart_lr
+#     else:
+#         # 非重启阶段：清除重启标志，让调度器正常工作
+#         if current_restart_lr is not None:
+#             current_restart_lr = None
+
 
 def train_model():
     """训练 hrsid 船舶检测模型"""
-
     setup_environment()
-
     # 检查数据集
     check_dataset(DATASET_PATH)
-
     # 检查 CUDA
     device = 'cpu'
-
     if torch.cuda.is_available():
         device = 0
         print(f"使用 GPU: {torch.cuda.get_device_name(0)}")
@@ -67,6 +89,9 @@ def train_model():
     # 加载模型 - 从配置文件开始（不使用预训练权重）
     print("加载 YOLO 模型...")
     model = YOLO(MODEL_NAME)  # 从配置文件开始
+
+    # 之后在训练前注册该回调
+    # model.add_callback("on_train_batch_start", on_train_batch_start)
 
     # 训练配置
     print("开始训练 船舶检测模型...")
@@ -78,9 +103,15 @@ def train_model():
             batch=16,
             workers=0,  # Windows 下设为 0 避免多进程问题
             device=device,
-            lr0=0.01,  # 初始学习率
-            weight_decay=0.0005,
+            optimizer="SGD",  # 改用 SGD
+            lr0=0.01,  # 初始学习率 0.01
+            lrf=0.01,  # 最终学习率 = 0.01 * 0.01 = 0.0001
+            momentum=0.937,  # SGD 动量
+            weight_decay=0.0005,  # 权重衰减
+            cos_lr=True,  # 余弦退火
             warmup_epochs=3.0,
+
+
             patience=0,  # 早停耐心值
             save=True,
             exist_ok=True,  # 覆盖现有训练结果
