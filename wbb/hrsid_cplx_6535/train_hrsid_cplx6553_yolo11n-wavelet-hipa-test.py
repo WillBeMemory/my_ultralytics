@@ -105,7 +105,7 @@ def train_model():
             device=device,
             optimizer="SGD",  # 改用 SGD
             lr0=0.01,  # 初始学习率 0.01
-            lrf=0.05,  # 最终学习率 = 0.01 * 0.05 = 0.0005
+            lrf=0.1,  # 最终学习率 = 0.01 * 0.05 = 0.0005
             momentum=0.937,  # SGD 动量
             weight_decay=0.0005,  # 权重衰减
             cos_lr=True,  # 余弦退火
