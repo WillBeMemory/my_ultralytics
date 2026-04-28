@@ -47,37 +47,38 @@ def check_dataset(config_path):
 
     print("==========================\n")
 
-# ========== 热重启 + 平坦区域恒定学习率 配置 ==========
-restart_epoch = 150          # 热重启点
-restart_lr = 0.005           # 重启后的学习率（可调）
-hold_epochs = 10             # 重启后保持恒定学习率的轮数
-restart_end = restart_epoch + hold_epochs   # 160
+# ========== 热重启配置（修正版） ==========
 
-constant_start = 250         # 平坦区域恒定学习率开始轮次
-constant_lr = 0.001          # 恒定学习率值（可调，通常为初始 lr0 的 1/5 ~ 1/10）
+# ---- 第一次重启（150 epoch） ----
+restart1_epoch = 150
+restart1_lr = 0.01             # 拉回初始学习率，制造强冲击
+restart1_hold = 10             # 保持 10 个 epoch，让模型在0.01探索
+
+# ---- 第二次重启（250 epoch） ----
+restart2_epoch = 250
+restart2_lr = 0.005            # 适当降低，避免后期震荡过大
+restart2_hold = 10             # 保持 10 个 epoch，给最后一次充分探索
 
 # ========== 回调函数 ==========
 def on_train_epoch_start(trainer):
-    """在 epoch 开始时打印关键信息"""
-    if trainer.epoch == restart_epoch:
-        print(f"🔥 Epoch {restart_epoch}: Hot restart, LR set to {restart_lr}, "
-              f"will hold for {hold_epochs} epochs")
-    if trainer.epoch == constant_start:
-        print(f"🔥 Epoch {constant_start}: Switched to constant LR = {constant_lr} "
-              f"for flat region exploration until end of training")
+    if trainer.epoch == restart1_epoch:
+        print(f"🔥 Epoch {restart1_epoch}: 第一次热重启, LR = {restart1_lr}, 持续 {restart1_hold} epochs")
+    if trainer.epoch == restart2_epoch:
+        print(f"🔥 Epoch {restart2_epoch}: 第二次热重启, LR = {restart2_lr}, 持续 {restart2_hold} epochs")
 
 def on_train_batch_start(trainer):
-    """每个 batch 前强制覆盖学习率，保证最高优先级"""
     epoch = trainer.epoch
-    # 热重启保持期：epoch 150 ~ 159
-    if restart_epoch <= epoch < restart_end:
+    # 第一次重启期：150 ~ 159
+    if restart1_epoch <= epoch < restart1_epoch + restart1_hold:
         for pg in trainer.optimizer.param_groups:
-            pg['lr'] = restart_lr
-    # 平坦区域恒定学习率：epoch 250 ~ 299
-    elif epoch >= constant_start:
+            pg['lr'] = restart1_lr
+    # 第二次重启期：250 ~ 259
+    elif restart2_epoch <= epoch < restart2_epoch + restart2_hold:
         for pg in trainer.optimizer.param_groups:
-            pg['lr'] = constant_lr
-    # 其他时间段：不做干预，让余弦退火调度器正常工作
+            pg['lr'] = restart2_lr
+    # 其余时间：让余弦退火调度器正常工作
+
+
 
 def train_model():
     """训练 hrsid 船舶检测模型"""
@@ -96,10 +97,9 @@ def train_model():
     print("加载 YOLO 模型...")
     model = YOLO(MODEL_NAME)  # 从配置文件开始
 
-    # ========== 注册回调 ==========
+    # 注册回调
     model.add_callback("on_train_epoch_start", on_train_epoch_start)
     model.add_callback("on_train_batch_start", on_train_batch_start)
-
     # 训练配置
     print("开始训练 船舶检测模型...")
     try:
