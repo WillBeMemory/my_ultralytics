@@ -6,7 +6,7 @@ import torch
 
 
 MODEL_NAME = "yolo11n-wavelet-hipa-test.yaml"
-DATASET_PATH = "../cfg/hrsid_cplx_6535.yaml"
+DATASET_PATH = "../cfg/hrsid.yaml"
 
 
 def setup_environment():
