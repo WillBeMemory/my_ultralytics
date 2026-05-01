@@ -12,8 +12,8 @@ class SlimDetect(Detect):
     同时通过合并插值、nearest 模式、可调压缩比来最小化时间开销。
     """
     def __init__(self, nc=80, reg_max=16, end2end=False, ch=(),
-                 slim_indices=(0,), slim_scale=0.5, slim_mode="nearest",
-                 c2_ratio=1.0, c3_ratio=1.0):
+                 slim_indices=(), slim_scale=0.5, slim_mode="nearest",
+                 c2_ratio=0.5, c3_ratio=0.5):
         super().__init__(nc, reg_max, end2end, ch)
         self.slim_indices = slim_indices
         self.slim_scale = slim_scale
