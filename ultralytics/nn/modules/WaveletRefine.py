@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ultralytics.nn.modules.block import Conv, Bottleneck
+from ultralytics.nn.modules.block import Conv
 
 
 class StarBlock(nn.Module):
@@ -45,47 +45,42 @@ class StarBlock(nn.Module):
         return out
 
 
-class WaveletTextureSuppress(nn.Module):
-    """用 StarBlock 实现小波子带纹理抑制"""
+class StarHighFeature(nn.Module):
+    """
+    用 StarBlock 对 LH 和 HL 子带进行星操作增强，返回正向特征。
+    输入：LH (B, C, H, W), HL (B, C, H, W)
+    输出：增强后的 LH, HL，通道数不变。
+    """
     def __init__(self, c, reduction=4):
         super().__init__()
-        self.star = StarBlock(c * 2, 1, k=3, e=0.5, shortcut=False)
-        self.bias = nn.Parameter(torch.tensor(2.0))
-        self.sigmoid = nn.Sigmoid()
+        # 输入 2*C，输出 2*C（保持每个子带通道数为 C）
+        self.star = StarBlock(c * 2, c * 2, k=3, e=0.5, shortcut=False)
 
     def forward(self, lh, hl):
         combined = torch.cat([lh, hl], dim=1)
-        logit = self.star(combined) + self.bias.view(1, -1, 1, 1)
-        mask = self.sigmoid(logit)
-        lh = lh * mask
-        hl = hl * mask
-        return lh, hl
+        enhanced = self.star(combined)          # (B, 2*C, H, W)
+        lh_out, hl_out = combined.chunk(2, dim=1)  # 各 (B, C, H, W)
+        return lh_out, hl_out
 
 
 class WaveletRefine(nn.Module):
     """
-    小波域特征精炼 + 下采样模块，替代 C3k2 + HWD。
-    LL 子带通过 Bottleneck 精炼。
-    LH, HL 子带通过 WaveletTextureSuppress 进行纹理过滤。
+    小波域特征精炼 + 下采样模块。
+    LL 子带通过 StarBlock 进行星操作增强。
+    LH, HL 子带通过 StarHighFeature 进行星操作增强（正向特征提取）。
     HH 子带不做处理，直接保留。
 
-    参数:
-        c1                 : 输入通道数
-        c2                 : 输出通道数（必须能被 4 整除当 keep_subbands=True）
-        n                  : LL 精炼的 Bottleneck 个数
-        shortcut           : Bottleneck 内部是否使用残差连接
-        g                  : 分组卷积组数
-        k                  : 卷积核大小
-        texture_suppress   : 是否启用 LH/HL 纹理抑制
-        keep_subbands      : True → 输出子带堆叠（四个子带各投影后堆叠），
-                             False→ 1×1 融合输出普通特征图
+    可通过 keep_subbands 控制是否输出子带堆叠 (默认 False 为 1×1 融合)。
+
+    输入：(B, c1, H, W)
+    输出：(B, c2, H/2, W/2)
     """
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, k=3,
-                 texture_suppress=True, keep_subbands=False):
+    def __init__(self, c1, c2, n=None, shortcut=True, g=1, k=3,
+                 star_enhance=True, keep_subbands=False):
         super().__init__()
         self.c1 = c1
         self.c2 = c2
-        self.texture_suppress = texture_suppress
+        self.star_enhance = star_enhance
         self.keep_subbands = keep_subbands
 
         # 固定 Haar 分解滤波器
@@ -93,19 +88,17 @@ class WaveletRefine(nn.Module):
         w_lh = torch.tensor([[1., -1.], [1., -1.]]) / 2.0
         w_hl = torch.tensor([[1., 1.], [-1., -1.]]) / 2.0
         w_hh = torch.tensor([[1., -1.], [-1., 1.]]) / 2.0
-        haar_init = torch.stack([w_ll, w_lh, w_hl, w_hh], dim=0).unsqueeze(1)
+        haar_init = torch.stack([w_ll, w_lh, w_hl, w_hh], dim=0).unsqueeze(1)  # (4,1,2,2)
         self.register_buffer('haar_filter', haar_init.repeat(c1, 1, 1, 1))
 
-        # LL 子带精炼分支（标准 Bottleneck）
-        self.ll_refine = nn.Sequential(*[
-            Bottleneck(c1, c1, shortcut, g, k=(k, k), e=1.0) for _ in range(n)
-        ])
+        # LL 子带星操作增强（输入输出通道均为 c1）
+        self.ll_star = StarBlock(c1, c1, k=k, e=0.5, shortcut=True, act=nn.ReLU6(inplace=True))
 
-        # LH, HL 纹理抑制分支
-        if texture_suppress:
-            self.texture_module = WaveletTextureSuppress(c1)
+        # LH, HL 星操作增强模块
+        if star_enhance:
+            self.high_star = StarHighFeature(c1)
 
-        # 根据 keep_subbands 选择输出方式
+        # 子带独立投影（仅 keep_subbands 模式使用）
         if keep_subbands:
             out_sub_ch = c2 // 4
             self.ll_proj = Conv(c1, out_sub_ch, k=1, act=False)
@@ -113,10 +106,12 @@ class WaveletRefine(nn.Module):
             self.hl_proj = Conv(c1, out_sub_ch, k=1, act=False)
             self.hh_proj = Conv(c1, out_sub_ch, k=1, act=False)
         else:
+            # 标准 1×1 融合
             self.fuse = Conv(c1 * 4, c2, k=1, act=True)
 
     def forward(self, x):
         B, C, H, W = x.shape
+        # 处理奇数尺寸
         pad_h = (2 - H % 2) % 2
         pad_w = (2 - W % 2) % 2
         if pad_h or pad_w:
@@ -131,45 +126,48 @@ class WaveletRefine(nn.Module):
         hl = coeff[:, :, 2]
         hh = coeff[:, :, 3]
 
-        # 2. LL 子带精炼
-        ll_out = self.ll_refine(ll)
+        # 2. LL 子带星操作增强
+        ll_out = self.ll_star(ll)                     # (B, C, H/2, W/2)
 
-        # 3. LH, HL 纹理过滤
-        if self.texture_suppress:
-            lh_out, hl_out = self.texture_module(lh, hl)
+        # 3. LH, HL 星操作增强（或原样保留）
+        if self.star_enhance:
+            lh_out, hl_out = self.high_star(lh, hl)   # 各 (B, C, H/2, W/2)
         else:
             lh_out, hl_out = lh, hl
 
-        # 4. HH 不做处理
         hh_out = hh
 
-        # 5. 输出选择
+        # 4. 子带投影或全局融合
         if self.keep_subbands:
-            # 每个子带独立投影后堆叠
             ll_out = self.ll_proj(ll_out)
             lh_out = self.lh_proj(lh_out)
             hl_out = self.hl_proj(hl_out)
             hh_out = self.hh_proj(hh_out)
+            # 堆叠并展平为 (B, c2, H/2, W/2)
             out = torch.stack([ll_out, lh_out, hl_out, hh_out], dim=2).reshape(B, self.c2, H // 2, W // 2)
         else:
-            # 拼接四个子带，然后通过 1×1 融合
+            # 原有 1×1 融合
             fused = torch.stack([ll_out, lh_out, hl_out, hh_out], dim=2).reshape(B, C * 4, H // 2, W // 2)
             out = self.fuse(fused)
 
         return out
 
 
-# ==================== 测试 ====================
+# 测试代码
 if __name__ == "__main__":
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    c1, c2 = 128, 256
+    x = torch.randn(2, c1, 40, 40).to(device)
 
-    # 普通模式输出普通特征图
-    x = torch.randn(2, 64, 80, 80).to(device)
-    refine_normal = WaveletRefine(64, 128, keep_subbands=False).to(device)
-    out1 = refine_normal(x)
-    print(f"keep_subbands=False: {out1.shape}")   # (2, 128, 40, 40)
+    # 测试标准模式
+    model = WaveletRefine(c1, c2, star_enhance=True, keep_subbands=False).to(device)
+    out = model(x)
+    print(f"Standard mode output shape: {out.shape}")  # [2, 256, 20, 20]
 
-    # 子带堆叠模式输出
-    refine_sub = WaveletRefine(64, 128, keep_subbands=True).to(device)
-    out2 = refine_sub(x)
-    print(f"keep_subbands=True:  {out2.shape}")   # (2, 128, 40, 40)
+    # 测试 keep_subbands 模式
+    model_sub = WaveletRefine(c1, c2, star_enhance=True, keep_subbands=True).to(device)
+    out_sub = model_sub(x)
+    print(f"Subband mode output shape: {out_sub.shape}")  # [2, 256, 20, 20]
+
+    params = sum(p.numel() for p in model.parameters())
+    print(f"Total params (standard): {params:,}")
