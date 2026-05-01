@@ -17,15 +17,15 @@ scales: # model compound scaling constants, i.e. 'model=yolo11n.yaml' will call 
 # YOLO11n backbone
 backbone:
   # [from, repeats, module, args]
-  - [-1, 1, WaveletStem, [48]] # 0
-  - [-1, 1, WaveletRefine, [96]]
-  - [-1, 1, WaveletRefine, [192]] # 2-P3/8
+  - [-1, 1, WaveletStem, [64]] # 0
+  - [-1, 1, WaveletRefine, [128]]
+  - [-1, 1, WaveletRefine, [256]] # 2-P3/8
   - [-1, 1, nn.Identity, [ ] ]
   - [-1, 1, nn.Identity, [ ] ]
-  - [-1, 1, WaveletRefine, [384]] # 5-P4/16
+  - [-1, 1, WaveletRefine, [512]] # 5-P4/16
   - [-1, 1, nn.Identity, [ ] ]
   - [-1, 1, nn.Identity, [ ] ]
-  - [-1, 1, WaveletRefine, [768]] # 5-P4/16
+  - [-1, 1, WaveletRefine, [1024]] # 5-P4/16
   - [-1, 1, nn.Identity, [ ] ]
 #  - [ -1, 1, Conv, [ 128, 3, 2 ] ] # 1-P2/4
 #  - [ -1, 2, C3k2, [ 256, False, 0.25 ] ]
@@ -36,15 +36,15 @@ backbone:
 #  - [ -1, 1, Conv, [ 1024, 3, 2 ] ] # 7-P5/32
 #  - [ -1, 2, C3k2, [ 1024, True ] ]
 #  - [ -1, 1, nn.Identity, [ ] ]
-  - [-1, 1, HIPA, [768, 4, 0.25,[],8, True, 16, 'center', True, 'l2']] # 10
+  - [-1, 1, HIPA, [1024, 4, 0.25,[],8, True, 16, 'center', True, 'l2']] # 10
 
 
 # YOLO11n head
 head:
-  - [[1, 4, 7, 10], 1, BiFPN, [[96, 192, 384, 768]]]  # 输入来自 Backbone P3, P4, P5
-  - [11, 1, SplitList, [192,0]] #12
-  - [11, 1, SplitList, [384,1]] #13
-  - [11, 1, SplitList, [768,2]] #14
+  - [[1, 4, 7, 10], 1, BiFPN, [[128, 256, 512, 1024]]]  # 输入来自 Backbone P3, P4, P5
+  - [11, 1, SplitList, [256,0]] #12
+  - [11, 1, SplitList, [512,1]] #13
+  - [11, 1, SplitList, [1024,2]] #14
   - [[12, 13 ,14], 1, Detect, [nc]] # Detect(P3, P4, P5)
 
 #  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
