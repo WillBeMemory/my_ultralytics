@@ -73,28 +73,33 @@ def train_model():
     try:
         results = model.train(
             data=DATASET_PATH,
-            epochs=100,
-            imgsz=800,
-            batch=8,
+            epochs=300,
+            imgsz=640,
+            batch=16,
             workers=0,  # Windows 下设为 0 避免多进程问题
             device=device,
-            lr0=0.01,  # 初始学习率
-            weight_decay=0.0005,
+            optimizer="SGD",  # 改用 SGD
+            lr0=0.02,  # 初始学习率 0.01
+            lrf=0.01,  # 最终学习率 = 0.01 * 0.05 = 0.0005
+            momentum=0.937,  # SGD 动量
+            weight_decay=0.0005,  # 权重衰减
+            cos_lr=True,  # 余弦退火
             warmup_epochs=3.0,
-            patience=20,  # 早停耐心值
+
+            patience=0,  # 早停耐心值
             save=True,
             exist_ok=True,  # 覆盖现有训练结果
             verbose=True,
             # 数据增强 - 针对船舶检测优化
-            degrees=5.0,  # 较小的旋转角度（船舶方向相对固定）
-            translate=0.1,
-            scale=0.5,
-            shear=1.0,  # 较小的剪切变换
-            perspective=0.0005,  # 较小的透视变换
-            flipud=0.3,  # 较小的上下翻转概率
-            fliplr=0.5,  # 左右翻转概率
-            mosaic=1.0,
-            mixup=0.1,
+            # degrees=5.0,  # 较小的旋转角度（船舶方向相对固定）
+            # translate=0.1,
+            # scale=0.5,
+            # shear=1.0,  # 较小的剪切变换
+            # perspective=0.0005,  # 较小的透视变换
+            # flipud=0.3,  # 较小的上下翻转概率
+            # fliplr=0.5,  # 左右翻转概率
+            # mosaic=1.0,
+            # mixup=0.1,
         )
 
         print("训练完成!")
