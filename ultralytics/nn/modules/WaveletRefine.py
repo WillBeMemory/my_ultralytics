@@ -37,7 +37,7 @@ class StarBlock(nn.Module):
         x2 = self.pw2(x2)
         x2 = self.bn2(x2)
 
-        out = x1 * x2
+        out = x1 * x2                     # 星操作
         out = self.fusion(out)
         out = self.out_act(out)
         if self.add:
@@ -64,19 +64,24 @@ class WaveletTextureSuppress(nn.Module):
 
 class WaveletRefine(nn.Module):
     """
-    小波域特征精炼 + 下采样模块。
-    LL 子带通过 Bottleneck 精炼。
-    LH, HL 子带通过 WaveletTextureSuppress 进行纹理过滤。
-    HH 子带不做处理，直接保留。
-    输入：(B, C1, H, W)
-    输出：(B, C2, H/2, W/2)
+    小波域特征精炼 + 下采样模块（子带堆叠输出）。
+    recursive=False: 对完整的输入特征进行 Haar 分解。
+    recursive=True:  假设输入是前一级输出的子带堆叠，仅取其前 1/4 通道（LL 部分）进行 Haar 分解。
+    两种模式均输出子带堆叠格式，通道数为 c2（c2 需能被 4 整除）。
     """
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, k=3,
-                 texture_suppress=True):
+    def __init__(self, c1, c2, n=1,recursive=False, shortcut=True, g=1, k=3,
+                 texture_suppress=True ):
         super().__init__()
         self.c1 = c1
         self.c2 = c2
         self.texture_suppress = texture_suppress
+        self.recursive = recursive
+
+        # 实际用于 Haar 分解的输入通道数
+        if recursive:
+            self.decomp_ch = c1 // 4   # 取 LL 子带
+        else:
+            self.decomp_ch = c1
 
         # 固定 Haar 分解滤波器
         w_ll = torch.tensor([[1., 1.], [1., 1.]]) / 2.0
@@ -84,64 +89,89 @@ class WaveletRefine(nn.Module):
         w_hl = torch.tensor([[1., 1.], [-1., -1.]]) / 2.0
         w_hh = torch.tensor([[1., -1.], [-1., 1.]]) / 2.0
         haar_init = torch.stack([w_ll, w_lh, w_hl, w_hh], dim=0).unsqueeze(1)
-        self.register_buffer('haar_filter', haar_init.repeat(c1, 1, 1, 1))
+        self.register_buffer('haar_filter', haar_init.repeat(self.decomp_ch, 1, 1, 1))
 
-        # LL 子带精炼分支（标准 Bottleneck）
+        # LL 子带精炼分支
         self.ll_refine = nn.Sequential(*[
-            Bottleneck(c1, c1, shortcut, g, k=(k, k), e=1.0) for _ in range(n)
+            Bottleneck(self.decomp_ch, self.decomp_ch, shortcut, g, k=(k, k), e=1.0) for _ in range(n)
         ])
 
-        # LH, HL 纹理抑制分支
+        # 纹理抑制
         if texture_suppress:
-            self.texture_module = WaveletTextureSuppress(c1)
+            self.texture_module = WaveletTextureSuppress(self.decomp_ch)
 
-        # 最终 1x1 融合（4*c1 → c2）
-        self.fuse = Conv(c1 * 4, c2, k=1, act=True)
+        # 子带独立投影卷积（输出通道各占 c2/4）
+        out_sub_ch = c2 // 4
+        self.ll_proj = Conv(self.decomp_ch, out_sub_ch, k=1, act=False)
+        self.lh_proj = Conv(self.decomp_ch, out_sub_ch, k=1, act=False)
+        self.hl_proj = Conv(self.decomp_ch, out_sub_ch, k=1, act=False)
+        self.hh_proj = Conv(self.decomp_ch, out_sub_ch, k=1, act=False)
 
     def forward(self, x):
         B, C, H, W = x.shape
+
+        # 1. 获取进行 Haar 分解的特征部分
+        if self.recursive:
+            # 输入是子带堆叠，取前 1/4 通道作为 LL
+            ll_part = x[:, :self.decomp_ch]          # (B, c1//4, H, W)
+            x = ll_part
+        # 否则，x 就是普通特征图，直接使用
+
+        # 2. 处理奇数尺寸（反射填充）
         pad_h = (2 - H % 2) % 2
         pad_w = (2 - W % 2) % 2
         if pad_h or pad_w:
             x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
 
-        # 1. Haar 分解
-        coeff = F.conv2d(x, self.haar_filter, stride=2, groups=C)
-        coeff = coeff.view(B, C, 4, H // 2, W // 2)
+        # 3. Haar 分解
+        coeff = F.conv2d(x, self.haar_filter, stride=2, groups=self.decomp_ch)  # (B, 4*decomp_ch, H/2, W/2)
+        coeff = coeff.view(B, self.decomp_ch, 4, H // 2, W // 2)
 
         ll = coeff[:, :, 0]
         lh = coeff[:, :, 1]
         hl = coeff[:, :, 2]
         hh = coeff[:, :, 3]
 
-        # 2. LL 子带精炼
+        # 4. LL 精炼
         ll_out = self.ll_refine(ll)
 
-        # 3. LH, HL 纹理过滤
+        # 5. 纹理抑制
         if self.texture_suppress:
             lh_out, hl_out = self.texture_module(lh, hl)
         else:
             lh_out, hl_out = lh, hl
 
-        # 4. HH 不做处理
         hh_out = hh
 
-        # 5. 堆叠并融合
-        fused = torch.stack([ll_out, lh_out, hl_out, hh_out], dim=2)
-        fused = fused.reshape(B, C * 4, H // 2, W // 2)
-        out = self.fuse(fused)
+        # 6. 各子带投影到输出通道
+        ll_out = self.ll_proj(ll_out)
+        lh_out = self.lh_proj(lh_out)
+        hl_out = self.hl_proj(hl_out)
+        hh_out = self.hh_proj(hh_out)
+
+        # 7. 堆叠为子带格式 (B, c2, H/2, W/2)
+        out = torch.stack([ll_out, lh_out, hl_out, hh_out], dim=2).reshape(B, self.c2, H // 2, W // 2)
         return out
 
 
-# 测试
+# ==================== 测试 ====================
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    c1, c2 = 128, 256
-    x = torch.randn(2, c1, 40, 40).to(device)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # 正常模式测试 (c1=64, c2=128)
+    x = torch.randn(2, 64, 80, 80).to(device)
+    refine_normal = WaveletRefine(64, 128, recursive=False).to(device)
+    out = refine_normal(x)
+    print(f"Normal mode: input {x.shape} -> output {out.shape}")
+    assert out.shape == (2, 128, 40, 40)
 
-    model = WaveletRefine(c1, c2, n=2, texture_suppress=True).to(device)
-    out = model(x)
-    print(f"Input : {x.shape}")
-    print(f"Output: {out.shape}")      # 期望 [2, 256, 20, 20]
-    params = sum(p.numel() for p in model.parameters())
-    print(f"Params: {params:,}")
+    # 递归模式测试：输入是子带堆叠 (c1=128，取前32通道作为LL)
+    x_rec = torch.randn(2, 128, 40, 40).to(device)
+    refine_rec = WaveletRefine(128, 256, recursive=True).to(device)
+    out_rec = refine_rec(x_rec)
+    print(f"Recursive mode: input {x_rec.shape} -> output {out_rec.shape}")
+    assert out_rec.shape == (2, 256, 20, 20)
+
+    # 参数对比
+    params_normal = sum(p.numel() for p in refine_normal.parameters())
+    params_rec = sum(p.numel() for p in refine_rec.parameters())
+    print(f"Normal params: {params_normal:,}, Recursive params: {params_rec:,}")

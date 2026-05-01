@@ -14,9 +14,9 @@ imgsz = 800                              # 图像大小，需与训练一致
 # iou = 0.6                                  # IoU阈值（默认0.6）
 # device = 0                                 # GPU设备（设为'cpu'使用CPU）
 
-# 兼容 PyTorch 2.6+ 的 weights_only 问题
-if hasattr(torch.serialization, 'set_default_weights_only'):
-    torch.serialization.set_default_weights_only(False)
+# # 兼容 PyTorch 2.6+ 的 weights_only 问题
+# if hasattr(torch.serialization, 'set_default_weights_only'):
+#     torch.serialization.set_default_weights_only(False)
 
 if __name__ == '__main__':
     # 加载模型
@@ -27,7 +27,7 @@ if __name__ == '__main__':
     results = model.val(
         data=data_yaml,
         split='test', #使用测试集合验证数据A
-        imgsz=imgsz,
+        # imgsz=imgsz,
         # batch=batch,
         # conf=conf,
         # iou=iou,
