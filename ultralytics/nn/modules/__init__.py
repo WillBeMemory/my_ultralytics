@@ -64,6 +64,8 @@ from ultralytics.nn.modules.CCFPN import CCFPN
 from ultralytics.nn.modules.WaveletCSP import WaveletCSP
 from ultralytics.nn.modules.WaveletRefine import WaveletRefine
 
+from ultralytics.nn.modules.SlimDetect import SlimDetect
+
 
 from .block import (
     C1,

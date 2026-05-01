@@ -58,6 +58,7 @@ from ultralytics.nn.modules.SplitList import SplitList
 from ultralytics.nn.modules.CCFPN import CCFPN
 from ultralytics.nn.modules.WaveletCSP import WaveletCSP
 from ultralytics.nn.modules.WaveletRefine import WaveletRefine
+from ultralytics.nn.modules.SlimDetect import SlimDetect
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1857,6 +1858,7 @@ def parse_model(d, ch, verbose=True):
             {
                 # DynamicDetect,
                 # AnchorDetect,
+                SlimDetect,
 
                 Detect,
                 WorldDetect,
@@ -1972,7 +1974,7 @@ def guess_model_task(model):
         m = cfg["head"][-1][-2].lower()  # output module name
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"
-        if "detect" in m:
+        if "detect" in m or "slimdetect" in m:
             return "detect"
         if "segment" in m:
             return "segment"

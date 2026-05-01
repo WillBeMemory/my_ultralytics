@@ -88,7 +88,7 @@ def train_model():
 
     # 加载模型 - 从配置文件开始（不使用预训练权重）
     print("加载 YOLO 模型...")
-    model = YOLO(MODEL_NAME)  # 从配置文件开始
+    model = YOLO(MODEL_NAME,task='detect')  # 从配置文件开始
 
     # 之后在训练前注册该回调
     # model.add_callback("on_train_batch_start", on_train_batch_start)
