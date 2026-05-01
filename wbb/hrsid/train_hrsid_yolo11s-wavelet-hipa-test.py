@@ -111,7 +111,6 @@ def train_model():
             cos_lr=True,  # 余弦退火
             warmup_epochs=3.0,
 
-
             patience=0,  # 早停耐心值
             save=True,
             exist_ok=True,  # 覆盖现有训练结果
