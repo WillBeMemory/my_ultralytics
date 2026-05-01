@@ -4,7 +4,7 @@ from ultralytics import YOLO
 import os
 import torch
 
-MODEL_NAME = "yolo11n.yaml"
+MODEL_NAME = "yolo11m.yaml"
 DATASET_PATH = "../cfg/hrsid.yaml"
 
 
