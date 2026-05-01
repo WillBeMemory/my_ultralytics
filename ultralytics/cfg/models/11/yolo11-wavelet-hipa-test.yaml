@@ -19,16 +19,16 @@ backbone:
   # [from, repeats, module, args]
   - [-1, 1, WaveletStem, [64] ] # 0
 #  - [-1, 2, C3k2, [256, False,0.25]]
-  - [-1, 1, WaveletRefine, [128,False]]
-  - [-1, 1, WaveletRefine, [256,True]] # 2-P3/8
+  - [-1, 1, WaveletRefine, [128]]
+  - [-1, 1, WaveletRefine, [256]] # 2-P3/8
   - [-1, 1, nn.Identity, [ ] ]
   - [-1, 1, nn.Identity, [ ] ]
 #  - [-1, 2, C3k2, [512, False,0.25]]
-  - [ 3, 1, WaveletRefine, [512,True]] # 5-P4/16
+  - [ 3, 1, WaveletRefine, [512]] # 5-P4/16
   - [-1, 1, nn.Identity, [ ] ]
   - [-1, 1, nn.Identity, [ ] ]
 #  - [-1, 2, C3k2, [512, True]]
-  - [ 6, 1, WaveletRefine, [1024,True ]] # 8-P5/32
+  - [ 6, 1, WaveletRefine, [1024 ]] # 8-P5/32
   - [ -1, 1, nn.Identity, [ ] ]
 #  - [-1, 2, C3k2, [1024, True]]
   - [-1, 1, HIPA, [1024, 4, 0.25,[],8, True, 16, 'center', True, 'l2']] # 10
