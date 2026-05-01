@@ -4,8 +4,8 @@ from ultralytics import YOLO
 import os
 import torch
 
-MODEL_NAME = "yolo11s-wavelet-hipa.yaml"
-DATASET_PATH = "../cfg/hrsid.yaml"
+MODEL_NAME = "yolo11n-c3k2wt.yaml"
+DATASET_PATH = "../cfg/ssdd.yaml"
 
 
 def setup_environment():
@@ -48,7 +48,7 @@ def check_dataset(config_path):
 
 
 def train_model():
-    """训练 hrsid 船舶检测模型"""
+    """训练  船舶检测模型"""
 
     setup_environment()
 
@@ -73,16 +73,15 @@ def train_model():
     try:
         results = model.train(
             data=DATASET_PATH,
-            epochs=300,
+            epochs=200,
             imgsz=640,
             batch=16,
             workers=0,  # Windows 下设为 0 避免多进程问题
             device=device,
-            lr0=0.02,  # 初始学习率
-            lrf=0.01,
+            lr0=0.01,  # 初始学习率
             weight_decay=0.0005,
             warmup_epochs=3.0,
-            patience=0,  # 早停耐心值
+            patience=20,  # 早停耐心值
             save=True,
             exist_ok=True,  # 覆盖现有训练结果
             verbose=True,
