@@ -18,10 +18,10 @@ scales: # model compound scaling constants, i.e. 'model=yolo11n.yaml' will call 
 backbone:
   # [from, repeats, module, args]
   - [-1, 1, WaveletStem, [64] ] # 0
-  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
-  - [-1, 2, WaveletRefine, [256,0.25]]
+  - [-1, 1, nn.Identity, [ ] ]
+  - [-1, 2, WaveletRefine, [128,0.25]] # 1-P2/4
   - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
-  - [-1, 2, WaveletRefine, [512,0.25]]
+  - [-1, 2, C3k2, [512,0.25]]
   - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
   - [-1, 2, C3k2, [512,]]
   - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
