@@ -59,6 +59,7 @@ from ultralytics.nn.modules.CCFPN import CCFPN
 from ultralytics.nn.modules.WaveletCSP import WaveletCSP
 from ultralytics.nn.modules.WaveletRefine import WaveletRefine
 from ultralytics.nn.modules.SlimDetect import SlimDetect
+from ultralytics.nn.modules.IWConv import IWConv
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1667,7 +1668,7 @@ def parse_model(d, ch, verbose=True):
             SplitList,
             WaveletCSP,
             WaveletRefine,
-
+            IWConv,
 
             Classify,
             Conv,
@@ -1742,6 +1743,7 @@ def parse_model(d, ch, verbose=True):
             DynamicC3k2,
             WaveletCSP,
             WaveletRefine,
+            IWConv,
 
             BottleneckCSP,
             C1,
