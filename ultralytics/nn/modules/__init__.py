@@ -66,6 +66,7 @@ from ultralytics.nn.modules.WaveletRefine import WaveletRefine
 
 from ultralytics.nn.modules.SlimDetect import SlimDetect
 from ultralytics.nn.modules.IWConv import IWConv
+from ultralytics.nn.modules.SPDConv import SPDConv
 
 
 from .block import (

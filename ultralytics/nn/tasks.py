@@ -60,6 +60,7 @@ from ultralytics.nn.modules.WaveletCSP import WaveletCSP
 from ultralytics.nn.modules.WaveletRefine import WaveletRefine
 from ultralytics.nn.modules.SlimDetect import SlimDetect
 from ultralytics.nn.modules.IWConv import IWConv
+from ultralytics.nn.modules.SPDConv import SPDConv
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1669,6 +1670,7 @@ def parse_model(d, ch, verbose=True):
             WaveletCSP,
             WaveletRefine,
             IWConv,
+            SPDConv,
 
             Classify,
             Conv,
