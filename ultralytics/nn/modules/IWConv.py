@@ -32,6 +32,32 @@ class StarBlock(nn.Module):
         return out + x if self.add else out
 
 
+# ---------- GSConv（并行双分支 + 通道混洗） ----------
+class GSConv(nn.Module):
+    """
+    Group Shuffle Convolution：标准卷积 + 深度可分离卷积并行，拼接后通道混洗。
+    输入输出通道: c1 -> c2
+    """
+    def __init__(self, c1, c2, k=3):
+        super().__init__()
+        self.branch1 = Conv(c1, c2 // 2, k, 1, act=True)          # 标准卷积
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(c1, c1, k, 1, padding=k//2, groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(c1, c2 // 2, 1, bias=False),
+            nn.BatchNorm2d(c2 // 2),
+            nn.SiLU(inplace=True)
+        )
+        self.shuffle = nn.Conv2d(c2, c2, 1, bias=False)           # 通道混洗
+
+    def forward(self, x):
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+        out = torch.cat([x1, x2], dim=1)
+        return self.shuffle(out)
+
+
 # ====================== IWConv（重要性分级，按计算量排序） ======================
 class IWConv(nn.Module):
     """
@@ -81,8 +107,8 @@ class IWConv(nn.Module):
             nn.SiLU(inplace=True)
         ))
 
-        # 3. GSConv（修正为并行双分支 + 通道混洗）
-        self.branches.append(self._make_gsconv_parallel(c1, hidden, k))
+        # 3. GSConv（独立类）
+        self.branches.append(GSConv(c1, hidden, k))
 
         # 4. 标准 3×3 卷积（Single Conv）
         self.branches.append(nn.Sequential(
@@ -91,7 +117,7 @@ class IWConv(nn.Module):
             nn.SiLU(inplace=True)
         ))
 
-        # 5. StarBlock（星操作，两个DWConv → 逐元素乘法）
+        # 5. StarBlock（星操作）
         self.branches.append(StarBlock(c1, hidden, k=k, e=0.5, shortcut=False))
 
         # 6. 双重标准卷积（Two Conv）
@@ -127,31 +153,6 @@ class IWConv(nn.Module):
 
         # ---------- 最终融合输出 ----------
         self.out_conv = Conv(hidden, c2, k=1, act=True)
-
-    @staticmethod
-    def _make_gsconv_parallel(c1, c2, k):
-        """并行双分支 GSConv：一个标准卷积 + 一个 DWConv-1x1，拼接后通道混洗"""
-        class ParallelGSConv(nn.Module):
-            def __init__(self, c1, c2, k):
-                super().__init__()
-                self.branch1 = Conv(c1, c2 // 2, k, 1, act=True)
-                self.branch2 = nn.Sequential(
-                    nn.Conv2d(c1, c1, k, 1, padding=k//2, groups=c1, bias=False),
-                    nn.BatchNorm2d(c1),
-                    nn.SiLU(inplace=True),
-                    nn.Conv2d(c1, c2 // 2, 1, bias=False),
-                    nn.BatchNorm2d(c2 // 2),
-                    nn.SiLU(inplace=True)
-                )
-                # 通道混洗：用一个1x1卷积融合两个分支
-                self.shuffle = nn.Conv2d(c2, c2, 1, bias=False)
-
-            def forward(self, x):
-                x1 = self.branch1(x)
-                x2 = self.branch2(x)
-                out = torch.cat([x1, x2], dim=1)
-                return self.shuffle(out)
-        return ParallelGSConv(c1, c2, k)
 
     def _compute_importance(self, x):
         importance = torch.norm(x, p=2, dim=1, keepdim=True)
