@@ -1,63 +1,79 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from ultralytics.nn.modules.block import DWConv, Conv
 from ultralytics.nn.modules.head import Detect
+from ultralytics.nn.modules.conv import DWConv
 
 
 class SlimDetect(Detect):
     """
-    极速版 SlimDetect：利用降采样‑预测‑上采样减少高分辨率层计算量，
-    同时通过合并插值、nearest 模式、可调压缩比来最小化时间开销。
-    """
-    def __init__(self, nc=80, reg_max=16, end2end=False, ch=(),
-                 slim_indices=(), slim_scale=0.5, slim_mode="nearest",
-                 c2_ratio=0.5, c3_ratio=0.5):
-        super().__init__(nc, reg_max, end2end, ch)
-        self.slim_indices = slim_indices
-        self.slim_scale = slim_scale
-        self.slim_mode = slim_mode
+    轻量化检测头：接收 P2, P3, P4 特征图，综合使用轻量分支与降采样重映射降低计算量。
 
-        # 如果压缩比 < 1，重新构建更窄的测头
-        if c2_ratio < 1.0 or c3_ratio < 1.0:
-            c2_ = max(16, int(ch[0] // 4 * c2_ratio), self.reg_max * 4)
-            c3_ = max(ch[0], min(self.nc, 100), int(ch[0] * c3_ratio))
-            self.cv2 = nn.ModuleList(
-                nn.Sequential(Conv(x, c2_, 3), Conv(c2_, c2_, 3), nn.Conv2d(c2_, 4 * self.reg_max, 1))
-                for x in ch
+    内部硬编码策略：
+        - 所有尺度的分类/回归分支均改为一个深度可分离卷积 + 1x1 卷积，参数量大幅减少。
+        - 对最高分辨率 P2 进行 2 倍降采样 → 预测 → 上采样恢复，以避免在高分辨率图上大量计算。
+    """
+
+    def __init__(self, nc=80, reg_max=16, end2end=False, ch=()):
+        # ch 为输入通道列表，形如 [c2, c3, c4]
+        super().__init__(nc, reg_max, end2end, ch)  # 复用 dfl、bias_init 等
+
+        # ----- 重构轻量化分支 -----
+        # 回归分支（box head）
+        c2 = max(16, ch[0] // 4, self.reg_max * 4)  # 保持与原版相同的下限，但可减小隐藏通道
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(
+                DWConv(x, c2, 3),  # depthwise 3x3
+                nn.Conv2d(c2, 4 * self.reg_max, 1)  # 1x1 投影
+            ) for x in ch
+        )
+
+        # 分类分支（cls head）
+        c3 = max(ch[0], min(self.nc, 100))  # 隐藏通道也可适当压缩，这里保持默认下限
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(
+                DWConv(x, c3, 3),
+                nn.Conv2d(c3, self.nc, 1)
+            ) for x in ch
+        )
+
+        # 若需要 one2one 分支，同样替换
+        if end2end:
+            self.one2one_cv2 = nn.ModuleList(
+                nn.Sequential(DWConv(x, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
             )
-            self.cv3 = nn.ModuleList(
-                nn.Sequential(
-                    nn.Sequential(DWConv(x, x, 3), Conv(x, c3_, 1)),
-                    nn.Sequential(DWConv(c3_, c3_, 3), Conv(c3_, c3_, 1)),
-                    nn.Conv2d(c3_, self.nc, 1),
-                )
-                for x in ch
+            self.one2one_cv3 = nn.ModuleList(
+                nn.Sequential(DWConv(x, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch
             )
+
+        # 硬编码各尺度的降采样比例：P2 使用 2 倍降采样，P3、P4 原尺度过轻量分支
+        self.slim_scales = [0.5, 1.0, 1.0]
 
     def forward_head(self, x, box_head=None, cls_head=None, **kwargs):
+        """
+        前向过程：根据 slim_scales 对特征图进行可选的降采样/上采样包裹，然后送入轻量分支。
+        """
         if box_head is None or cls_head is None:
             return dict()
         bs = x[0].shape[0]
         box_outs, cls_outs = [], []
 
-        for i in range(self.nl):
-            feat = x[i]
-            H, W = feat.shape[2:]
-            if i in self.slim_indices:
-                H_low, W_low = int(H * self.slim_scale), int(W * self.slim_scale)
-                feat_low = F.interpolate(feat, size=(H_low, W_low), mode=self.slim_mode)
+        for i, feat in enumerate(x):
+            H_orig, W_orig = feat.shape[-2:]
+            scale = self.slim_scales[i]
+            if scale < 1.0:
+                # 降采样 → 预测 → 上采样恢复
+                H_low = int(H_orig * scale)
+                W_low = int(W_orig * scale)
+                feat_low = F.interpolate(feat, size=(H_low, W_low), mode='nearest')
                 box_low = box_head[i](feat_low)
                 cls_low = cls_head[i](feat_low)
-                # 合并插值：将 box 和 cls 在通道上拼接，一次上采样，再拆分
-                combined = torch.cat([box_low, cls_low], dim=1)  # (B, 4*reg_max+nc, H_low, W_low)
-                combined_up = F.interpolate(combined, size=(H, W), mode=self.slim_mode)
-                reg_max4 = 4 * self.reg_max
-                box_out, cls_out = combined_up.split([reg_max4, self.nc], dim=1)
+                box_out = F.interpolate(box_low, size=(H_orig, W_orig), mode='nearest')
+                cls_out = F.interpolate(cls_low, size=(H_orig, W_orig), mode='nearest')
             else:
                 box_out = box_head[i](feat)
                 cls_out = cls_head[i](feat)
+
             box_outs.append(box_out.view(bs, 4 * self.reg_max, -1))
             cls_outs.append(cls_out.view(bs, self.nc, -1))
 

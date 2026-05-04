@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from ultralytics.nn.modules.block import Conv
 
 
-# ========== 辅助模块 ==========
+# ---------- 辅助模块 ----------
 class StarBlock(nn.Module):
     """轻量星操作块"""
     def __init__(self, c1, c2, k=3, e=0.5, shortcut=False, act=nn.ReLU6(inplace=True)):
@@ -34,7 +34,7 @@ class StarBlock(nn.Module):
 
 
 class WaveletTextureSuppress(nn.Module):
-    """小波纹理抑制 (StarBlock 空间掩码)"""
+    """小波纹理抑制"""
     def __init__(self, c):
         super().__init__()
         self.star = StarBlock(c * 2, 1, k=3, e=0.5, shortcut=False)
@@ -66,24 +66,21 @@ class ECA(nn.Module):
         return x * self.sigmoid(y)
 
 
-# ====================== WaveletRefine（最终版） ======================
+# ====================== WaveletRefine ======================
 class WaveletRefine(nn.Module):
     """
     小波域特征精炼 + 下采样模块。
     输入: (B, c1, H, W) → 输出: (B, c2, H/2, W/2)
 
-    子带处理方式:
-        - LL: 深度可分离卷积 (DWConv + 1x1)
-        - LH, HL: StarBlock 纹理抑制
-        - HH: 标准 3×3 卷积
-        - 堆叠四个子带
-        - ECA 通道增强
-        - 无最后的 1×1 融合卷积
+    子带处理:
+        - LL: 双重标准卷积
+        - HH: 深度可分离卷积 (DWConv + 1x1)
+        - LH, HL: 纹理抑制
+        - 四个子带拼接 -> ECA -> 1x1 融合卷积
     """
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, k=3,
-                 texture_suppress=True, keep_subbands=False):
+                 texture_suppress=True):
         super().__init__()
-        assert c2 % 4 == 0, "c2 must be divisible by 4"
         self.c1, self.c2 = c1, c2
         self.texture_suppress = texture_suppress
 
@@ -95,17 +92,20 @@ class WaveletRefine(nn.Module):
         haar_init = torch.stack([w_ll, w_lh, w_hl, w_hh], dim=0).unsqueeze(1)  # (4,1,2,2)
         self.register_buffer('haar_filter', haar_init.repeat(c1, 1, 1, 1))
 
-        # ---- LL 子带：深度可分离卷积 ----
+        # ---- LL 子带：双重标准卷积 ----
         self.ll_refine = nn.Sequential(
-            nn.Conv2d(c1, c1, k, padding=k//2, groups=c1, bias=False),  # DWConv
-            nn.Conv2d(c1, c1, 1, bias=False),                          # 1×1
+            nn.Conv2d(c1, c1, k, padding=k//2, bias=False),
             nn.BatchNorm2d(c1),
-            nn.SiLU(inplace=True)
+            nn.SiLU(inplace=True),
+            # nn.Conv2d(c1, c1, k, padding=k//2, bias=False),
+            # nn.BatchNorm2d(c1),
+            # nn.SiLU(inplace=True)
         )
 
-        # ---- HH 子带：标准 3×3 卷积 ----
+        # ---- HH 子带：深度可分离卷积 ----
         self.hh_conv = nn.Sequential(
-            nn.Conv2d(c1, c1, k, padding=k//2, bias=False),
+            nn.Conv2d(c1, c1, k, padding=k//2, groups=c1, bias=False),  # DWConv
+            nn.Conv2d(c1, c1, 1, bias=False),                          # 1×1
             nn.BatchNorm2d(c1),
             nn.SiLU(inplace=True)
         )
@@ -114,15 +114,9 @@ class WaveletRefine(nn.Module):
         if texture_suppress:
             self.texture_module = WaveletTextureSuppress(c1)
 
-        # ---- 各子带投影到 c2//4 ----
-        out_sub = c2 // 4
-        self.ll_proj = nn.Conv2d(c1, out_sub, 1, bias=False)
-        self.lh_proj = nn.Conv2d(c1, out_sub, 1, bias=False)
-        self.hl_proj = nn.Conv2d(c1, out_sub, 1, bias=False)
-        self.hh_proj = nn.Conv2d(c1, out_sub, 1, bias=False)
-
-        # ---- ECA 通道增强（对合并后 c2 通道） ----
-        self.eca = ECA(c2)
+        # ---- 融合（ECA + 1x1 卷积） ----
+        self.eca = ECA(c1 * 4)
+        self.fuse = Conv(c1 * 4, c2, k=1, act=True)
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -144,18 +138,14 @@ class WaveletRefine(nn.Module):
         else:
             lh_out, hl_out = lh, hl
 
-        # 3. 各子带投影到 c2//4 通道
-        ll_proj = self.ll_proj(ll_out)
-        lh_proj = self.lh_proj(lh_out)
-        hl_proj = self.hl_proj(hl_out)
-        hh_proj = self.hh_proj(hh_out)
+        # 3. 直接拼接四个子带 (B, 4*c1, H/2, W/2)
+        out = torch.cat([ll_out, lh_out, hl_out, hh_out], dim=1)
 
-        # 4. 将四个子带堆叠并拼接，无需最后的 1×1 卷积
-        out = torch.cat([ll_proj, lh_proj, hl_proj, hh_proj], dim=1)  # (B, c2, H/2, W/2)
-
-        # 5. ECA 通道增强
+        # 4. ECA 通道增强
         out = self.eca(out)
 
+        # 5. 1x1 融合卷积
+        out = self.fuse(out)
         return out
 
 
@@ -164,7 +154,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     c1, c2 = 128, 256
     x = torch.randn(2, c1, 40, 40).to(device)
-    model = WaveletRefine(c1, c2, n=2, texture_suppress=True).to(device)
+    model = WaveletRefine(c1, c2, texture_suppress=True).to(device)
     y = model(x)
     print(f"输入: {x.shape} -> 输出: {y.shape}")
     print(f"参数量: {sum(p.numel() for p in model.parameters()):,}")
