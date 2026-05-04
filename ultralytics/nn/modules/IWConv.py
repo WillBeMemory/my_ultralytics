@@ -4,181 +4,79 @@ import torch.nn.functional as F
 from ultralytics.nn.modules.conv import Conv
 
 
-# ---------- 轻量星操作块 ----------
-class StarBlock(nn.Module):
-    def __init__(self, c1, c2, k=3, e=0.5, shortcut=False, act=nn.ReLU6(inplace=True)):
-        super().__init__()
-        hidden = max(1, int(c1 * e))
-        self.add = shortcut and c1 == c2
-        self.dw1 = nn.Conv2d(c1, c1, k, padding=k // 2, groups=c1, bias=False)
-        self.pw1 = nn.Conv2d(c1, hidden, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(hidden)
-        self.act1 = act
-        self.dw2 = nn.Conv2d(c1, c1, k, padding=k // 2, groups=c1, bias=False)
-        self.pw2 = nn.Conv2d(c1, hidden, 1, bias=False)
-        self.bn2 = nn.BatchNorm2d(hidden)
-        self.fusion = nn.Sequential(
-            nn.Conv2d(hidden, c2, 1, bias=False),
-            nn.BatchNorm2d(c2)
-        )
-        self.out_act = act
-
-    def forward(self, x):
-        x1 = self.dw1(x); x1 = self.pw1(x1); x1 = self.bn1(x1); x1 = self.act1(x1)
-        x2 = self.dw2(x); x2 = self.pw2(x2); x2 = self.bn2(x2)
-        out = x1 * x2
-        out = self.fusion(out)
-        out = self.out_act(out)
-        return out + x if self.add else out
-
-
-# ---------- GSConv（并行双分支 + 通道混洗） ----------
-class GSConv(nn.Module):
-    """
-    Group Shuffle Convolution：标准卷积 + 深度可分离卷积并行，拼接后通道混洗。
-    输入输出通道: c1 -> c2
-    """
-    def __init__(self, c1, c2, k=3):
-        super().__init__()
-        self.branch1 = Conv(c1, c2 // 2, k, 1, act=True)          # 标准卷积
-        self.branch2 = nn.Sequential(
-            nn.Conv2d(c1, c1, k, 1, padding=k//2, groups=c1, bias=False),
-            nn.BatchNorm2d(c1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(c1, c2 // 2, 1, bias=False),
-            nn.BatchNorm2d(c2 // 2),
-            nn.SiLU(inplace=True)
-        )
-        self.shuffle = nn.Conv2d(c2, c2, 1, bias=False)           # 通道混洗
-
-    def forward(self, x):
-        x1 = self.branch1(x)
-        x2 = self.branch2(x)
-        out = torch.cat([x1, x2], dim=1)
-        return self.shuffle(out)
-
-
-# ====================== IWConv（重要性分级，按计算量排序） ======================
 class IWConv(nn.Module):
     """
-    基于 L2 范数的重要性加权特征精炼模块，根据重要性分级执行不同复杂度的卷积。
-    分支按计算量从低到高排列：
-        1. 深度可分离卷积 (DWConv)
-        2. GhostConv
-        3. GSConv (并行标准卷积 + 深度可分离卷积，通道混洗)
-        4. 标准卷积 (Single 3x3 Conv)
-        5. StarBlock (星操作)
-        6. 双重标准卷积 (Two 3x3 Conv)
-        7. 三重标准卷积 (Three 3x3 Conv)
+    重要性加权特征精炼模块（C3k2 风格，串行增强版）
+    输入：(B, c1, H, W) → 输出：(B, c2, H, W)
+
+    流程：
+        1. 1×1 卷积通道扩增至 2*c_ (c_ = int(c2 * e))
+        2. chunk 分两路：一路恒等映射，另一路进行重要性增强
+        3. 增强分支：
+            - 基础卷积：DWConv (轻量，全图执行)
+            - 增强卷积：标准 3×3，全图执行，但输出被重要性权重调制
+            - 重要性权重：由输入自身预测 (Conv1x1 + Sigmoid)
+        4. 拼接直连与精炼部分后投影输出
 
     参数:
-        c1, c2     : 输入/输出通道数
-        n          : 占位参数（兼容框架）
-        k          : 卷积核大小，默认 3
-        e          : 隐藏通道扩展比，默认 0.5
-        num_levels : 重要性分级数量，默认为 7，可设为较小值
+        c1, c2 : 输入/输出通道数
+        n      : 占位参数（兼容框架）
+        k      : 卷积核大小，默认 3
+        e      : 扩展比，决定隐藏通道 c_ = int(c2 * e)，默认 0.5
     """
-    def __init__(self, c1, c2, n=1, k=3, e=0.5, num_levels=5):
+    def __init__(self, c1, c2, n=1, k=3, e=0.5):
         super().__init__()
-        self.num_levels = num_levels
-        hidden = max(1, int(c1 * e))
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * c_, 1, 1)
 
-        # ---------- 各重要性级别的卷积分支（按计算量升序） ----------
-        self.branches = nn.ModuleList()
-
-        # 1. 深度可分离卷积（DWConv）– 最轻量
-        self.branches.append(nn.Sequential(
-            nn.Conv2d(c1, c1, k, padding=k//2, groups=c1, bias=False),
-            nn.Conv2d(c1, hidden, 1, bias=False),
-            nn.BatchNorm2d(hidden),
+        # 基础轻量分支 (DWConv + PW)
+        self.branch_base = nn.Sequential(
+            nn.Conv2d(c_, c_, k, padding=k//2, groups=c_, bias=False),
+            nn.Conv2d(c_, c_, 1, bias=False),
+            nn.BatchNorm2d(c_),
             nn.SiLU(inplace=True)
-        ))
-
-        # 2. GhostConv（简化版：1×1 压缩 → 3×3 DW → 拼接）
-        self.branches.append(nn.Sequential(
-            nn.Conv2d(c1, hidden // 2, 1, bias=False),
-            nn.BatchNorm2d(hidden // 2),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden // 2, hidden // 2, k, padding=k//2, groups=hidden // 2, bias=False),
-            nn.BatchNorm2d(hidden // 2),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden // 2, hidden, 1, bias=False),
-            nn.BatchNorm2d(hidden),
-            nn.SiLU(inplace=True)
-        ))
-
-        # 3. GSConv（独立类）
-        self.branches.append(GSConv(c1, hidden, k))
-
-        # 4. 标准 3×3 卷积（Single Conv）
-        self.branches.append(nn.Sequential(
-            nn.Conv2d(c1, hidden, k, padding=k//2, bias=False),
-            nn.BatchNorm2d(hidden),
-            nn.SiLU(inplace=True)
-        ))
-
-        # 5. StarBlock（星操作）
-        self.branches.append(StarBlock(c1, hidden, k=k, e=0.5, shortcut=False))
-
-        # 6. 双重标准卷积（Two Conv）
-        self.branches.append(nn.Sequential(
-            nn.Conv2d(c1, hidden, k, padding=k//2, bias=False),
-            nn.BatchNorm2d(hidden),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden, hidden, k, padding=k//2, bias=False),
-            nn.BatchNorm2d(hidden),
-            nn.SiLU(inplace=True)
-        ))
-
-        # 7. 三重标准卷积（Three Conv）
-        self.branches.append(nn.Sequential(
-            nn.Conv2d(c1, hidden, k, padding=k//2, bias=False),
-            nn.BatchNorm2d(hidden),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden, hidden, k, padding=k//2, bias=False),
-            nn.BatchNorm2d(hidden),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden, hidden, k, padding=k//2, bias=False),
-            nn.BatchNorm2d(hidden),
-            nn.SiLU(inplace=True)
-        ))
-
-        self.branches = self.branches[:num_levels]
-
-        # ---------- 分级映射层 ----------
-        self.level_mapper = nn.Sequential(
-            nn.Conv2d(1, num_levels, 1, bias=False),
-            nn.Softmax(dim=1)
         )
 
-        # ---------- 最终融合输出 ----------
-        self.out_conv = Conv(hidden, c2, k=1, act=True)
+        # 增强分支 (标准 3×3)
+        self.branch_enhance = nn.Sequential(
+            nn.Conv2d(c_, c_, k, padding=k//2, bias=False),
+            nn.BatchNorm2d(c_),
+            nn.SiLU(inplace=True)
+        )
 
-    def _compute_importance(self, x):
-        importance = torch.norm(x, p=2, dim=1, keepdim=True)
-        mean = F.avg_pool2d(importance, kernel_size=5, stride=1, padding=2)
-        importance = importance / (mean + 1e-6)
-        return importance.sigmoid()
+        # 重要性预测器：预测空间权重图 (B, 1, H, W)
+        self.importance = nn.Sequential(
+            nn.Conv2d(c_, 1, 1, bias=False),
+            nn.Sigmoid()
+        )
+
+        # 输出投影
+        self.cv2 = Conv(2 * c_, c2, 1, 1)
 
     def forward(self, x):
-        B, C, H, W = x.shape
-        importance = self._compute_importance(x)
-        level_weights = self.level_mapper(importance)      # (B, num_levels, H, W)
-        outputs = [branch(x) for branch in self.branches]  # 每个分支输出 (B, hidden, H, W)
+        y = self.cv1(x)                        # (B, 2*c_, H, W)
+        a, b = y.chunk(2, dim=1)               # 各 (B, c_, H, W)
 
-        out = torch.zeros_like(outputs[0])
-        for i, branch_out in enumerate(outputs):
-            out = out + branch_out * level_weights[:, i:i+1]
+        base = self.branch_base(b)             # 基础输出
 
-        return self.out_conv(out)
+        w = self.importance(b)                 # (B, 1, H, W)，空间重要性
+
+        enhance = self.branch_enhance(b)       # 增强输出
+        enhance = enhance * w                  # 重要区域放大，非重要区域抑制
+
+        b_out = base + enhance                 # 串行融合
+
+        out = torch.cat([a, b_out], dim=1)     # 拼接直连与精炼
+        return self.cv2(out)
 
 
-# ====================== 测试 ======================
+# -------------------- 测试 --------------------
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    for lv in [3, 5, 7]:
-        model = IWConv(128, 256, n=1, k=3, e=0.5, num_levels=lv).to(device)
-        x = torch.randn(2, 128, 40, 40).to(device)
-        y = model(x)
-        print(f"num_levels={lv}, 输入: {x.shape} -> 输出: {y.shape}, "
-              f"参数量: {sum(p.numel() for p in model.parameters()):,}")
+    c1, c2 = 128, 256
+    x = torch.randn(2, c1, 40, 40).to(device)
+    model = IWConv(c1, c2, e=0.5).to(device)
+    y = model(x)
+    params = sum(p.numel() for p in model.parameters())
+    print(f"输入: {x.shape} -> 输出: {y.shape}")
+    print(f"参数量: {params:,}")
