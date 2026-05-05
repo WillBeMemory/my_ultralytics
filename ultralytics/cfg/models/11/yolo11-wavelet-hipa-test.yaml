@@ -20,7 +20,7 @@ backbone:
   - [-1, 1, WaveletStem, [64] ] # 0
   - [-1, 1, nn.Identity, [ ] ]
   - [-1, 2, WaveletRefine, [128]] # 1-P2/4
-  - [-1, 1, SPDConv, [ 2048 ,4, False ] ]
+  - [-1, 1, nn.Identity, [ ] ]
   - [ 2, 1, Conv, [256,3,2]] # 3-P3/8
   - [-1, 2, C3k2, [512, False, 0.25]]
   - [-1, 1, Conv, [512,3,2]] # 5-P4/16
@@ -33,7 +33,7 @@ backbone:
 # YOLO11n head
 head:
   # BiFPN 接收 P2~P5，输出 P3~P5
-  - [[3, 5, 7, 10], 1, BiFPN, [[2048, 512, 512, 1024], [256, 512, 1024]]] # 注意 out_channels 也变为3个值
+  - [[2, 5, 7, 10], 1, BiFPN, [[128, 512, 512, 1024], [256, 512, 1024]]] # 注意 out_channels 也变为3个值
 
   # 只需要三个 SplitList
   - [11, 1, SplitList, [256,  0]]   # P3_out
