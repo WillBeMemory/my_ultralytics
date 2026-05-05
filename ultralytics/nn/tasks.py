@@ -1823,11 +1823,17 @@ def parse_model(d, ch, verbose=True):
             BiFPN,
             CCFPN
         ):
-            raw_channels = args[0]  # [256, 512, 1024]
+            raw_channels = args[0]
             scaled_channels = [make_divisible(min(ch, max_channels) * width, 8) for ch in raw_channels]
-            args = [scaled_channels]  # 只传缩放后的列表
-            c2 = scaled_channels[0]  # 框架占位
-        # elif m is SplitList:
+            # 如果有第二个列表（out_channels），同样进行缩放
+            if len(args) >= 2:
+                raw_out_channels = args[1]
+                scaled_out_channels = [make_divisible(min(ch, max_channels) * width, 8) for ch in raw_out_channels]
+                args = [scaled_channels, scaled_out_channels]
+            else:
+                args = [scaled_channels]
+            c2 = scaled_channels[0]
+            # elif m is SplitList:
         #     # SplitList 参数 [index, raw_out_channels]
         #     # 对通道参数应用缩放，确保与 BiFPN 输出一致
         #     idx, raw_ch = args[0], args[1]

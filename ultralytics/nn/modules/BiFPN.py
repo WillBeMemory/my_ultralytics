@@ -1,136 +1,151 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ultralytics.nn.modules.block import Conv
+from ultralytics.nn.modules.block import Conv, C3k2
+
+
+class BiFPN_Add(nn.Module):
+    def __init__(self, num_inputs=2):
+        super().__init__()
+        self.w = nn.Parameter(torch.ones(num_inputs, dtype=torch.float32))
+        self.eps = 1e-4
+
+    def forward(self, xs):
+        w = F.relu(self.w)
+        w_norm = w / (w.sum() + self.eps)
+        return sum(w_norm[i] * xs[i] for i in range(len(xs)))
 
 
 class BiFPN(nn.Module):
-    """
-    轻量双向特征金字塔 + 固定半层输出 (128, 64, 32)
-    输入: [P2, P3, P4, P5]  (尺寸: 160, 80, 40, 20)
-    输出: [P2.5, P3.5, P4.5] (尺寸: 128, 64, 32)
-    输出通道: P2.5 = c3//2 (128), P3.5 = c4 (256), P4.5 = c5 (512)
-
-    参数:
-        channels : [c2, c3, c4, c5] 输入通道数
-        mid_ch   : 半层融合时的低维共享通道数，默认 64 (可调小以进一步压缩计算量)
-    """
-    def __init__(self, channels, mid_ch=64):
+    def __init__(self, channels, out_channels=None, use_c3k2=False):
         super().__init__()
-        c2, c3, c4, c5 = channels
-        self.out_c2 = c3 // 2   # 128 (对齐标准检测头 P3 的期望通道)
-        self.out_c3 = c4        # 256
-        self.out_c4 = c5        # 512
-        self.mid_ch = mid_ch
+        c2, c3, c4, c5 = channels          # [1024, 256, 256, 512]
+        if out_channels is None:
+            out_channels = [c3, c4, c5]
+        o3, o4, o5 = out_channels           # 目标输出通道，例如 [128, 256, 512]
 
-        # ---------- 横向连接 (1x1 卷积) ----------
-        self.td_conv5 = nn.Conv2d(c5, c4, 1, bias=False)   # P5 -> P4
-        self.td_conv4 = nn.Conv2d(c4, c3, 1, bias=False)   # P4 -> P3
-        self.td_conv3 = nn.Conv2d(c3, c2, 1, bias=False)   # P3 -> P2
+        self.expand_ch = c2                 # 统一扩展通道数 = P2 通道数
 
-        # ---------- 深度可分离下采样 ----------
-        self.down2 = nn.Sequential(
-            nn.Conv2d(c2, c2, 3, stride=2, padding=1, groups=c2, bias=False),
-            nn.Conv2d(c2, c3, 1, bias=False),
-            nn.BatchNorm2d(c3),
-            nn.SiLU(inplace=True)
+        # ---------- 扩张 ----------
+        self.expand_p3 = Conv(c3, self.expand_ch, 1, act=False)   # 256 → 1024
+        self.expand_p4 = Conv(c4, self.expand_ch, 1, act=False)
+        self.expand_p5 = Conv(c5, self.expand_ch, 1, act=False)   # 512 → 1024
+
+        # ---------- P2 注入路径 ----------
+        self.p2_to_p3 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='nearest'),          # 16 → 32
+            Conv(self.expand_ch, self.expand_ch, 1, act=False)
         )
+        self.p2_to_p4 = Conv(self.expand_ch, self.expand_ch, 1, act=False)   # 尺寸不变
+        self.p2_to_p5 = nn.Sequential(
+            nn.Conv2d(self.expand_ch, self.expand_ch, 3, stride=2, padding=1, groups=self.expand_ch, bias=False),
+            Conv(self.expand_ch, self.expand_ch, 1, act=False)
+        )                                                         # 16 → 8
+
+        # ---------- 自顶向下投影 ----------
+        self.td_p5 = Conv(self.expand_ch, self.expand_ch, 1, act=False)  # P5 → P4
+        self.td_p4 = Conv(self.expand_ch, self.expand_ch, 1, act=False)  # P4 → P3
+
+        # ---------- 自底向上投影 ----------
+        self.bu_p3 = Conv(self.expand_ch, self.expand_ch, 1, act=False)  # P3 → P4
+        self.bu_p4 = Conv(self.expand_ch, self.expand_ch, 1, act=False)  # P4 → P5
+
+        # ---------- 加权融合节点 ----------
+        self.fuse_p4_td = BiFPN_Add(2)   # P4_exp + up(P5_exp)
+        self.fuse_p3_td = BiFPN_Add(2)   # P3_exp + up(P4_td)
+        self.fuse_p4_bu = BiFPN_Add(2)   # P4_td + down(P3_bu)
+        self.fuse_p5_bu = BiFPN_Add(2)   # P5_exp + down(P4_bu)
+
+        # ---------- 下采样（深度可分离） ----------
         self.down3 = nn.Sequential(
-            nn.Conv2d(c3, c3, 3, stride=2, padding=1, groups=c3, bias=False),
-            nn.Conv2d(c3, c4, 1, bias=False),
-            nn.BatchNorm2d(c4),
-            nn.SiLU(inplace=True)
+            nn.Conv2d(self.expand_ch, self.expand_ch, 3, stride=2, padding=1, groups=self.expand_ch, bias=False),
+            Conv(self.expand_ch, self.expand_ch, 1, act=False)
         )
         self.down4 = nn.Sequential(
-            nn.Conv2d(c4, c4, 3, stride=2, padding=1, groups=c4, bias=False),
-            nn.Conv2d(c4, c5, 1, bias=False),
-            nn.BatchNorm2d(c5),
-            nn.SiLU(inplace=True)
+            nn.Conv2d(self.expand_ch, self.expand_ch, 3, stride=2, padding=1, groups=self.expand_ch, bias=False),
+            Conv(self.expand_ch, self.expand_ch, 1, act=False)
         )
 
-        # ---------- 共享低维投影 (降维) ----------
-        self.proj_down2 = Conv(c2, mid_ch, 1, act=False)
-        self.proj_down3 = Conv(c3, mid_ch, 1, act=False)
-        self.proj_down4 = Conv(c4, mid_ch, 1, act=False)
-        self.proj_down5 = Conv(c5, mid_ch, 1, act=False)
+        # ---------- 压缩 ----------
+        self.compress_p3 = Conv(self.expand_ch, o3, 1, act=False)   # 1024 → o3
+        self.compress_p4 = Conv(self.expand_ch, o4, 1, act=False)   # 1024 → o4
+        self.compress_p5 = Conv(self.expand_ch, o5, 1, act=False)   # 1024 → o5
 
-        # ---------- 输出投影 (升维) ----------
-        self.proj_up25 = Conv(mid_ch, self.out_c2, 1, act=False)
-        self.proj_up35 = Conv(mid_ch, self.out_c3, 1, act=False)
-        self.proj_up45 = Conv(mid_ch, self.out_c4, 1, act=False)
+        # ---------- 可选精炼 ----------
+        kwa = dict(n=1, shortcut=False, e=0.5)
+        self.refine_p4_td = C3k2(self.expand_ch, self.expand_ch, **kwa) if use_c3k2 else nn.Identity()
+        self.refine_p3_td = C3k2(self.expand_ch, self.expand_ch, **kwa) if use_c3k2 else nn.Identity()
+        self.refine_p4_bu = C3k2(self.expand_ch, self.expand_ch, **kwa) if use_c3k2 else nn.Identity()
+        self.refine_p5_bu = C3k2(self.expand_ch, self.expand_ch, **kwa) if use_c3k2 else nn.Identity()
 
     def forward(self, features):
         p2, p3, p4, p5 = features
 
-        # ========== 自顶向下 (最近邻上采样 + 相加融合) ==========
-        p5_up = F.interpolate(self.td_conv5(p5), size=p4.shape[-2:], mode='nearest')
-        p4_td = p4 + p5_up
+        # 1. 扩张
+        p3_exp = self.expand_p3(p3)   # (B, 1024, 32, 32)
+        p4_exp = self.expand_p4(p4)   # (B, 1024, 16, 16)
+        p5_exp = self.expand_p5(p5)   # (B, 1024, 8, 8)
 
-        p4_up = F.interpolate(self.td_conv4(p4_td), size=p3.shape[-2:], mode='nearest')
-        p3_td = p3 + p4_up
+        # 2. P2 注入
+        p3_exp = p3_exp + self.p2_to_p3(p2)
+        p4_exp = p4_exp + self.p2_to_p4(p2)
+        p5_exp = p5_exp + self.p2_to_p5(p2)
 
-        p3_up = F.interpolate(self.td_conv3(p3_td), size=p2.shape[-2:], mode='nearest')
-        p2_td = p2 + p3_up
+        # 3. 自顶向下
+        p5_up = F.interpolate(self.td_p5(p5_exp), size=p4_exp.shape[-2:], mode='nearest')
+        p4_td = self.refine_p4_td(self.fuse_p4_td([p4_exp, p5_up]))
 
-        # ========== 自底向上 ==========
-        p2_down = self.down2(p2_td)                         # 160 -> 80
-        p3_bu = p3_td + p2_down
+        p4_up = F.interpolate(self.td_p4(p4_td), size=p3_exp.shape[-2:], mode='nearest')
+        p3_td = self.refine_p3_td(self.fuse_p3_td([p3_exp, p4_up]))
 
-        p3_down = self.down3(p3_bu)                         # 80 -> 40
-        p4_bu = p4_td + p3_down
+        # 4. 自底向上
+        p3_down = self.down3(p3_td)
+        p4_bu = self.refine_p4_bu(self.fuse_p4_bu([p4_td, p3_down]))
 
-        p4_down = self.down4(p4_bu)                         # 40 -> 20
-        p5_bu = p5 + p4_down
+        p4_down = self.down4(p4_bu)
+        p5_bu = self.refine_p5_bu(self.fuse_p5_bu([p5_exp, p4_down]))
 
-        # ========== 半层生成 (共享低维投影 + 最近邻插值 + 相加) ==========
-        f2 = self.proj_down2(p2_td)                         # (B,mid_ch,160)
-        f3 = self.proj_down3(p3_bu)                         # (B,mid_ch,80)
-        f4 = self.proj_down4(p4_bu)                         # (B,mid_ch,40)
-        f5 = self.proj_down5(p5_bu)                         # (B,mid_ch,20)
+        # 5. 压缩输出
+        p3_out = self.compress_p3(p3_td)
+        p4_out = self.compress_p4(p4_bu)
+        p5_out = self.compress_p5(p5_bu)
 
-        # 插值到目标尺寸并相加融合
-        p25_low = F.interpolate(f2, size=(128,128), mode='nearest') + \
-                  F.interpolate(f3, size=(128,128), mode='nearest')
-        p35_low = F.interpolate(f3, size=(64,64), mode='nearest') + \
-                  F.interpolate(f4, size=(64,64), mode='nearest')
-        p45_low = F.interpolate(f4, size=(32,32), mode='nearest') + \
-                  F.interpolate(f5, size=(32,32), mode='nearest')
-
-        # 升维到目标输出通道
-        p25 = self.proj_up25(p25_low)   # (B, 128, 128, 128)
-        p35 = self.proj_up35(p35_low)   # (B, 256, 64, 64)
-        p45 = self.proj_up45(p45_low)   # (B, 512, 32, 32)
-
-        return [p25, p35, p45]
+        return [p3_out, p4_out, p5_out]
 
 
-# ====================== 测试 ======================
+# ==================== 简单 main 测试 ====================
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"使用设备: {device}\n")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"设备: {device}\n")
 
-    # YOLO11s 缩放后实际通道 (width=0.5)
-    channels = [64, 256, 256, 512]   # P2, P3, P4, P5
-    bifpn = BiFPN(channels, mid_ch=64).to(device)
+    # 输入通道（你的 backbone 实际值）
+    in_channels  = [1024, 256, 256, 512]   # P2, P3, P4, P5
+    # 输出通道（P3 压缩到 128，其他不变）
+    out_channels = [128, 256, 512]         # P3_out, P4_out, P5_out
 
+    bifpn = BiFPN(in_channels, out_channels, use_c3k2=False).to(device)
+
+    # 构造虚拟输入（尺寸与 backbone 输出一致）
     bs = 2
-    p2 = torch.randn(bs, 64, 160, 160).to(device)
-    p3 = torch.randn(bs, 256, 80, 80).to(device)
-    p4 = torch.randn(bs, 256, 40, 40).to(device)
-    p5 = torch.randn(bs, 512, 20, 20).to(device)
+    p2 = torch.randn(bs, 1024, 16, 16).to(device)
+    p3 = torch.randn(bs,  256, 32, 32).to(device)
+    p4 = torch.randn(bs,  256, 16, 16).to(device)
+    p5 = torch.randn(bs,  512,  8,  8).to(device)
 
-    out = bifpn([p2, p3, p4, p5])
+    inputs = [p2, p3, p4, p5]
+    outputs = bifpn(inputs)
 
+    # 期望输出形状
     expected = [
-        (bs, 128, 128, 128),   # P2.5
-        (bs, 256, 64, 64),     # P3.5
-        (bs, 512, 32, 32),     # P4.5
+        (bs, 128, 32, 32),   # P3_out
+        (bs, 256, 16, 16),   # P4_out
+        (bs, 512,  8,  8),   # P5_out
     ]
 
     print("=== BiFPN 输出形状 ===")
-    for name, feat, exp in zip(["P2.5", "P3.5", "P4.5"], out, expected):
-        print(f"{name}: {feat.shape} (期望 {exp})")
-        assert feat.shape == exp, f"形状不匹配！"
+    for name, out, exp in zip(["P3_out", "P4_out", "P5_out"], outputs, expected):
+        print(f"{name}: {out.shape} (期望 {exp})")
+        assert out.shape == exp, f"形状不匹配！期望 {exp}，实际 {out.shape}"
 
     print("\n✅ 所有输出形状验证通过！")
     print(f"总参数量: {sum(p.numel() for p in bifpn.parameters()):,}")
