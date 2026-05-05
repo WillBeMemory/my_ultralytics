@@ -1,232 +1,146 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ultralytics.nn.modules.block import C3k2, Conv
-from ultralytics.nn.modules import HWD
-from ultralytics.nn.modules.WaveletFusionUp import WaveletFusionUp
-
-
-class BiFPN_Add(nn.Module):
-    """快速归一化加权融合，支持任意数量的输入。"""
-    def __init__(self, num_inputs=2):
-        super().__init__()
-        self.w = nn.Parameter(torch.ones(num_inputs, dtype=torch.float32))
-        self.eps = 1e-4
-
-    def forward(self, xs):
-        w = F.relu(self.w)
-        w_norm = w / (w.sum() + self.eps)
-        return sum(w_norm[i] * xs[i] for i in range(len(xs)))
+from ultralytics.nn.modules.block import Conv
 
 
 class BiFPN(nn.Module):
     """
-    双向特征金字塔网络（EfficientDet 风格），固定三尺度输出。
-    当输入包含 P2 时，将其下采样并融合到 P3（可选）。
-
-    参数:
-        channels       : 输入通道列表，长度 3 (P3,P4,P5) 或 4 (P2,P3,P4,P5)
-        out_channels   : 输出通道列表，长度必须为 3，默认使用 P3-P5 通道。
-        fuse_p2        : 是否启用 P2 融合（仅当长度=4 时生效）
-        p2_to_p3_down  : 下采样 P2 的方式 "hwd" 或 "conv"
+    极速双向特征金字塔 + 半层生成。
+    输入： [P2, P3, P4, P5]  (尺寸：160, 80, 40, 20)
+    输出： [P2.5, P3.5, P4.5] (尺寸：120, 60, 30)
+    输出通道：P2.5 = c3//2, P3.5 = c4, P4.5 = c5
     """
-    def __init__(
-        self,
-        channels,
-        out_channels=None,
-        use_wavelet_up=False,
-        use_hwd_down=True,
-        use_c3k2=False,
-        c3k2_kwargs=None,
-        fuse_p2=True,
-        p2_to_p3_down="hwd",
-    ):
+    def __init__(self, channels, out_channels=None,
+                 use_c3k2=False, c3k2_kwargs=None,
+                 mid_ch=64):
         super().__init__()
-        self.num_inputs = len(channels)
-        self.fuse_p2 = fuse_p2 and (self.num_inputs == 4)
+        assert len(channels) == 4, "需提供4个尺度 [c2,c3,c4,c5]"
+        c2, c3, c4, c5 = channels
+        self.out_c2 = c3 // 2   # 128
+        self.out_c3 = c4        # 256
+        self.out_c4 = c5        # 512
+        self.mid_ch = mid_ch
 
-        # 确定 P3、P4、P5 通道
-        if self.num_inputs == 4:
-            c2, c3, c4, c5 = channels
-        else:
-            c3, c4, c5 = channels
+        # ---------- 横向连接 (1x1 卷积) ----------
+        self.td_conv5 = nn.Conv2d(c5, c4, 1, bias=False)
+        self.td_conv4 = nn.Conv2d(c4, c3, 1, bias=False)
+        self.td_conv3 = nn.Conv2d(c3, c2, 1, bias=False)
 
-        self.c3, self.c4, self.c5 = c3, c4, c5
-
-        if out_channels is None:
-            out_channels = [c3, c4, c5]
-        self.out_channels = out_channels
-
-        kwa = c3k2_kwargs if c3k2_kwargs else dict(n=1, shortcut=False, e=0.5)
-
-        # ---------- P2 融合模块 ----------
-        if self.fuse_p2:
-            if p2_to_p3_down == "hwd":
-                self.p2_down = HWD(c2, c3)
-            else:
-                self.p2_down = Conv(c2, c3, k=3, s=2, act=True)
-        else:
-            self.p2_down = None
-
-        # ---------- 通道对齐（1x1 卷积） ----------
-        # 自顶向下通路：两个横向连接，顺序为 (P5->P4, P4->P3)
-        self.lateral_convs = nn.ModuleList([
-            nn.Conv2d(c5, c4, 1, bias=False),  # P5 -> P4
-            nn.Conv2d(c4, c3, 1, bias=False),  # P4 -> P3
-        ])
-        # 小波上采样后的后置投影（仅在 use_wavelet_up=True 时使用）
-        if use_wavelet_up:
-            self.up_proj = nn.ModuleList([
-                nn.Conv2d(c5, c4, 1, bias=False),
-                nn.Conv2d(c4, c3, 1, bias=False),
-            ])
-        else:
-            self.up_proj = nn.ModuleList([nn.Identity(), nn.Identity()])
-
-        # 自底向上通路：两个下采样通道映射 (P3->P4, P4->P5)
-        self.down_convs = nn.ModuleList([
+        # ---------- 下采样（深度可分离，保持轻量） ----------
+        self.down2 = nn.Sequential(
+            nn.Conv2d(c2, c2, 3, stride=2, padding=1, groups=c2, bias=False),
+            nn.Conv2d(c2, c3, 1, bias=False),
+            nn.BatchNorm2d(c3),
+            nn.SiLU(inplace=True)
+        )
+        self.down3 = nn.Sequential(
+            nn.Conv2d(c3, c3, 3, stride=2, padding=1, groups=c3, bias=False),
             nn.Conv2d(c3, c4, 1, bias=False),
+            nn.BatchNorm2d(c4),
+            nn.SiLU(inplace=True)
+        )
+        self.down4 = nn.Sequential(
+            nn.Conv2d(c4, c4, 3, stride=2, padding=1, groups=c4, bias=False),
             nn.Conv2d(c4, c5, 1, bias=False),
-        ])
+            nn.BatchNorm2d(c5),
+            nn.SiLU(inplace=True)
+        )
 
-        # ---------- 融合节点 ----------
-        self.td_nodes = nn.ModuleList([BiFPN_Add(2), BiFPN_Add(2)])  # P5->P4, P4->P3
-        self.bu_nodes = nn.ModuleList([BiFPN_Add(2), BiFPN_Add(2)])  # P3->P4, P4->P5
+        # ---------- 共享低维投影 ----------
+        self.proj_down2 = Conv(c2, mid_ch, 1, act=False)
+        self.proj_down3 = Conv(c3, mid_ch, 1, act=False)
+        self.proj_down4 = Conv(c4, mid_ch, 1, act=False)
+        self.proj_down5 = Conv(c5, mid_ch, 1, act=False)
 
-        # ---------- 上采样模块 ----------
-        self.ups = nn.ModuleList()
-        for i in range(2):
-            if use_wavelet_up:
-                low_ch = c4 if i == 0 else c3
-                high_ch = c5 if i == 0 else c4
-                self.ups.append(WaveletFusionUp(low_ch, high_ch, k=3))
-            else:
-                self.ups.append(None)
+        # ---------- 输出投影 ----------
+        self.proj_up25 = Conv(mid_ch, self.out_c2, 1, act=False)
+        self.proj_up35 = Conv(mid_ch, self.out_c3, 1, act=False)
+        self.proj_up45 = Conv(mid_ch, self.out_c4, 1, act=False)
 
-        # ---------- 下采样模块 ----------
-        if use_hwd_down:
-            self.downs = nn.ModuleList([HWD(c3, c4), HWD(c4, c5)])
-        else:
-            self.downs = nn.ModuleList([Conv(c3, c4, k=3, s=2, act=True),
-                                        Conv(c4, c5, k=3, s=2, act=True)])
-
-        # ---------- 可选后处理 ----------
+        # ---------- 可选后处理（默认关闭） ----------
+        kwa = c3k2_kwargs if c3k2_kwargs else dict(n=1, shortcut=False, e=0.5)
         if use_c3k2:
-            self.refines_td = nn.ModuleList([
-                C3k2(out_channels[2], out_channels[2], **kwa),
-                C3k2(out_channels[1], out_channels[1], **kwa),
-                C3k2(out_channels[0], out_channels[0], **kwa),
-            ])
-            self.refines_bu = nn.ModuleList([
-                C3k2(out_channels[0], out_channels[0], **kwa),
-                C3k2(out_channels[1], out_channels[1], **kwa),
-                C3k2(out_channels[2], out_channels[2], **kwa),
-            ])
+            from ultralytics.nn.modules.block import C3k2
+            self.refine_p4_td = C3k2(c4, c4, **kwa)
+            self.refine_p3_td = C3k2(c3, c3, **kwa)
+            self.refine_p2_td = C3k2(c2, c2, **kwa)
+            self.refine_p3_bu = C3k2(c3, c3, **kwa)
+            self.refine_p4_bu = C3k2(c4, c4, **kwa)
+            self.refine_p5_bu = C3k2(c5, c5, **kwa)
         else:
-            self.refines_td = None
-            self.refines_bu = None
+            self.refine_p4_td = self.refine_p3_td = self.refine_p2_td = nn.Identity()
+            self.refine_p3_bu = self.refine_p4_bu = self.refine_p5_bu = nn.Identity()
 
     def forward(self, features):
-        # 1. 处理 P2 融合
-        if self.fuse_p2 and len(features) == 4:
-            p2, p3, p4, p5 = features
-            p2_down = self.p2_down(p2)
-            p3 = p3 + p2_down
-            features = [p3, p4, p5]
-        elif len(features) == 4:
-            features = features[1:]  # 丢弃 P2
+        p2, p3, p4, p5 = features
 
-        # 现在 features = [p3, p4, p5]
-        p3, p4, p5 = features
+        # ========== 自顶向下（使用最近邻插值 + 直接相加） ==========
+        p5_up = F.interpolate(self.td_conv5(p5), size=p4.shape[-2:], mode='nearest')
+        p4_td = self.refine_p4_td(p4 + p5_up)
 
-        # 反转顺序，方便从高分辨率开始处理：P5, P4, P3
-        feats = [p5, p4, p3]
+        p4_up = F.interpolate(self.td_conv4(p4_td), size=p3.shape[-2:], mode='nearest')
+        p3_td = self.refine_p3_td(p3 + p4_up)
 
-        # ---------- 自顶向下 ----------
-        td = [None, None, None]
-        td[0] = feats[0]  # P5
+        p3_up = F.interpolate(self.td_conv3(p3_td), size=p2.shape[-2:], mode='nearest')
+        p2_td = self.refine_p2_td(p2 + p3_up)
 
-        # P5 -> P4
-        high = td[0]       # P5
-        low_orig = feats[1]  # P4
-        i = 0  # 索引
-        up = self.ups[i]
-        if up is not None:
-            high_up = up(low_orig, high)      # 输出通道 = c5
-            high_up = self.up_proj[i](high_up)  # c5 -> c4
-        else:
-            high_aligned = self.lateral_convs[i](high)   # c5 -> c4
-            high_up = F.interpolate(high_aligned, size=low_orig.shape[-2:], mode='nearest')
-        td_feat = self.td_nodes[i]([low_orig, high_up])
-        if self.refines_td:
-            td_feat = self.refines_td[i](td_feat)
-        td[1] = td_feat   # P4_td
+        # ========== 自底向上 ==========
+        p2_down = self.down2(p2_td)
+        p3_bu = self.refine_p3_bu(p3_td + p2_down)
 
-        # P4_td -> P3
-        high = td[1]       # P4_td
-        low_orig = feats[2]  # P3
-        i = 1
-        up = self.ups[i]
-        if up is not None:
-            high_up = up(low_orig, high)      # 输出通道 = c4
-            high_up = self.up_proj[i](high_up)  # c4 -> c3
-        else:
-            high_aligned = self.lateral_convs[i](high)   # c4 -> c3
-            high_up = F.interpolate(high_aligned, size=low_orig.shape[-2:], mode='nearest')
-        td_feat = self.td_nodes[i]([low_orig, high_up])
-        if self.refines_td:
-            td_feat = self.refines_td[i](td_feat)
-        td[2] = td_feat   # P3_td
+        p3_bu_down = self.down3(p3_bu)
+        p4_bu = self.refine_p4_bu(p4_td + p3_bu_down)
 
-        # ---------- 自底向上 ----------
-        out = [None, None, None]
-        out[0] = td[2]   # P3_td
+        p4_bu_down = self.down4(p4_bu)
+        p5_bu = self.refine_p5_bu(p5 + p4_bu_down)
 
-        # P3 -> P4
-        low_td = out[0]        # P3_td
-        high_td = td[1]        # P4_td
-        low_down = self.downs[0](low_td)  # P3_td -> P4 size, 通道自动对齐到 c4
-        bu_feat = self.bu_nodes[0]([high_td, low_down])
-        if self.refines_bu:
-            bu_feat = self.refines_bu[1](bu_feat)  # 注意索引：bu_nodes 的输出对应 out[1]，refines_bu[1] 是正确的
-        out[1] = bu_feat        # P4_out
+        # ========== 半层生成（最近邻插值 + 直接相加） ==========
+        f2 = self.proj_down2(p2_td)
+        f3 = self.proj_down3(p3_bu)
+        f4 = self.proj_down4(p4_bu)
+        f5 = self.proj_down5(p5_bu)
 
-        # P4 -> P5
-        low_td = out[1]         # P4_out
-        high_td = td[0]         # P5
-        low_down = self.downs[1](low_td)  # P4_out -> P5 size, 通道对齐到 c5
-        bu_feat = self.bu_nodes[1]([high_td, low_down])
-        if self.refines_bu:
-            bu_feat = self.refines_bu[2](bu_feat)
-        out[2] = bu_feat        # P5_out
+        p25_low = F.interpolate(f2, size=(120, 120), mode='nearest') + \
+                  F.interpolate(f3, size=(120, 120), mode='nearest')
+        p35_low = F.interpolate(f3, size=(60, 60), mode='nearest') + \
+                  F.interpolate(f4, size=(60, 60), mode='nearest')
+        p45_low = F.interpolate(f4, size=(30, 30), mode='nearest') + \
+                  F.interpolate(f5, size=(30, 30), mode='nearest')
 
-        # 返回 P3_out, P4_out, P5_out
-        return [out[0], out[1], out[2]]
+        p25 = self.proj_up25(p25_low)
+        p35 = self.proj_up35(p35_low)
+        p45 = self.proj_up45(p45_low)
+
+        return [p25, p35, p45]
 
 
-# ============================================
-# 测试代码
-# ============================================
+# ====================== 测试 ======================
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"使用设备: {device}\n")
 
-    # 测试三尺度（无 P2）
-    print("==== 三尺度 BiFPN (无 P2) ====")
-    bifpn = BiFPN([64, 128, 256]).to(device)
-    p3 = torch.randn(2, 64, 80, 80).to(device)
-    p4 = torch.randn(2, 128, 40, 40).to(device)
-    p5 = torch.randn(2, 256, 20, 20).to(device)
-    out = bifpn([p3, p4, p5])
-    for i, o in enumerate(out):
-        print(f"P{i+3}: {o.shape}")   # 应为 (2,64,80,80) (2,128,40,40) (2,256,20,20)
+    channels = [64, 256, 256, 512]   # 缩放后实际通道
+    bifpn = BiFPN(channels, mid_ch=64, use_c3k2=False).to(device)
 
-    # 测试四尺度（P2 融合）
-    print("\n==== 四尺度 BiFPN (P2 融合) ====")
-    bifpn4 = BiFPN([32, 64, 128, 256], fuse_p2=True, p2_to_p3_down="conv").to(device)
-    p2 = torch.randn(2, 32, 160, 160).to(device)
-    p3 = torch.randn(2, 64, 80, 80).to(device)
-    p4 = torch.randn(2, 128, 40, 40).to(device)
-    p5 = torch.randn(2, 256, 20, 20).to(device)
-    out = bifpn4([p2, p3, p4, p5])
-    for i, o in enumerate(out):
-        print(f"P{i+3}: {o.shape}")
+    bs = 2
+    p2 = torch.randn(bs, 64, 160, 160).to(device)
+    p3 = torch.randn(bs, 256, 80, 80).to(device)
+    p4 = torch.randn(bs, 256, 40, 40).to(device)
+    p5 = torch.randn(bs, 512, 20, 20).to(device)
+
+    out = bifpn([p2, p3, p4, p5])
+
+    expected = [
+        (bs, 128, 120, 120),   # P2.5
+        (bs, 256, 60, 60),     # P3.5
+        (bs, 512, 30, 30),     # P4.5
+    ]
+
+    print("=== BiFPN 输出形状 ===")
+    for name, feat, exp in zip(["P2.5", "P3.5", "P4.5"], out, expected):
+        print(f"{name}: {feat.shape} (期望 {exp})")
+        assert feat.shape == exp, f"形状不匹配！"
+
+    print("\n✅ 所有输出形状验证通过！")
+    print(f"总参数量: {sum(p.numel() for p in bifpn.parameters()):,}")
