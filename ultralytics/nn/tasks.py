@@ -62,6 +62,8 @@ from ultralytics.nn.modules.SlimDetect import SlimDetect
 from ultralytics.nn.modules.IWConv import IWConv
 from ultralytics.nn.modules.SPDConv import SPDConv
 
+from ultralytics.nn.modules.InterpDownsample import InterpDownsample
+
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
     AIFI,
@@ -1671,6 +1673,7 @@ def parse_model(d, ch, verbose=True):
             WaveletRefine,
             IWConv,
             SPDConv,
+            InterpDownsample,
 
             Classify,
             Conv,
