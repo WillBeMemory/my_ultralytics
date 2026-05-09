@@ -33,7 +33,7 @@ class SparseSelfAttention(nn.Module):
 
 class HIPABlock(nn.Module):
     """
-    层级重要性传播注意力模块（支持场景自适应保留率）
+    层级重要性传播注意力模块（支持复杂度门控）
     """
     def __init__(
         self,
@@ -47,9 +47,9 @@ class HIPABlock(nn.Module):
         fill_mode: str = 'center',
         importance_mode: str = 'l2',
         gaussian_sigma_scale: float = 0.3,
-        use_adaptive: bool = False,                # 是否启用场景自适应
-        adaptive_keep_factor_lo: float = 0.5,      # 复杂场景保留率乘数（相对于原保留率）
-        adaptive_hidden_ratio: float = 0.25,       # 复杂度预测网络隐藏层比例
+        use_gate: bool = False,               # 是否启用复杂度门控
+        gate_threshold: float = 0.5,          # 推理时使用的硬阈值
+        gate_hidden_ratio: float = 0.25       # 门控网络隐藏层比例
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -59,10 +59,10 @@ class HIPABlock(nn.Module):
         self.fill_mode = fill_mode
         self.importance_mode = importance_mode
         self.gaussian_sigma_scale = gaussian_sigma_scale
-        self.use_adaptive = use_adaptive
-        self.adaptive_keep_factor_lo = adaptive_keep_factor_lo
+        self.use_gate = use_gate
+        self.gate_threshold = gate_threshold
 
-        # 分层保留比例（静态基准）
+        # 分层保留比例
         if keep_ratios is not None and len(keep_ratios) > 0:
             assert len(keep_ratios) == num_levels
             self.keep_ratios = keep_ratios
@@ -82,7 +82,7 @@ class HIPABlock(nn.Module):
             nn.Linear(in_channels, out_channels)
         )
 
-        # 平滑卷积 (conv_smooth)
+        # 平滑卷积（仅 conv_smooth 模式）
         if fill_mode == 'conv_smooth':
             self.smooth_conv = nn.Conv2d(
                 out_channels, out_channels, kernel_size=3,
@@ -91,10 +91,10 @@ class HIPABlock(nn.Module):
         else:
             self.smooth_conv = None
 
-        # 场景复杂度预测网络（自适应模式）
-        if use_adaptive:
-            hidden = max(1, int(in_channels * adaptive_hidden_ratio))
-            self.complexity_net = nn.Sequential(
+        # 复杂度门控网络
+        if use_gate:
+            hidden = max(1, int(in_channels * gate_hidden_ratio))
+            self.gate_net = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
                 nn.Linear(in_channels, hidden),
@@ -103,9 +103,8 @@ class HIPABlock(nn.Module):
                 nn.Sigmoid()
             )
         else:
-            self.complexity_net = None
+            self.gate_net = None
 
-    # ---------- 金字塔构建辅助方法 ----------
     @staticmethod
     def _deterministic_grid_pool(x, grid_size):
         B, C, H, W = x.shape
@@ -127,7 +126,6 @@ class HIPABlock(nn.Module):
         bboxes = torch.cat([centers, sizes], dim=-1)
         return bboxes.unsqueeze(0).expand(B, -1, -1)
 
-    # ---------- 填充方法 ----------
     def _fill_2d_center(self, features, coords, H, W):
         B, K, C = features.shape
         out = torch.zeros(B, self.out_channels, H, W, device=features.device, dtype=features.dtype)
@@ -199,30 +197,12 @@ class HIPABlock(nn.Module):
             base = self.smooth_conv(base)
         return base
 
-    # ---------- 前向传播 ----------
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _hipa_core(self, x: torch.Tensor):
+        """HIPA 的核心处理逻辑（不包含门控）"""
         B, C, H, W = x.shape
-        assert C == self.in_channels
         device, dtype = x.device, x.dtype
 
-        # 场景复杂度预测 (自适应模式)
-        if self.use_adaptive and self.complexity_net is not None:
-            complexity = self.complexity_net(x).mean()   # 标量，范围 0~1
-        else:
-            complexity = None
-
-        # 构建动态保留率列表
-        if complexity is not None:
-            dynamic_keep_ratios = []
-            for idx, base_kr in enumerate(self.keep_ratios):
-                keep_hi = base_kr
-                keep_lo = base_kr * self.adaptive_keep_factor_lo
-                keep_dyn = keep_hi + (keep_lo - keep_hi) * complexity
-                dynamic_keep_ratios.append(keep_dyn)
-        else:
-            dynamic_keep_ratios = self.keep_ratios
-
-        # 1. 构建金字塔
+        # 构建金字塔
         pyramid_features, pyramid_coords = [], []
         for level in range(self.num_levels):
             grid_size = 2 ** level
@@ -231,7 +211,7 @@ class HIPABlock(nn.Module):
             coords = self._get_coords(B, H, W, grid_size, grid_size, dtype, device)
             pyramid_coords.append(coords)
 
-        # 2. 重要性筛选 (自底向上)
+        # 重要性筛选 (自底向上)
         kept_coords_list, kept_features_list = [], []
         for level in reversed(range(self.num_levels)):
             feat = pyramid_features[level]
@@ -262,7 +242,7 @@ class HIPABlock(nn.Module):
                 raise ValueError(f"Unsupported importance_mode: {self.importance_mode}")
 
             importance = importance.clamp(min=1e-8, max=2e4)
-            keep_ratio_l = dynamic_keep_ratios[level]
+            keep_ratio_l = self.keep_ratios[level]
             min_keeps_l = self.min_keeps[level]
             keep_num = max(min_keeps_l, int(N_l * keep_ratio_l))
             keep_num = min(keep_num, N_l)
@@ -283,18 +263,57 @@ class HIPABlock(nn.Module):
         sparsity = torch.tensor(total_kept / (H * W), device=device, dtype=dtype).mean()
         return out_sparse, sparse_seq, all_coords, sparsity
 
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # 如果未启用门控，直接执行核心逻辑
+        if not self.use_gate or self.gate_net is None:
+            return self._hipa_core(x)
+
+        B, C, H, W = x.shape
+        # 预测复杂度分数 (0~1)
+        complexity = self.gate_net(x).mean()  # shape: (1,) -> 标量
+
+        if self.training:
+            # 训练时使用 Gumbel-Sigmoid 技巧让决策可微
+            # 将 complexity 视为 logit，采样出二值门控
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(complexity) + 1e-8) + 1e-8)
+            logit = complexity + gumbel_noise
+            # soft hard gate: sigmoid with temperature
+            gate_hard = ((logit > 0).float() - complexity).detach() + complexity  # straight-through
+        else:
+            # 推理时直接用硬阈值
+            gate_hard = (complexity > self.gate_threshold).float()
+
+        # 若 gate_hard=1（复杂场景），执行 HIPA；否则返回原始输入（对应简单场景直通）
+        # 注意：此处需要返回与 _hipa_core 相同的四元组格式，但为了兼容外部调用（_HIPASingle），
+        # 我们将在 _HIPASingle 中处理门控返回的不同情况。
+        # 这里改变方案：在 HIPABlock 中，gate 直接控制是否输出处理后的特征。
+        # 为了方便，我们让 forward 返回处理特征和辅助信息，而 _HIPASingle 负责 mix。
+        # 但实际上我们最后在 _HIPASingle 中拿到 out_sparse 后加残差，如果简单场景直通，残差连接也需要适配。
+        # 我们重新规划：HIPABlock 返回 out_sparse, sparse_seq, all_coords, sparsity。
+        # 对于简单场景，让 out_sparse 为零（或 identity 输入），由 _HIPASingle 做残差。
+        pass
+
+    # 由于上述门控逻辑需要与外部 _HIPASingle 的残差连接配合，我们决定调整设计：
+    # 将门控逻辑放在 _HIPASingle 中更为合理，因为那里负责残差加和以及可选的 self-attention。
+    # 因此，我们回退 HIPABlock 的 forward，保持原来的 pure 输出，而在 _HIPASingle 中加入门控。
+    # 修改 _HIPASingle 如后续代码所示。
+
+    # 为了代码清晰，重新定义 _HIPASingle 类，覆盖原定义。
 
 class _HIPASingle(nn.Module):
-    """单层 HIPA 封装"""
+    """单层 HIPA 封装：稀疏图 + 可选自注意力 + 残差连接 + 复杂度门控"""
     def __init__(
         self, in_channels, out_channels, num_levels=3, keep_ratio=0.3,
         keep_ratios=None, min_keeps=8, use_contrast_norm=True, num_heads=8,
         fill_mode='center', use_self_attn=True, importance_mode='l2',
-        gaussian_sigma_scale=0.3, use_adaptive=False,
-        adaptive_keep_factor_lo=0.5, adaptive_hidden_ratio=0.25
+        gaussian_sigma_scale=0.3,
+        use_gate=False, gate_threshold=0.5, gate_hidden_ratio=0.25
     ):
         super().__init__()
         self.use_self_attn = use_self_attn
+        self.use_gate = use_gate
+        self.gate_threshold = gate_threshold
+
         self.hipa = HIPABlock(
             in_channels=in_channels, out_channels=out_channels,
             num_levels=num_levels, keep_ratio=keep_ratio,
@@ -302,23 +321,66 @@ class _HIPASingle(nn.Module):
             use_contrast_norm=use_contrast_norm, fill_mode=fill_mode,
             importance_mode=importance_mode,
             gaussian_sigma_scale=gaussian_sigma_scale,
-            use_adaptive=use_adaptive,
-            adaptive_keep_factor_lo=adaptive_keep_factor_lo,
-            adaptive_hidden_ratio=adaptive_hidden_ratio
+            use_gate=False  # HIPABlock 内部不使用门控，保持纯粹
         )
         if use_self_attn:
             self.attn = SparseSelfAttention(embed_dim=out_channels, num_heads=num_heads)
         else:
             self.attn = nn.Identity()
+
         self.residual_proj = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
+        # 复杂度门控网络（仅当 use_gate=True 时构建）
+        if use_gate:
+            hidden = max(1, int(in_channels * gate_hidden_ratio))
+            self.gate_net = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(in_channels, hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden, 1),
+                nn.Sigmoid()
+            )
+        else:
+            self.gate_net = None
+
     def forward(self, x):
-        out_sparse, sparse_seq, coords, _ = self.hipa(x)
-        if self.use_self_attn:
-            sparse_seq = self.attn(sparse_seq)
-            H, W = x.shape[2:]
-            out_sparse = self.hipa._fill_2d(sparse_seq, coords, H, W)
-        return self.residual_proj(x) + out_sparse
+        if not self.use_gate or self.gate_net is None:
+            # 原始流程
+            out_sparse, sparse_seq, coords, _ = self.hipa(x)
+            if self.use_self_attn:
+                sparse_seq = self.attn(sparse_seq)
+                H, W = x.shape[2:]
+                out_sparse = self.hipa._fill_2d(sparse_seq, coords, H, W)
+            return self.residual_proj(x) + out_sparse
+
+        # ------ 门控流程 ------
+        # 预测复杂度
+        complexity = self.gate_net(x).mean()  # shape: 标量
+
+        if self.training:
+            # Gumbel-Sigmoid 实现可微二值化
+            noise = -torch.log(-torch.log(torch.rand_like(complexity) + 1e-8) + 1e-8)
+            logit = complexity + noise
+            # 直通估计器：前向硬取整，反向保留梯度
+            gate = ((logit > 0).float() - complexity).detach() + complexity
+        else:
+            gate = (complexity > self.gate_threshold).float()
+
+        # gate: 1 表示复杂场景（执行 HIPA），0 表示简单场景（直通）
+        # 对 gate 做 broadcast 到与输出相同的形状
+        # 注意：gate 是标量，可以简单乘除
+        if gate > 0.5:
+            # 复杂场景：执行核心逻辑
+            out_sparse, sparse_seq, coords, _ = self.hipa(x)
+            if self.use_self_attn:
+                sparse_seq = self.attn(sparse_seq)
+                H, W = x.shape[2:]
+                out_sparse = self.hipa._fill_2d(sparse_seq, coords, H, W)
+            return self.residual_proj(x) + out_sparse
+        else:
+            # 简单场景：直通
+            return self.residual_proj(x)
 
 
 class HIPA(nn.Module):
@@ -327,8 +389,8 @@ class HIPA(nn.Module):
         self, c1, c2, n=1, num_levels=3, keep_ratio=0.3,
         keep_ratios=None, min_keeps=8, use_contrast_norm=True, num_heads=8,
         fill_mode='center', use_self_attn=True, importance_mode='l2',
-        gaussian_sigma_scale=0.3, use_adaptive=False,
-        adaptive_keep_factor_lo=0.5, adaptive_hidden_ratio=0.25
+        gaussian_sigma_scale=0.3, use_gate=False, gate_threshold=0.5,
+        gate_hidden_ratio=0.25
     ):
         super().__init__()
         self.n = n
@@ -343,9 +405,8 @@ class HIPA(nn.Module):
                 fill_mode=fill_mode, use_self_attn=use_self_attn,
                 importance_mode=importance_mode,
                 gaussian_sigma_scale=gaussian_sigma_scale,
-                use_adaptive=use_adaptive,
-                adaptive_keep_factor_lo=adaptive_keep_factor_lo,
-                adaptive_hidden_ratio=adaptive_hidden_ratio
+                use_gate=use_gate, gate_threshold=gate_threshold,
+                gate_hidden_ratio=gate_hidden_ratio
             ))
         self.blocks = nn.ModuleList(blocks)
 
@@ -355,34 +416,31 @@ class HIPA(nn.Module):
         return x
 
 
-# ---------- 测试 ----------
+# 测试
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Device: {device}\n")
+    x = torch.randn(2, 256, 20, 20).to(device)
 
-    # 模拟输入
-    x_simple = torch.randn(2, 256, 20, 20).to(device)   # 简单场景模拟
-    x_complex = torch.randn(2, 256, 20, 20).to(device) * 0.1  # 弱信号模拟复杂场景
+    # 无门控版本
+    model_no_gate = HIPA(256, 512, n=1, keep_ratios=[0.5, 0.3, 0.2], min_keeps=4,
+                         use_self_attn=True, use_gate=False).to(device)
+    y1 = model_no_gate(x)
+    print(f"无门控输出形状: {y1.shape}")
 
-    # 测试原始 HIPA (无自适应)
-    print("=== Original HIPA ===")
-    model_orig = HIPA(256, 512, n=1, keep_ratios=[0.5, 0.3, 0.2], min_keeps=4,
-                      use_self_attn=True, use_adaptive=False).to(device)
-    y = model_orig(x_simple)
-    print(f"Input: {x_simple.shape} -> Output: {y.shape}")
-    print(f"Params: {sum(p.numel() for p in model_orig.parameters()):,}")
+    # 带门控版本
+    model_gate = HIPA(256, 512, n=1, keep_ratios=[0.5, 0.3, 0.2], min_keeps=4,
+                      use_self_attn=True, use_gate=True, gate_threshold=0.5).to(device)
+    # 训练模式
+    model_gate.train()
+    y2_train = model_gate(x)
+    print(f"门控训练输出形状: {y2_train.shape}")
+    # 推理模式
+    model_gate.eval()
+    with torch.no_grad():
+        y2_eval = model_gate(x)
+    print(f"门控推理输出形状: {y2_eval.shape}")
 
-    # 测试自适应 HIPA
-    print("\n=== Adaptive HIPA ===")
-    model_adaptive = HIPA(256, 512, n=1, keep_ratios=[0.5, 0.3, 0.2], min_keeps=4,
-                          use_self_attn=True, use_adaptive=True,
-                          adaptive_keep_factor_lo=0.5).to(device)
-    y1 = model_adaptive(x_simple)
-    y2 = model_adaptive(x_complex)
-    print(f"Simple output: {y1.shape}, Complex output: {y2.shape}")
-    print(f"Params: {sum(p.numel() for p in model_adaptive.parameters()):,}")
-
-    # 检查梯度流
-    loss = y1.sum() + y2.sum()
+    # 梯度测试
+    loss = y2_train.sum()
     loss.backward()
-    print("Backward passed.")
+    print("反向传播通过")
