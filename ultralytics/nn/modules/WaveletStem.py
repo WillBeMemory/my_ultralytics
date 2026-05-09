@@ -1,188 +1,162 @@
-# ============================================
-# File: ultralytics/nn/modules/WaveletStem_Denoise.py
-# ============================================
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-__ALL__ = ['WaveletStem']
 
-
+# ================== Haar 小波滤波器 ==================
 def haar_filters(in_channels: int):
-    """生成 Haar 小波的分解滤波器，形状 (in_channels*4, 1, 2, 2)"""
     dec_lo = torch.tensor([1 / 2, 1 / 2])
     dec_hi = torch.tensor([1 / 2, -1 / 2])
     base = torch.stack([
         dec_lo.unsqueeze(0) * dec_lo.unsqueeze(1),  # LL
         dec_lo.unsqueeze(0) * dec_hi.unsqueeze(1),  # LH
         dec_hi.unsqueeze(0) * dec_lo.unsqueeze(1),  # HL
-        dec_hi.unsqueeze(0) * dec_hi.unsqueeze(1)  # HH
+        dec_hi.unsqueeze(0) * dec_hi.unsqueeze(1)   # HH
     ], dim=0)  # (4, 2, 2)
     filters = base[:, None].repeat(1, in_channels, 1, 1)  # (4, C, 2, 2)
     return filters.reshape(in_channels * 4, 1, 2, 2)
 
 
 def wavelet_decompose(x: torch.Tensor, filters: torch.Tensor) -> torch.Tensor:
-    """小波分解：输入 (B,C,H,W)，输出 (B,C*4,H/2,W/2)"""
     B, C, H, W = x.shape
-    x = F.conv2d(x, filters, stride=2, groups=C, padding=0)
-    return x
+    return F.conv2d(x, filters, stride=2, groups=C, padding=0)
 
 
-class SubbandDenoise(nn.Module):
+# ================== 方向性子带卷积 ==================
+class DirectionalConv(nn.Module):
     """
-    小波子带差异化去噪模块。
-    对四个子带分别采用不同的可学习去噪策略：
-    - LL: 可学习衰减系数（软抑制背景，保留轮廓）
-    - LH/HL: 共享的标量软阈值（保边去噪）
-    - HH: 逐通道软阈值（精准切除噪声尖峰）
+    根据不同子带特性设计的方向卷积：
+    - LL: 标准 3×3 深度卷积
+    - LH: (1, 3) 垂直条状深度卷积（增强水平边缘）
+    - HL: (3, 1) 水平条状深度卷积（增强垂直边缘）
+    - HH: 3×3 深度卷积，可初始化为对角模式（强化对角边缘）
     """
-
-    def __init__(self, channels: int, init_ll_alpha: float = 0.8):
+    def __init__(self, channels: int, mode: str, use_diag_init: bool = True):
         super().__init__()
-        self.channels = channels
-        # LL 衰减因子初始化为 1.0 (sigmoid后≈0.73，实际更接近1？需调整)
-        # 改为初始值 2.0，使 sigmoid(2.0) ≈ 0.88，轻微抑制
-        self.ll_alpha = nn.Parameter(torch.tensor(2.0))
+        self.mode = mode
+        if mode == 'll':
+            self.conv = nn.Conv2d(channels, channels, 3, padding=1,
+                                  groups=channels, bias=False)
+        elif mode == 'lh':
+            self.conv = nn.Conv2d(channels, channels, (1, 3), padding=(0, 1),
+                                  groups=channels, bias=False)
+        elif mode == 'hl':
+            self.conv = nn.Conv2d(channels, channels, (3, 1), padding=(1, 0),
+                                  groups=channels, bias=False)
+        elif mode == 'hh':
+            self.conv = nn.Conv2d(channels, channels, 3, padding=1,
+                                  groups=channels, bias=False)
+            if use_diag_init:
+                self._init_diag_weights()
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
+        self.bn = nn.BatchNorm2d(channels)
+        self.act = nn.SiLU(inplace=True)
 
-        # LH/HL 阈值初始为负值，使 softplus 输出接近 0
-        self.lh_hl_thr = nn.Parameter(torch.tensor(-4.0))  # softplus(-4)≈0.018
+    def _init_diag_weights(self):
+        """初始化 HH 卷积核为对角增强模式（主对角线正，反对角线负）"""
+        with torch.no_grad():
+            weight = self.conv.weight  # (C, 1, 3, 3)
+            nn.init.zeros_(weight)
+            # 主对角线 (+)
+            weight[:, 0, 0, 0] = 1.0
+            weight[:, 0, 1, 1] = 1.0
+            weight[:, 0, 2, 2] = 1.0
+            # 反对角线 (-)
+            weight[:, 0, 0, 2] = -0.5
+            weight[:, 0, 1, 1] -= 1.0   # 中心点被正对角线占用，适当调整
+            weight[:, 0, 2, 0] = -0.5
+            # 归一化
+            C = weight.shape[0]
+            weight /= weight.view(C, -1).norm(p=2, dim=1).view(C, 1, 1, 1) + 1e-6
 
-        # HH 阈值同样初始为负值
-        self.hh_thr = nn.Parameter(torch.full((channels,), -4.0))
-
-    def forward(self, coeffs: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            coeffs: 小波系数，形状 (B, C,Q 4, H, W)
-        Returns:
-            去噪后的小波系数，形状相同
-        """
-        # 拆分四个子带
-        ll = coeffs[:, :, 0, :, :]  # (B, C, H, W)
-        lh = coeffs[:, :, 1, :, :]
-        hl = coeffs[:, :, 2, :, :]
-        hh = coeffs[:, :, 3, :, :]
-
-        # LL 子带：可学习衰减（用 sigmoid 限制在 0~1 之间）
-        alpha = torch.sigmoid(self.ll_alpha)
-        ll = ll * alpha
-
-        # LH 和 HL 子带：共享软阈值（确保阈值非负）
-        thr_lh_hl = F.softplus(self.lh_hl_thr)
-        lh = torch.sign(lh) * F.relu(torch.abs(lh) - thr_lh_hl)
-        hl = torch.sign(hl) * F.relu(torch.abs(hl) - thr_lh_hl)
-
-        # HH 子带：逐通道软阈值
-        thr_hh = F.softplus(self.hh_thr).view(1, -1, 1, 1)  # (1, C, 1, 1)
-        hh = torch.sign(hh) * F.relu(torch.abs(hh) - thr_hh)
-
-        # 重新堆叠
-        return torch.stack([ll, lh, hl, hh], dim=2)
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
 
 
+# ================== 完整的 WaveletStem（无阈值） ==================
 class WaveletStem(nn.Module):
     """
-    带子带去噪的小波 Stem 模块，替代 YOLO11 的 P1 和 P2 层。
-    输入: (B, 3, H, W)
-    输出: (B, out_channels, H/4, W/4)
-
-    内部流程:
-        1. 第一次小波分解：3 → 12 通道，尺寸减半
-        2. 子带去噪：对 LL/LH/HL/HH 差异化去噪
-        3. 中间卷积块：高频特征处理，通道扩张
-        4. 第二次小波分解：mid → out_channels，尺寸再减半
+    小波分解 + 四种方向卷积 + 通道扩张。
+    输入: (B, in_channels, H, W)
+    输出: (B, out_channels, H/2, W/2)
     """
-
-    def __init__(self, in_channels: int = 3, out_channels: int = 128, use_denoise: bool = True):
+    def __init__(self, in_channels: int = 3, out_channels: int = 64,
+                 use_diag_init: bool = True):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.use_denoise = use_denoise
 
-        # 中间通道数需保证第二次小波分解后通道数匹配
-        assert out_channels % 4 == 0, "out_channels 必须能被 4 整除"
-        mid_channels = out_channels // 4
+        # 注册 Haar 分解滤波器
+        self.register_buffer('dec_filters', haar_filters(in_channels))
 
-        # 注册小波滤波器（不可训练）
-        self.register_buffer('dec_filters_1', haar_filters(in_channels))
-        self.register_buffer('dec_filters_2', haar_filters(mid_channels))
+        # 四个子带专用的方向卷积
+        self.ll_conv = DirectionalConv(in_channels, 'll')
+        self.lh_conv = DirectionalConv(in_channels, 'lh')
+        self.hl_conv = DirectionalConv(in_channels, 'hl')
+        self.hh_conv = DirectionalConv(in_channels, 'hh', use_diag_init=use_diag_init)
 
-        # 子带去噪模块（作用于第一次分解后）
-        if use_denoise:
-            self.denoise = SubbandDenoise(channels=in_channels, init_ll_alpha=0.8)
-        else:
-            self.denoise = None
-
-        # 中间卷积块：标准卷积 + 深度可分离卷积
-        self.conv_block = nn.Sequential(
-            nn.Conv2d(in_channels * 4, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1, groups=mid_channels, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.SiLU(inplace=True),
+        # 通道扩张：4*C → out_channels
+        self.expand = nn.Sequential(
+            nn.Conv2d(in_channels * 4, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.SiLU(inplace=True)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 处理奇数尺寸
         _, _, H, W = x.shape
+        # 填充到偶数尺寸
         pad_h = (2 - H % 2) % 2
         pad_w = (2 - W % 2) % 2
         if pad_h > 0 or pad_w > 0:
             x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
 
-        # 第一次小波分解
-        x = wavelet_decompose(x, self.dec_filters_1)  # (B,             12, H/2, W/2)
-
-        # 重塑为 (B, C, 4, H/2, W/2) 以便子带处理
-        B, C4, H2, W2 = x.shape
+        # 小波分解
+        coeffs = wavelet_decompose(x, self.dec_filters)  # (B, 4C, H/2, W/2)
+        B, C4, H2, W2 = coeffs.shape
         C = C4 // 4
-        x = x.view(B, C, 4, H2, W2)
+        coeffs = coeffs.view(B, C, 4, H2, W2)
 
-        # 子带去噪（可选）
-        if self.denoise is not None:
-            x = self.denoise(x)
+        # 分离子带
+        ll = coeffs[:, :, 0, :, :]
+        lh = coeffs[:, :, 1, :, :]
+        hl = coeffs[:, :, 2, :, :]
+        hh = coeffs[:, :, 3, :, :]
 
-        # 展平子带维度回通道维
-        x = x.view(B, C * 4, H2, W2)
+        # 分别进行方向卷积增强
+        ll = self.ll_conv(ll)
+        lh = self.lh_conv(lh)
+        hl = self.hl_conv(hl)
+        hh = self.hh_conv(hh)
 
-        # 中间卷积块
-        x = self.conv_block(x)  # (B, mid_channels, H/2, W/2)
-
-        # 第二次分解前的尺寸处理
-        _, _, H2, W2 = x.shape
-        pad_h2 = (2 - H2 % 2) % 2
-        pad_w2 = (2 - W2 % 2) % 2
-        if pad_h2 > 0 or pad_w2 > 0:
-            x = F.pad(x, (0, pad_w2, 0, pad_h2), mode='reflect')
-
-        # 第二次小波分解
-        x = wavelet_decompose(x, self.dec_filters_2)  # (B, out_channels, H/4, W/4)
-
-        return x
+        # 拼接并扩张通道
+        out = torch.cat([ll, lh, hl, hh], dim=1)   # (B, 4C, H/2, W/2)
+        out = self.expand(out)                     # (B, out_channels, H/2, W/2)
+        return out
 
 
-# ============================================
-# 测试代码
-# ============================================
+# ================== 简单 main 测试 ==================
 if __name__ == "__main__":
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = WaveletStem(in_channels=3, out_channels=128, use_denoise=True).to(device)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Device: {device}")
+
+    # 模拟输入 RGB 640x640
     x = torch.randn(2, 3, 640, 640).to(device)
-    out = model(x)
-    print(f"Input shape: {x.shape}")
-    print(f"Output shape: {out.shape}")  # 期望 (2, 128, 160, 160)
 
-    # 打印去噪参数初始值
-    if model.denoise is not None:
-        print(f"LL alpha: {torch.sigmoid(model.denoise.ll_alpha).item():.3f}")
-        print(f"LH/HL threshold: {F.softplus(model.denoise.lh_hl_thr).item():.3f}")
-        print(f"HH thresholds (first 5): {F.softplus(model.denoise.hh_thr[:5]).detach().cpu().numpy()}")
+    # 构建模型（输出 64 通道，也可测试 128）
+    model = WaveletStem(in_channels=3, out_channels=64, use_diag_init=True).to(device)
+    model.eval()
 
-    loss = out.mean()
-    loss.backward()
-    print("Backward pass completed.")
-    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    with torch.no_grad():
+        out = model(x)
 
+    print(f"Input shape : {x.shape}")
+    print(f"Output shape: {out.shape}")   # 期望 (2, 64, 320, 320)
+    expected_shape = (2, 64, 320, 320)
+    assert out.shape == expected_shape, f"Shape mismatch! Expected {expected_shape}, got {out.shape}"
+    print("✅ Output shape verified.")
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
