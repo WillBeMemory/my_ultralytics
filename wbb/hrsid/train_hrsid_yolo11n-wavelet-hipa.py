@@ -74,7 +74,7 @@ def train_model():
         results = model.train(
             data=DATASET_PATH,
             epochs=300,
-            imgsz=800,
+            imgsz=640,
             batch=16,
             workers=0,  # Windows 下设为 0 避免多进程问题
             device=device,
