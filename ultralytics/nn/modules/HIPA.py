@@ -1,34 +1,16 @@
-# ============================================
-# File: ultralytics/nn/modules/HIPA.py
-# 核心改进：新增 fill_mode='conv_smooth'，用可学习的轻量卷积平滑稀疏图
-# ============================================
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple, Optional, Union
 
-__all__ = ["HIPA"]
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 
 class SparseSelfAttention(nn.Module):
-    """
-    稀疏自注意力模块（余弦注意力变体）。
-    通过对 Q 和 K 进行 L2 归一化，将点积值域限制在 [-1, 1]，彻底杜绝 FP16 溢出。
-    无任何裁剪，完整保留特征信息。
-    """
-
+    """稀疏自注意力模块（余弦注意力变体）"""
     def __init__(self, embed_dim: int, num_heads: int = 8, dropout: float = 0.0):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** -0.5  # 保留缩放，虽归一化后值域已安全
-
+        self.scale = self.head_dim ** -0.5
         self.qkv = nn.Linear(embed_dim, embed_dim * 3)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
@@ -36,33 +18,22 @@ class SparseSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
-
-        # 计算 Q、K、V
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # 每个形状: (B, num_heads, N, head_dim)
-
-        # 核心改进：对 Q 和 K 进行 L2 归一化，点积退化为余弦相似度，值域 [-1, 1]
+        q, k, v = qkv[0], qkv[1], qkv[2]
         q = F.normalize(q, p=2, dim=-1)
         k = F.normalize(k, p=2, dim=-1)
-
-        # 计算注意力权重
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.dropout(attn)
-
-        # 加权求和
         out = torch.matmul(attn, v).transpose(1, 2).reshape(B, N, C)
         out = self.out_proj(out)
-
-        # 残差连接 + LayerNorm
         x = self.norm(x + out)
         return x
 
 
 class HIPABlock(nn.Module):
     """
-    层级重要性传播注意力模块
-    支持 fill_mode: 'center', 'constant', 'gaussian', 'conv_smooth'
+    层级重要性传播注意力模块（支持场景自适应保留率）
     """
     def __init__(
         self,
@@ -76,6 +47,9 @@ class HIPABlock(nn.Module):
         fill_mode: str = 'center',
         importance_mode: str = 'l2',
         gaussian_sigma_scale: float = 0.3,
+        use_adaptive: bool = False,                # 是否启用场景自适应
+        adaptive_keep_factor_lo: float = 0.5,      # 复杂场景保留率乘数（相对于原保留率）
+        adaptive_hidden_ratio: float = 0.25,       # 复杂度预测网络隐藏层比例
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -85,8 +59,10 @@ class HIPABlock(nn.Module):
         self.fill_mode = fill_mode
         self.importance_mode = importance_mode
         self.gaussian_sigma_scale = gaussian_sigma_scale
+        self.use_adaptive = use_adaptive
+        self.adaptive_keep_factor_lo = adaptive_keep_factor_lo
 
-        # 分层保留比例
+        # 分层保留比例（静态基准）
         if keep_ratios is not None and len(keep_ratios) > 0:
             assert len(keep_ratios) == num_levels
             self.keep_ratios = keep_ratios
@@ -106,7 +82,7 @@ class HIPABlock(nn.Module):
             nn.Linear(in_channels, out_channels)
         )
 
-        # 可学习的平滑卷积（仅 conv_smooth 模式激活）
+        # 平滑卷积 (conv_smooth)
         if fill_mode == 'conv_smooth':
             self.smooth_conv = nn.Conv2d(
                 out_channels, out_channels, kernel_size=3,
@@ -114,6 +90,20 @@ class HIPABlock(nn.Module):
             )
         else:
             self.smooth_conv = None
+
+        # 场景复杂度预测网络（自适应模式）
+        if use_adaptive:
+            hidden = max(1, int(in_channels * adaptive_hidden_ratio))
+            self.complexity_net = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(in_channels, hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden, 1),
+                nn.Sigmoid()
+            )
+        else:
+            self.complexity_net = None
 
     # ---------- 金字塔构建辅助方法 ----------
     @staticmethod
@@ -137,13 +127,13 @@ class HIPABlock(nn.Module):
         bboxes = torch.cat([centers, sizes], dim=-1)
         return bboxes.unsqueeze(0).expand(B, -1, -1)
 
-    # ---------- 各种填充实现 ----------
+    # ---------- 填充方法 ----------
     def _fill_2d_center(self, features, coords, H, W):
         B, K, C = features.shape
         out = torch.zeros(B, self.out_channels, H, W, device=features.device, dtype=features.dtype)
         cx = (coords[..., 0] * W).long().clamp(0, W - 1)
         cy = (coords[..., 1] * H).long().clamp(0, H - 1)
-        src = features.transpose(1, 2)  # (B, C, K)
+        src = features.transpose(1, 2)
         index = (cy.unsqueeze(1) * W + cx.unsqueeze(1)).expand(-1, self.out_channels, -1)
         out = out.flatten(2).scatter_(2, index, src).view(B, self.out_channels, H, W)
         return out
@@ -166,8 +156,6 @@ class HIPABlock(nn.Module):
         return out
 
     def _fill_2d_gaussian(self, features, coords, H, W):
-        # 保留你的高斯实现，但可使用局部邻域版本（已在前文提供，若嫌栈溢出可置空）
-        # 这里仅示例，实际可替换为你认为稳定的版本
         B, K, C = features.shape
         device = features.device
         dtype = features.dtype
@@ -199,7 +187,6 @@ class HIPABlock(nn.Module):
         return out
 
     def _fill_2d(self, features, coords, H, W):
-        # 基础填充
         if self.fill_mode in ['center', 'conv_smooth']:
             base = self._fill_2d_center(features, coords, H, W)
         elif self.fill_mode == 'constant':
@@ -208,8 +195,6 @@ class HIPABlock(nn.Module):
             base = self._fill_2d_gaussian(features, coords, H, W)
         else:
             raise ValueError(f"Unsupported fill_mode: {self.fill_mode}")
-
-        # 附加平滑：仅对 conv_smooth 模式
         if self.fill_mode == 'conv_smooth' and self.smooth_conv is not None:
             base = self.smooth_conv(base)
         return base
@@ -219,6 +204,23 @@ class HIPABlock(nn.Module):
         B, C, H, W = x.shape
         assert C == self.in_channels
         device, dtype = x.device, x.dtype
+
+        # 场景复杂度预测 (自适应模式)
+        if self.use_adaptive and self.complexity_net is not None:
+            complexity = self.complexity_net(x).mean()   # 标量，范围 0~1
+        else:
+            complexity = None
+
+        # 构建动态保留率列表
+        if complexity is not None:
+            dynamic_keep_ratios = []
+            for idx, base_kr in enumerate(self.keep_ratios):
+                keep_hi = base_kr
+                keep_lo = base_kr * self.adaptive_keep_factor_lo
+                keep_dyn = keep_hi + (keep_lo - keep_hi) * complexity
+                dynamic_keep_ratios.append(keep_dyn)
+        else:
+            dynamic_keep_ratios = self.keep_ratios
 
         # 1. 构建金字塔
         pyramid_features, pyramid_coords = [], []
@@ -260,7 +262,7 @@ class HIPABlock(nn.Module):
                 raise ValueError(f"Unsupported importance_mode: {self.importance_mode}")
 
             importance = importance.clamp(min=1e-8, max=2e4)
-            keep_ratio_l = self.keep_ratios[level]
+            keep_ratio_l = dynamic_keep_ratios[level]
             min_keeps_l = self.min_keeps[level]
             keep_num = max(min_keeps_l, int(N_l * keep_ratio_l))
             keep_num = min(keep_num, N_l)
@@ -276,7 +278,6 @@ class HIPABlock(nn.Module):
         sparse_seq = torch.cat(kept_features_list, dim=1)
         all_coords = torch.cat(kept_coords_list, dim=1)
 
-        # 3. 生成稀疏二维图
         out_sparse = self._fill_2d(sparse_seq, all_coords, H, W)
         total_kept = sparse_seq.size(1)
         sparsity = torch.tensor(total_kept / (H * W), device=device, dtype=dtype).mean()
@@ -284,12 +285,13 @@ class HIPABlock(nn.Module):
 
 
 class _HIPASingle(nn.Module):
-    """单层 HIPA 封装：稀疏图 + 可选自注意力 + 残差连接"""
+    """单层 HIPA 封装"""
     def __init__(
         self, in_channels, out_channels, num_levels=3, keep_ratio=0.3,
         keep_ratios=None, min_keeps=8, use_contrast_norm=True, num_heads=8,
         fill_mode='center', use_self_attn=True, importance_mode='l2',
-        gaussian_sigma_scale=0.3,
+        gaussian_sigma_scale=0.3, use_adaptive=False,
+        adaptive_keep_factor_lo=0.5, adaptive_hidden_ratio=0.25
     ):
         super().__init__()
         self.use_self_attn = use_self_attn
@@ -300,6 +302,9 @@ class _HIPASingle(nn.Module):
             use_contrast_norm=use_contrast_norm, fill_mode=fill_mode,
             importance_mode=importance_mode,
             gaussian_sigma_scale=gaussian_sigma_scale,
+            use_adaptive=use_adaptive,
+            adaptive_keep_factor_lo=adaptive_keep_factor_lo,
+            adaptive_hidden_ratio=adaptive_hidden_ratio
         )
         if use_self_attn:
             self.attn = SparseSelfAttention(embed_dim=out_channels, num_heads=num_heads)
@@ -319,24 +324,28 @@ class _HIPASingle(nn.Module):
 class HIPA(nn.Module):
     """可重复多次的 HIPA 模块（YOLO 接口）"""
     def __init__(
-        self, in_channels, out_channels, n=1, num_levels=3, keep_ratio=0.3,
+        self, c1, c2, n=1, num_levels=3, keep_ratio=0.3,
         keep_ratios=None, min_keeps=8, use_contrast_norm=True, num_heads=8,
         fill_mode='center', use_self_attn=True, importance_mode='l2',
-        gaussian_sigma_scale=0.3,
+        gaussian_sigma_scale=0.3, use_adaptive=False,
+        adaptive_keep_factor_lo=0.5, adaptive_hidden_ratio=0.25
     ):
         super().__init__()
         self.n = n
         blocks = []
         for i in range(n):
-            in_ch = in_channels if i == 0 else out_channels
+            in_ch = c1 if i == 0 else c2
             blocks.append(_HIPASingle(
-                in_channels=in_ch, out_channels=out_channels,
+                in_channels=in_ch, out_channels=c2,
                 num_levels=num_levels, keep_ratio=keep_ratio,
                 keep_ratios=keep_ratios, min_keeps=min_keeps,
                 use_contrast_norm=use_contrast_norm, num_heads=num_heads,
                 fill_mode=fill_mode, use_self_attn=use_self_attn,
                 importance_mode=importance_mode,
                 gaussian_sigma_scale=gaussian_sigma_scale,
+                use_adaptive=use_adaptive,
+                adaptive_keep_factor_lo=adaptive_keep_factor_lo,
+                adaptive_hidden_ratio=adaptive_hidden_ratio
             ))
         self.blocks = nn.ModuleList(blocks)
 
@@ -346,16 +355,34 @@ class HIPA(nn.Module):
         return x
 
 
-# ============================================
-# 测试
-# ============================================
+# ---------- 测试 ----------
 if __name__ == "__main__":
-    for mode in ['center', 'constant', 'conv_smooth']:
-        print(f"\n=== Testing fill_mode='{mode}' ===")
-        x = torch.randn(2, 256, 20, 20)
-        model = HIPA(256, 512, n=1, num_levels=3, keep_ratios=[0.5, 0.3, 0.2],
-                     min_keeps=4, fill_mode=mode, use_self_attn=True,
-                     importance_mode='contrast')
-        y = model(x)
-        print(f"Input: {x.shape} -> Output: {y.shape}")
-        print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Device: {device}\n")
+
+    # 模拟输入
+    x_simple = torch.randn(2, 256, 20, 20).to(device)   # 简单场景模拟
+    x_complex = torch.randn(2, 256, 20, 20).to(device) * 0.1  # 弱信号模拟复杂场景
+
+    # 测试原始 HIPA (无自适应)
+    print("=== Original HIPA ===")
+    model_orig = HIPA(256, 512, n=1, keep_ratios=[0.5, 0.3, 0.2], min_keeps=4,
+                      use_self_attn=True, use_adaptive=False).to(device)
+    y = model_orig(x_simple)
+    print(f"Input: {x_simple.shape} -> Output: {y.shape}")
+    print(f"Params: {sum(p.numel() for p in model_orig.parameters()):,}")
+
+    # 测试自适应 HIPA
+    print("\n=== Adaptive HIPA ===")
+    model_adaptive = HIPA(256, 512, n=1, keep_ratios=[0.5, 0.3, 0.2], min_keeps=4,
+                          use_self_attn=True, use_adaptive=True,
+                          adaptive_keep_factor_lo=0.5).to(device)
+    y1 = model_adaptive(x_simple)
+    y2 = model_adaptive(x_complex)
+    print(f"Simple output: {y1.shape}, Complex output: {y2.shape}")
+    print(f"Params: {sum(p.numel() for p in model_adaptive.parameters()):,}")
+
+    # 检查梯度流
+    loss = y1.sum() + y2.sum()
+    loss.backward()
+    print("Backward passed.")

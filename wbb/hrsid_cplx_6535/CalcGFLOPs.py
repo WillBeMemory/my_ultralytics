@@ -11,10 +11,10 @@ from ultralytics import YOLO
 # model = YOLO('yolo11n-wavelet-hipa.yaml').model
 # model = YOLO('yolo11n-wavelet-hipa-dswtg.yaml').model
 # model = YOLO('yolo11n-wavelet-hipa-dyc3k2.yaml').model
-model = YOLO('yolo11n-wavelet-hipa-test.yaml').model
+# model = YOLO('yolo11n-wavelet-hipa-test.yaml').model
 # model = YOLO('yolo11n-wavelet-hipa-test.yaml').model
 # model = YOLO('yolo11s-wavelet-hipa-test.yaml').model
-# model = YOLO('yolo11n-wavelet-hipa.yaml').model
+model = YOLO('yolo11n-hipa.yaml').model
 # model = YOLO('yolo11n-dwwtconv-dyhead.yaml').model
 # model = YOLO('yolo11n-dwwtconv-dyhead.yaml').model
 # model = YOLO('yolo11n.yaml').model
