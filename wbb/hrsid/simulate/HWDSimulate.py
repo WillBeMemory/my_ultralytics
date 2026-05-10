@@ -12,10 +12,10 @@ if __name__ == "__main__":
     label_path = image_path.replace('.jpg', '.txt')
 
     # 构建待测试的 stem：这里使用 HWD，输入图像是 RGB 3 通道，输出 64 通道
-    stem = HWD(c1=3, c2=16)
+    stem = HWD(c1=3, c2=64)
 
     tester = ModuleTester(stem=stem,
-                          stem_out_channels=16,
+                          stem_out_channels=64,
                           image_path=image_path,
                           label_path=label_path,
                           input_size=640,
