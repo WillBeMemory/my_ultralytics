@@ -3,69 +3,98 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def haar_filters_groups(in_channels: int):
+    """生成形状 (in_channels*4, 1, 2, 2)，保证每组内顺序为 [LL, LH, HL, HH]"""
+    dec_lo = torch.tensor([1 / 2, 1 / 2])
+    dec_hi = torch.tensor([1 / 2, -1 / 2])
+    base_LL = (dec_lo.unsqueeze(0) * dec_lo.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
+    base_LH = (dec_lo.unsqueeze(0) * dec_hi.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
+    base_HL = (dec_hi.unsqueeze(0) * dec_lo.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
+    base_HH = (dec_hi.unsqueeze(0) * dec_hi.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
+    per_channel = torch.cat([base_LL, base_LH, base_HL, base_HH], dim=1)  # (1,4,2,2)
+    per_channel = per_channel.repeat(in_channels, 1, 1, 1)  # (C,4,2,2)
+    return per_channel.reshape(in_channels * 4, 1, 2, 2)  # (4C,1,2,2)
+
+
+def wt_decompose_level(x: torch.Tensor):
+    """输入 (B, C, H, W)，返回四个子带 (B, C, H/2, W/2)"""
+    B, C, H, W = x.shape
+    filters = haar_filters_groups(C).to(device=x.device, dtype=x.dtype)
+    coeffs = F.conv2d(x, filters, stride=2, groups=C, padding=0)  # (B, 4C, H/2, W/2)
+    coeffs = coeffs.view(B, C, 4, H // 2, W // 2)
+    LL = coeffs[:, :, 0, :, :]
+    LH = coeffs[:, :, 1, :, :]
+    HL = coeffs[:, :, 2, :, :]
+    HH = coeffs[:, :, 3, :, :]
+    return LL, LH, HL, HH
+
+
 class HWD(nn.Module):
-    """
-    小波下采样模块 (HWD) —— 固定 Haar 滤波器版本。
-    1. 固定 Haar 分解 → (B, 4*C_in, H/2, W/2)
-    2. 1×1 卷积压缩 → (B, C_out, H/2, W/2)
-    """
-    def __init__(self, c1: int, c2: int, act: bool = True):
+    def __init__(self, c1: int, c2: int, enhance_ll: bool = True):
         super().__init__()
+        assert c2 % 4 == 0, f"c2 must be divisible by 4, got {c2}"
         self.c1 = c1
         self.c2 = c2
+        self.enhance_ll = enhance_ll
+        ch_per_band = c2 // 4
 
-        # ---------- 固定的 Haar 分解滤波器 ----------
-        w_ll = torch.tensor([[1., 1.],
-                             [1., 1.]]) / 2.0
-        w_lh = torch.tensor([[1., -1.],
-                             [1., -1.]]) / 2.0
-        w_hl = torch.tensor([[1., 1.],
-                             [-1., -1.]]) / 2.0
-        w_hh = torch.tensor([[1., -1.],
-                             [-1., 1.]]) / 2.0
-        haar_init = torch.stack([w_ll, w_lh, w_hl, w_hh], dim=0).unsqueeze(1)  # (4, 1, 2, 2)
-        # 不再使用 nn.Parameter，而是注册为不可训练的 buffer
-        self.register_buffer('haar_filter', haar_init.repeat(c1, 1, 1, 1))
+        self.ll_proj = nn.Conv2d(c1, ch_per_band, 1, bias=False)
+        self.lh_proj = nn.Conv2d(c1, ch_per_band, 1, bias=False)
+        self.hl_proj = nn.Conv2d(c1, ch_per_band, 1, bias=False)
+        self.hh_proj = nn.Conv2d(c1, ch_per_band, 1, bias=False)
 
-        # ---------- 1×1 压缩卷积 ----------
-        self.conv = nn.Conv2d(c1 * 4, c2, kernel_size=1, bias=False)
+        if self.enhance_ll:
+            self.ll_enhance = nn.Sequential(
+                nn.Conv2d(ch_per_band, ch_per_band, 3, padding=1, bias=False),  # 标准卷积
+                nn.BatchNorm2d(ch_per_band),
+                nn.SiLU(inplace=True)
+            )
+        else:
+            self.ll_enhance = nn.Identity()
+
         self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.SiLU(inplace=True) if act else nn.Identity()
+        self.act = nn.SiLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 固定 Haar 滤波器，分组卷积下采样
-        x = F.conv2d(x, self.haar_filter, stride=2, groups=self.c1)
-        # 1x1 压缩 + BN + 激活
-        x = self.conv(x)
-        x = self.bn(x)
-        return self.act(x)
+        B, C, H, W = x.shape
+        pad_h = (2 - H % 2) % 2
+        pad_w = (2 - W % 2) % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
 
+        LL, LH, HL, HH = wt_decompose_level(x)
 
-# ============================================
-# 测试代码（保持原有测试）
-# ============================================
+        ll = self.ll_proj(LL)
+        lh = self.lh_proj(LH)
+        hl = self.hl_proj(HL)
+        hh = self.hh_proj(HH)
+
+        if self.enhance_ll:
+            ll = ll + self.ll_enhance(ll)  # 残差连接
+
+        out = torch.cat([ll, lh, hl, hh], dim=1)
+        return self.act(self.bn(out))
+
+# ================== 简单 main 测试 ==================
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
 
-    # 模拟 YOLO11n P4 特征 (C=128, 40x40)
-    x = torch.randn(2, 128, 40, 40).to(device)
+    # 测试增强版 HWD
+    hwd = HWD(c1=3, c2=64, enhance_ll=True).to(device)
+    x = torch.randn(2, 3, 256, 256).to(device)
+    out = hwd(x)
+    print(f"Input: {x.shape} -> Output: {out.shape}")  # (2, 64, 128, 128)
+    expected = (2, 64, 128, 128)
+    assert out.shape == expected, f"Shape mismatch: {out.shape}"
+    print("✅ Output shape verified.")
 
-    # 标准下采样对比
-    conv_standard = nn.Conv2d(128, 256, 3, stride=2, padding=1, bias=False).to(device)
-    hwd = HWD(128, 256).to(device)
+    # 参数量
+    total_params = sum(p.numel() for p in hwd.parameters())
+    print(f"Total parameters (LL enhanced): {total_params:,}")
 
-    out_conv = conv_standard(x)
-    out_hwd = hwd(x)
-
-    print("=== 输出形状对比 ===")
-    print(f"标准 Conv: {out_conv.shape}")  # [2, 256, 20, 20]
-    print(f"HWD      : {out_hwd.shape}")   # [2, 256, 20, 20]
-
-    # 参数量对比
-    def count_params(module):
-        return sum(p.numel() for p in module.parameters())
-
-    print("\n=== 参数量对比 ===")
-    print(f"标准 Conv: {count_params(conv_standard):,}")
-    print(f"HWD      : {count_params(hwd):,}")
-    print(f"HWD 参数量仅为标准卷积的 {count_params(hwd)/count_params(conv_standard)*100:.1f}%")
+    # 测试不增强版本
+    hwd_light = HWD(3, 64, enhance_ll=False).to(device)
+    out_l = hwd_light(x)
+    print(f"Light version output shape: {out_l.shape}")
+    print("✅ All tests passed.")
