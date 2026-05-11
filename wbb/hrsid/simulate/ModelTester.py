@@ -21,15 +21,13 @@ class SimpleDetectionHead(nn.Module):
             nn.Conv2d(in_channels, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.SiLU(inplace=True),
-            nn.Conv2d(64, 5, 1)
+            nn.Conv2d(64, 5, 1)   # 输出 obj, tx, ty, tw, th
         )
-        # obj 通道偏置初始化
-        nn.init.constant_(self.conv[-1].bias[0], -4.6)  # sigmoid(-4.6) ≈ 0.01
-        # 其余 tx,ty,tw,th 保持默认 0，符合预期
+        # obj 通道偏置初始化为负值，使 sigmoid ≈ 0.01
+        nn.init.constant_(self.conv[-1].bias[0], -4.6)
 
     def forward(self, x):
         return self.conv(x)
-
 
 # ================== 标签加载 ==================
 def load_yolo_labels(label_path, img_w, img_h):
@@ -216,6 +214,7 @@ class ModuleTester:
         self.model.eval()
         with torch.no_grad():
             feat = self.stem(self.img_tensor)
+        print(f"Feature mean: {feat.mean().item():.4f}, max: {feat.max().item():.4f}")
         feat_np = feat.squeeze(0).mean(dim=0).cpu().numpy()
         feat_np = (feat_np - feat_np.min()) / (feat_np.max() - feat_np.min() + 1e-6)
 
