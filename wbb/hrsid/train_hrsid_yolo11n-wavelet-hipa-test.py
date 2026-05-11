@@ -3,7 +3,7 @@ from ultralytics import YOLO
 import os
 import torch
 
-
+from ultralytics.utils.HIPATrainer import CustomTrainer
 
 MODEL_NAME = "yolo11n-wavelet-hipa-test.yaml"
 DATASET_PATH = "../cfg/hrsid.yaml"
@@ -110,7 +110,8 @@ def train_model():
             weight_decay=0.0005,  # 权重衰减
             cos_lr=True,  # 余弦退火
             warmup_epochs=3.0,
-
+            # amp = False,
+            trainer=CustomTrainer,
 
             patience=0,  # 早停耐心值
             save=True,
