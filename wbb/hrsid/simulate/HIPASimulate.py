@@ -11,7 +11,7 @@ import random
 from torch.utils.data import Dataset, DataLoader
 
 from ultralytics import YOLO
-from ultralytics.nn.modules import HIPA   # 确保已导入最新版 HIPA（含 aggregate）
+from ultralytics.nn.modules import HIPA   # 新版增强模式 HIPA
 
 
 # ================== 数据集 ==================
@@ -93,9 +93,10 @@ class PretrainedBackbone(nn.Module):
 # ================== HIPA + 检测头 ==================
 class HIPAHead(nn.Module):
     def __init__(self, in_channels, hipa_channels=256, num_levels=3,
-                 threshold_init=0.5, fill_mode='constant',
-                 aggregate=False, use_self_attn=False, importance_mode='l2'):
+                 threshold_init=0.5, keep_ratio=0.25,
+                 use_self_attn=True):
         super().__init__()
+        # 通道对齐
         if in_channels != hipa_channels:
             self.align_conv = nn.Conv2d(in_channels, hipa_channels, 1, bias=False)
         else:
@@ -107,9 +108,8 @@ class HIPAHead(nn.Module):
             threshold_init=threshold_init,
             use_contrast_norm=True,
             use_self_attn=use_self_attn,
-            importance_mode=importance_mode,
-            fill_mode=fill_mode,
-            aggregate=aggregate,
+            keep_ratio=keep_ratio,
+
         )
         self.head = nn.Sequential(
             nn.Conv2d(hipa_channels, 64, 3, padding=1, bias=False),
@@ -121,14 +121,14 @@ class HIPAHead(nn.Module):
 
     def forward(self, x):
         x = self.align_conv(x)
-        x = self.hipa(x, None)   # 依赖注入的 target_mask 属性
+        x = self.hipa(x)          # 增强后的特征图，无 target_mask
         return self.head(x)
 
-    def get_sparse_output(self, x):
+    def get_enhanced_output(self, x):
+        """返回 HIPA 增强后的特征图（用于可视化）"""
         with torch.no_grad():
             x = self.align_conv(x)
-            out_sparse = self.hipa(x, None)
-        return out_sparse
+            return self.hipa(x)
 
 
 # ================== 损失函数（仅检测损失） ==================
@@ -170,17 +170,17 @@ def compute_loss(pred, targets, feat_h=20, feat_w=20):
     return loss_obj + loss_box
 
 
-# ================== 训练与可视化 ==================
+# ================== 训练与可视化函数 ==================
 def run_experiment(
     model_path, dataset_root, output_dir,
     num_samples=50, epochs=200, batch_size=8, lr=0.002,
-    threshold_init=0.5, fill_mode='constant', aggregate=False,
-    use_self_attn=False,
+    threshold_init=0.5, keep_ratio=0.25,
+    use_self_attn=True
 ):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. 随机选取图像
+    # 1. 随机抽取训练图像
     train_img_dir = os.path.join(dataset_root, 'images', 'train')
     train_label_dir = os.path.join(dataset_root, 'labels', 'train')
     all_imgs = [f for f in os.listdir(train_img_dir) if f.endswith(('.jpg', '.png'))]
@@ -213,8 +213,8 @@ def run_experiment(
 
     hipa_head = HIPAHead(
         in_channels, hipa_channels=256, num_levels=3,
-        threshold_init=threshold_init, fill_mode=fill_mode,
-        aggregate=aggregate, use_self_attn=use_self_attn,
+        threshold_init=threshold_init, keep_ratio=keep_ratio,
+        use_self_attn=use_self_attn
     ).to(device)
 
     optimizer = optim.SGD(hipa_head.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
@@ -229,32 +229,11 @@ def run_experiment(
             imgs = torch.stack([d[0] for d in batch_data]).to(device)
             targets_batch = [d[1] for d in batch_data]
 
-            # 生成 P5 目标掩膜 (20x20)
-            B = len(imgs)
-            target_mask = torch.zeros(B, 20, 20, device=device)
-            for b, tgts in enumerate(targets_batch):
-                for cx, cy, w, h in tgts:
-                    cx_f = cx * 20; cy_f = cy * 20
-                    w_f = w * 20; h_f = h * 20
-                    x1 = int(max(0, cx_f - w_f/2))
-                    y1 = int(max(0, cy_f - h_f/2))
-                    x2 = int(min(20, cx_f + w_f/2 + 1))
-                    y2 = int(min(20, cy_f + h_f/2 + 1))
-                    if x2 > x1 and y2 > y1:
-                        target_mask[b, y1:y2, x1:x2] = 1.0
-
-            # 注入 target_mask 到 HIPABlock
-            hipa_head.hipa.hipa.target_mask = target_mask
-
             optimizer.zero_grad()
             with torch.no_grad():
                 p5_feats = backbone(imgs)
             pred = hipa_head(p5_feats)
             loss = compute_loss(pred, targets_batch)
-
-            # 清除注入的掩膜
-            hipa_head.hipa.hipa.target_mask = None
-
             if torch.isnan(loss):
                 print(f"NaN at epoch {epoch+1}")
                 continue
@@ -267,24 +246,24 @@ def run_experiment(
 
     print("训练完成！")
 
-    # 可视化（推理时不传 target_mask）
+    # 可视化（推理模式）
     hipa_head.eval()
     for img_tensor, targets, img_name in data:
         img_np = img_tensor.permute(1, 2, 0).numpy()
         img_t = img_tensor.unsqueeze(0).to(device)
         with torch.no_grad():
-            p5 = backbone(img_t)
-            sparse = hipa_head.get_sparse_output(p5)
+            p5 = backbone(img_t)                          # (1, C, 20, 20)
+            enhanced = hipa_head.get_enhanced_output(p5)   # HIPA 增强后的特征图
 
         p5_feat = p5.squeeze(0).abs().mean(dim=0).cpu().numpy()
         p5_feat = (p5_feat - p5_feat.min()) / (p5_feat.max() - p5_feat.min() + 1e-8)
         p5_img = Image.fromarray((p5_feat * 255).astype(np.uint8)).resize((640, 640), Image.NEAREST)
         p5_large = np.array(p5_img) / 255.0
 
-        sparse_abs = sparse.squeeze(0).abs().mean(dim=0).cpu().numpy()
-        sparse_abs = (sparse_abs - sparse_abs.min()) / (sparse_abs.max() - sparse_abs.min() + 1e-8)
-        sparse_pil = Image.fromarray((sparse_abs * 255).astype(np.uint8)).resize((640, 640), Image.NEAREST)
-        sparse_large = np.array(sparse_pil) / 255.0
+        enhanced_feat = enhanced.squeeze(0).abs().mean(dim=0).cpu().numpy()
+        enhanced_feat = (enhanced_feat - enhanced_feat.min()) / (enhanced_feat.max() - enhanced_feat.min() + 1e-8)
+        enh_img = Image.fromarray((enhanced_feat * 255).astype(np.uint8)).resize((640, 640), Image.NEAREST)
+        enh_large = np.array(enh_img) / 255.0
 
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
         axes[0].imshow(img_np)
@@ -300,13 +279,13 @@ def run_experiment(
         axes[1].set_title('P5 Feature Map (20x20)')
         axes[1].axis('off')
 
-        axes[2].imshow(sparse_large, cmap='gray')
+        axes[2].imshow(enh_large, cmap='gray')
         for cx, cy, w, h in targets:
             x1 = (cx - w/2) * 640; y1 = (cy - h/2) * 640
             x2 = (cx + w/2) * 640; y2 = (cy + h/2) * 640
             rect = Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor='red', facecolor='none')
             axes[2].add_patch(rect)
-        axes[2].set_title('Sparse Feature (HIPA) with GT')
+        axes[2].set_title('HIPA Enhanced Feature')
         axes[2].axis('off')
 
         plt.tight_layout()
@@ -334,7 +313,6 @@ if __name__ == "__main__":
         batch_size=8,
         lr=0.002,
         threshold_init=0.5,
-        fill_mode='upsample',      # 可改为 'upsample'
-        aggregate=True,           # 可改为 True 以启用多级聚合
-        use_self_attn=False,
+        keep_ratio=0.25,
+        use_self_attn=True,
     )

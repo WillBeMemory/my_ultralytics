@@ -47,31 +47,22 @@ def check_dataset(config_path):
 
     print("==========================\n")
 
-#
-# # 配置
-# restart_epochs = [150, 250]  # 需要重启的 epoch
-# restart_lr = 0.01  # 重启时的学习率
-# current_restart_lr = None  # 当前使用的学习率（用于在非重启阶段恢复原值）
-#
-#
-# def on_train_batch_start(trainer):
-#     global current_restart_lr
-#
-#     # 检查是否需要在这个 epoch 启动热重启
-#     if trainer.epoch in restart_epochs:
-#         # 只在第一次进入时打印
-#         if current_restart_lr != restart_lr:
-#             print(f"🔥 Epoch {trainer.epoch}: Learning rate forcibly restarted to {restart_lr}")
-#             current_restart_lr = restart_lr
-#
-#         # 强制所有参数组使用重启学习率
-#         for pg in trainer.optimizer.param_groups:
-#             pg['lr'] = restart_lr
-#     else:
-#         # 非重启阶段：清除重启标志，让调度器正常工作
-#         if current_restart_lr is not None:
-#             current_restart_lr = None
-
+# 阈值打印回调（可选，注册到 on_fit_epoch_end）
+def print_hipa_thresholds(trainer):
+    threshold_values = []
+    for module in trainer.model.modules():
+        if hasattr(module, 'logit_thresholds'):
+            th = torch.sigmoid(module.logit_thresholds).detach().cpu().numpy()
+            threshold_values.append(('single', th))
+        if hasattr(module, 'logit_thresholds_low'):
+            low = torch.sigmoid(module.logit_thresholds_low).detach().cpu().numpy()
+            high = torch.sigmoid(module.logit_thresholds_high).detach().cpu().numpy()
+            threshold_values.append(('low', low))
+            threshold_values.append(('high', high))
+    if threshold_values:
+        print(f"\n--- Epoch {trainer.epoch} HIPA Thresholds ---")
+        for name, val in threshold_values:
+            print(f"  {name}: {val}")
 
 def train_model():
     """训练 hrsid 船舶检测模型"""
@@ -91,7 +82,7 @@ def train_model():
     model = YOLO(MODEL_NAME)  # 从配置文件开始
 
     # 之后在训练前注册该回调
-    # model.add_callback("on_train_batch_start", on_train_batch_start)
+    # model.add_callback("on_fit_epoch_end", print_hipa_thresholds)
 
     # 训练配置
     print("开始训练 船舶检测模型...")
@@ -111,7 +102,7 @@ def train_model():
             cos_lr=True,  # 余弦退火
             warmup_epochs=3.0,
             # amp = False,
-            trainer=CustomTrainer,
+            # trainer=CustomTrainer,
 
             patience=0,  # 早停耐心值
             save=True,
