@@ -179,14 +179,16 @@ class HIPABlock(nn.Module):
 
 
 class _HIPASingle(nn.Module):
-    """单层 HIPA 封装：稀疏序列 + 可选自注意力 + 残差连接"""
+    """单层 HIPA 封装：稀疏序列 + 可选位置编码 + 可选自注意力 + 残差连接"""
     def __init__(
         self, in_channels, out_channels, num_levels=3, keep_ratio=0.3,
         keep_ratios=None, min_keeps=8, use_contrast_norm=True, num_heads=8,
         use_self_attn=True, importance_mode='l2',
+        use_positional_encoding=False,   # 新增：是否启用空间位置编码
     ):
         super().__init__()
         self.use_self_attn = use_self_attn
+        self.use_pos = use_positional_encoding
 
         self.hipa = HIPABlock(
             in_channels=in_channels, out_channels=out_channels,
@@ -202,11 +204,22 @@ class _HIPASingle(nn.Module):
 
         self.residual_proj = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
+        # 简单可学习位置编码层：将 (cx,cy,w,h) 映射到 out_channels
+        if self.use_pos:
+            self.pos_encoder = nn.Linear(4, out_channels)
+        else:
+            self.pos_encoder = None
+
     def forward(self, x):
         _, sparse_seq, coords, _ = self.hipa(x)
 
-        if self.use_self_attn and not isinstance(self.attn, nn.Identity):
-            sparse_seq = self.attn(sparse_seq)
+        if self.use_self_attn and not isinstance(self.attn, nn.Identity) and sparse_seq.size(1) > 0:
+            # 可选位置编码
+            if self.use_pos and self.pos_encoder is not None:
+                pos_embed = self.pos_encoder(coords)        # (B, N, C)
+                sparse_seq = sparse_seq + pos_embed
+
+            sparse_seq = self.attn(sparse_seq)               # 稀疏自注意力
             H, W = x.shape[2:]
             # 散射回空间图，得到注意力增强的特征
             out_attn = self.hipa._fill_2d_center(sparse_seq, coords, H, W)
@@ -217,11 +230,12 @@ class _HIPASingle(nn.Module):
 
 
 class HIPA(nn.Module):
-    """可重复多次的 HIPA 模块（YOLO 接口）"""
+    """可重复多次的 HIPA 模块（YOLO 接口），支持可选空间位置编码"""
     def __init__(
         self, c1, c2, n=1, num_levels=3, keep_ratio=0.3,
         keep_ratios=None, min_keeps=8, use_contrast_norm=True, num_heads=8,
         use_self_attn=True, importance_mode='l2',
+        use_positional_encoding=True,   # 新增：空间位置编码开关
     ):
         super().__init__()
         self.n = n
@@ -235,6 +249,7 @@ class HIPA(nn.Module):
                 use_contrast_norm=use_contrast_norm, num_heads=num_heads,
                 use_self_attn=use_self_attn,
                 importance_mode=importance_mode,
+                use_positional_encoding=use_positional_encoding,  # 传入
             ))
         self.blocks = nn.ModuleList(blocks)
 
@@ -244,31 +259,24 @@ class HIPA(nn.Module):
         return x
 
 
-# 测试
+# ---------- 简单测试 ----------
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     x = torch.randn(2, 256, 20, 20).to(device)
 
-    # 无自注意力（直通）
-    model_no_attn = HIPA(256, 512, n=1, keep_ratios=[0.5, 0.3, 0.2], min_keeps=4,
-                         use_self_attn=False).to(device)
-    y1 = model_no_attn(x)
-    print(f"无自注意力输出形状: {y1.shape}")
+    # 无位置编码 + 自注意力
+    model_no_pos = HIPA(256, 512, n=1, keep_ratios=[0.5, 0.3, 0.2], min_keeps=4,
+                        use_self_attn=True, num_heads=8, use_positional_encoding=False).to(device)
+    y1 = model_no_pos(x)
+    print(f"无位置编码输出形状: {y1.shape}")
 
-    # 带自注意力
-    model_attn = HIPA(256, 512, n=1, keep_ratios=[0.5, 0.3, 0.2], min_keeps=4,
-                      use_self_attn=True, num_heads=8).to(device)
-    # 训练模式
-    model_attn.train()
-    y2_train = model_attn(x)
-    print(f"自注意力训练输出形状: {y2_train.shape}")
-    # 推理模式
-    model_attn.eval()
-    with torch.no_grad():
-        y2_eval = model_attn(x)
-    print(f"自注意力推理输出形状: {y2_eval.shape}")
+    # 有位置编码 + 自注意力
+    model_pos = HIPA(256, 512, n=1, keep_ratios=[0.5, 0.3, 0.2], min_keeps=4,
+                     use_self_attn=True, num_heads=8, use_positional_encoding=True).to(device)
+    y2 = model_pos(x)
+    print(f"有位置编码输出形状: {y2.shape}")
 
     # 梯度测试
-    loss = y2_train.sum()
+    loss = y1.sum() + y2.sum()
     loss.backward()
     print("反向传播通过")
