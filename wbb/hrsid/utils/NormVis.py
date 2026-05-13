@@ -3,6 +3,7 @@ import torch.nn as nn
 import numpy as np
 from PIL import Image, ImageDraw
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import os
 import random
 from ultralytics import YOLO
@@ -10,14 +11,14 @@ from ultralytics import YOLO
 # ================== 参数配置 ==================
 model_path = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\pt\yolo11n-wavelet-hipa-test-7c46e-5090d.pt"
 dataset_root = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\datasets\HRSID_YOLO"
-output_dir = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\simulate\norm_visualization"
-num_samples = 50
+output_dir = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\simulate\fpn_visualization"
+num_samples = 10
 img_size = 640
 
 os.makedirs(output_dir, exist_ok=True)
 
 # ================== 数据集工具函数 ==================
-def load_yolo_labels(label_path, img_w, img_h):
+def load_yolo_labels(label_path):
     targets = []
     if not os.path.exists(label_path):
         return targets
@@ -30,34 +31,195 @@ def load_yolo_labels(label_path, img_w, img_h):
             targets.append((cx, cy, w, h))
     return targets
 
-# ================== 固定 Backbone（截取第 8 层 C3k2 后的 P5） ==================
-class PretrainedBackbone(nn.Module):
+# ================== 多尺度特征提取器 ==================
+class FPNFeatureExtractor(nn.Module):
     def __init__(self, model_path, device):
         super().__init__()
         yolo = YOLO(model_path)
-        # 仅取前 8 层（索引 0 ~ 7），对应 C3k2 处理后的 P5 特征图
-        num_backbone = 10
-        backbone_layers = list(yolo.model.model.children())[:num_backbone]
-        self.backbone = nn.Sequential(*backbone_layers)
-
-        # 冻结参数
-        self.backbone.eval()
-        for param in self.backbone.parameters():
+        self.model = yolo.model
+        self.model.eval()
+        for param in self.model.parameters():
             param.requires_grad = False
-
-        self.backbone.to(device)
+        self.model.to(device)
         self.device = device
 
+        self.feature_sequence = {}   # {size: [tensor, ...]}
+        self.named_features = {}     # {'sppf': tensor, 'c2psa': tensor}
+        self.hooks = []
+
+        def hook_fn(module, input, output):
+            if isinstance(output, (list, tuple)):
+                out = output[0]
+            else:
+                out = output
+            if isinstance(out, torch.Tensor) and len(out.shape) == 4:
+                _, _, H, W = out.shape
+                if H == W:  # 正方形特征图
+                    if H not in self.feature_sequence:
+                        self.feature_sequence[H] = []
+                    self.feature_sequence[H].append(out.detach())
+
+            # 按模块名称捕获特定层
+            for key in ['sppf', 'c2psa']:
+                if key in module.__class__.__name__.lower():
+                    self.named_features[key] = out.detach()
+
+        for module in self.model.modules():
+            self.hooks.append(module.register_forward_hook(hook_fn))
+
     def forward(self, x):
+        self.feature_sequence = {}
+        self.named_features = {}
         with torch.no_grad():
-            return self.backbone(x)   # 输出 (1, C, 20, 20)
+            _ = self.model(x)
+
+        def get_first(size):
+            if size in self.feature_sequence and len(self.feature_sequence[size]) >= 1:
+                return self.feature_sequence[size][0]
+            return None
+
+        def get_second(size):
+            if size in self.feature_sequence and len(self.feature_sequence[size]) >= 2:
+                return self.feature_sequence[size][1]
+            return None
+
+        p3_backbone = get_first(80)
+        p4_backbone = get_first(40)
+        p5_backbone = get_first(20)
+
+        p4_fpn = get_second(40)
+        p3_fpn = get_second(80)
+
+        sppf_feat = self.named_features.get('sppf', None)
+        c2psa_feat = self.named_features.get('c2psa', None)
+
+        return {
+            'P3_backbone': p3_backbone,
+            'P4_backbone': p4_backbone,
+            'P5_backbone': p5_backbone,
+            'SPPF': sppf_feat,
+            'C2PSA': c2psa_feat,
+            'P4_fpn': p4_fpn,
+            'P3_fpn': p3_fpn
+        }
+
+    def remove_hooks(self):
+        for h in self.hooks:
+            h.remove()
+
+# ================== 归一化 & 上采样 ==================
+def normalize_and_resize(tensor_map, size):
+    arr = tensor_map.cpu().numpy().squeeze()
+    vmin, vmax = arr.min(), arr.max()
+    if vmax - vmin > 1e-6:
+        arr = (arr - vmin) / (vmax - vmin)
+    else:
+        arr = np.zeros_like(arr)
+    arr = (arr * 255).astype(np.uint8)
+    img_pil = Image.fromarray(arr).resize((size, size), Image.NEAREST)
+    return np.array(img_pil) / 255.0
+
+# ================== 生成 4x8 大图（7个特征列 + 1个原图列） ==================
+def plot_all_features(img_draw, feature_dict, targets, img_size, output_path):
+    device = 'cpu'
+    for feat in feature_dict.values():
+        if feat is not None:
+            device = feat.device
+            break
+
+    target_sizes = {
+        'P3_backbone': 80, 'P4_backbone': 40, 'P5_backbone': 20,
+        'SPPF': 20, 'C2PSA': 20,
+        'P4_fpn': 40, 'P3_fpn': 80
+    }
+
+    def compute_maps(feat, size):
+        if feat is None:
+            return None, None, None, None
+        _, _, H, W = feat.shape
+        mask = torch.zeros((1, H, W), device=feat.device)
+        for cx, cy, w, h in targets:
+            x1 = int((cx - w/2) * W)
+            y1 = int((cy - h/2) * H)
+            x2 = int((cx + w/2) * W + 1)
+            y2 = int((cy + h/2) * H + 1)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(W, x2), min(H, y2)
+            mask[0, y1:y2, x1:x2] = 1.0
+
+        mean_map = feat.mean(dim=1)
+        l1_map = feat.abs().sum(dim=1)
+        bg_mean = (l1_map * (1 - mask)).sum() / ((1 - mask).sum() + 1e-6)
+        contrast_full = l1_map / (bg_mean + 1e-6)
+        contrast_masked = contrast_full * mask
+        return mean_map, l1_map, contrast_masked, contrast_full
+
+    plt.rc('font', size=14)
+    plt.rc('axes', titlesize=16)
+
+    # 关键修改：8列，原图占1列，特征占7列，宽度比例
+    fig = plt.figure(figsize=(64, 28))
+    gs = gridspec.GridSpec(4, 8, figure=fig,
+                           width_ratios=[2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+                           wspace=0.05, hspace=0.2)
+
+    # 原图占据全部4行，第0列
+    ax_img = fig.add_subplot(gs[0:4, 0])
+    ax_img.imshow(img_draw)
+    ax_img.set_title('Original Image with GT', fontsize=20, fontweight='bold', pad=15)
+    ax_img.axis('off')
+
+    # 7个特征列（顺序固定）
+    col_names = ['P3_backbone', 'P4_backbone', 'P5_backbone', 'SPPF', 'C2PSA', 'P4_fpn', 'P3_fpn']
+    row_titles = ['Mean Activation', 'L1 Norm', 'Object Contrast', 'Full Contrast']
+    row_cmaps  = ['gray', 'gray', 'plasma', 'plasma']
+
+    for col_idx, name in enumerate(col_names):
+        feat = feature_dict[name]
+        # 列索引：原图占用第0列，特征从第1列开始
+        col_pos = col_idx + 1
+
+        if feat is None:
+            for row_idx in range(4):
+                ax = fig.add_subplot(gs[row_idx, col_pos])
+                ax.imshow(np.zeros((img_size, img_size)), cmap='gray')
+                ax.set_title(f'{name}\n{row_titles[row_idx]}\n(missing)', fontsize=12)
+                ax.axis('off')
+            continue
+
+        mean_map, l1_map, obj_con, full_con = compute_maps(feat, target_sizes[name])
+
+        ax1 = fig.add_subplot(gs[0, col_pos])
+        ax1.imshow(normalize_and_resize(mean_map, img_size), cmap='gray')
+        ax1.set_title(f'{name}\n{row_titles[0]}', fontsize=15, fontweight='bold', pad=8)
+        ax1.axis('off')
+
+        ax2 = fig.add_subplot(gs[1, col_pos])
+        ax2.imshow(normalize_and_resize(l1_map, img_size), cmap='gray')
+        ax2.set_title(f'{name}\n{row_titles[1]}', fontsize=15, fontweight='bold', pad=8)
+        ax2.axis('off')
+
+        ax3 = fig.add_subplot(gs[2, col_pos])
+        ax3.imshow(normalize_and_resize(obj_con, img_size), cmap='plasma')
+        ax3.set_title(f'{name}\n{row_titles[2]}', fontsize=15, fontweight='bold', pad=8)
+        ax3.axis('off')
+
+        ax4 = fig.add_subplot(gs[3, col_pos])
+        ax4.imshow(normalize_and_resize(full_con, img_size), cmap='plasma')
+        ax4.set_title(f'{name}\n{row_titles[3]}', fontsize=15, fontweight='bold', pad=8)
+        ax4.axis('off')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=100, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {output_path}")
 
 # ================== 主程序 ==================
 def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    backbone = PretrainedBackbone(model_path, device)
+    extractor = FPNFeatureExtractor(model_path, device)
 
     train_img_dir = os.path.join(dataset_root, 'images', 'train')
     train_label_dir = os.path.join(dataset_root, 'labels', 'train')
@@ -68,72 +230,13 @@ def main():
         img_path = os.path.join(train_img_dir, img_name)
         label_path = os.path.join(train_label_dir, os.path.splitext(img_name)[0] + '.txt')
 
-        # 加载图像并预处理
         img = Image.open(img_path).convert('RGB')
         img = img.resize((img_size, img_size), Image.BILINEAR)
         img_np = np.array(img).astype(np.float32) / 255.0
         img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)
 
-        targets = load_yolo_labels(label_path, img.width, img.height)
+        targets = load_yolo_labels(label_path)
 
-        # 提取第 8 层 P5 特征图
-        p5 = backbone(img_tensor)
-        print(f"P5 feature shape (from layer 8 C3k2): {p5.shape}")
-
-        # ---- 通道均值图 ----
-        p5_mean_map = p5.mean(dim=1, keepdim=False)
-
-        # ---- L1 和 L2 范数图 ----
-        l1_map = p5.abs().sum(dim=1, keepdim=False)
-        l2_map = torch.norm(p5, p=2, dim=1, keepdim=False)
-
-        # ---- 激活稀疏度图（每个位置活跃的通道数） ----
-        thresh = p5.abs().mean() * 1.5  # 动态阈值，可按需改为固定值如 0.5
-        active_mask = (p5.abs() > thresh).float()
-        sparsity_map = active_mask.sum(dim=1)  # (1,20,20) 值越小越稀疏
-
-        # ---- 目标-背景对比度图（基于 L1 范数） ----
-        # 建立 20×20 的 GT 掩膜
-        mask = torch.zeros((1, 20, 20), device=device)
-        for cx, cy, w, h in targets:
-            x1 = int((cx - w/2) * 20)
-            y1 = int((cy - h/2) * 20)
-            x2 = int((cx + w/2) * 20 + 1)
-            y2 = int((cy + h/2) * 20 + 1)
-            # 边界裁剪
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(20, x2), min(20, y2)
-            mask[0, y1:y2, x1:x2] = 1.0
-
-        # 背景平均 L1
-        bg_pixels = (1 - mask).sum() + 1e-6
-        bg_mean_l1 = (l1_map * (1 - mask)).sum() / bg_pixels
-
-        if mask.sum() > 0:
-            contrast_map = l1_map / (bg_mean_l1 + 1e-6)
-            contrast_map = contrast_map * mask  # 只保留目标区域的对比度
-        else:
-            contrast_map = torch.zeros_like(l1_map)
-
-        # ---- 归一化并上采样到 640×640 ----
-        def normalize_and_resize(tensor_map, size):
-            arr = tensor_map.cpu().numpy().squeeze()
-            vmin, vmax = arr.min(), arr.max()
-            if vmax - vmin > 1e-6:
-                arr = (arr - vmin) / (vmax - vmin)
-            else:
-                arr = np.zeros_like(arr)
-            arr = (arr * 255).astype(np.uint8)
-            img_pil = Image.fromarray(arr).resize((size, size), Image.NEAREST)
-            return np.array(img_pil) / 255.0
-
-        p5_mean_large = normalize_and_resize(p5_mean_map, img_size)
-        l1_large      = normalize_and_resize(l1_map, img_size)
-        l2_large      = normalize_and_resize(l2_map, img_size)
-        sparsity_large = normalize_and_resize(sparsity_map, img_size)
-        contrast_large = normalize_and_resize(contrast_map, img_size)
-
-        # ---- 绘制原图 + GT 框 ----
         img_draw = Image.fromarray((img_np * 255).astype(np.uint8))
         draw = ImageDraw.Draw(img_draw)
         for cx, cy, w, h in targets:
@@ -143,40 +246,14 @@ def main():
             y2 = (cy + h/2) * img_size
             draw.rectangle([x1, y1, x2, y2], outline='lime', width=2)
 
-        # ---- 2×3 可视化 ----
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-        axes = axes.flatten()
+        feats = extractor(img_tensor)
+        print(f"Processing {img_name}: SPPF={'OK' if feats['SPPF'] is not None else 'MISS'}, "
+              f"C2PSA={'OK' if feats['C2PSA'] is not None else 'MISS'}, ...")
 
-        axes[0].imshow(img_draw)
-        axes[0].set_title('Original + GT')
-        axes[0].axis('off')
+        out_path = os.path.join(output_dir, f"fpn_compare_{os.path.splitext(img_name)[0]}.png")
+        plot_all_features(img_draw, feats, targets, img_size, out_path)
 
-        axes[1].imshow(p5_mean_large, cmap='gray')
-        axes[1].set_title('P5 Mean (C-dim avg)')
-        axes[1].axis('off')
-
-        axes[2].imshow(l1_large, cmap='gray')
-        axes[2].set_title('L1 Norm')
-        axes[2].axis('off')
-
-        axes[3].imshow(l2_large, cmap='gray')
-        axes[3].set_title('L2 Norm')
-        axes[3].axis('off')
-
-        axes[4].imshow(sparsity_large, cmap='hot')
-        axes[4].set_title('Active Channels (> th)')
-        axes[4].axis('off')
-
-        axes[5].imshow(contrast_large, cmap='plasma')
-        axes[5].set_title('Object Contrast (L1/BG)')
-        axes[5].axis('off')
-
-        plt.tight_layout()
-        out_path = os.path.join(output_dir, f"norm_{os.path.splitext(img_name)[0]}.png")
-        plt.savefig(out_path, dpi=100)
-        plt.close()
-        print(f"Saved {out_path}")
-
+    extractor.remove_hooks()
     print("All visualizations completed.")
 
 if __name__ == "__main__":
