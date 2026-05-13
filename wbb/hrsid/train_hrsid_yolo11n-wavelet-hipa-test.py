@@ -3,7 +3,6 @@ from ultralytics import YOLO
 import os
 import torch
 
-from ultralytics.utils.HIPATrainer import CustomTrainer
 
 MODEL_NAME = "yolo11n-wavelet-hipa-test.yaml"
 DATASET_PATH = "../cfg/hrsid.yaml"
@@ -47,22 +46,6 @@ def check_dataset(config_path):
 
     print("==========================\n")
 
-# 阈值打印回调（可选，注册到 on_fit_epoch_end）
-def print_hipa_thresholds(trainer):
-    threshold_values = []
-    for module in trainer.model.modules():
-        if hasattr(module, 'logit_thresholds'):
-            th = torch.sigmoid(module.logit_thresholds).detach().cpu().numpy()
-            threshold_values.append(('single', th))
-        if hasattr(module, 'logit_thresholds_low'):
-            low = torch.sigmoid(module.logit_thresholds_low).detach().cpu().numpy()
-            high = torch.sigmoid(module.logit_thresholds_high).detach().cpu().numpy()
-            threshold_values.append(('low', low))
-            threshold_values.append(('high', high))
-    if threshold_values:
-        print(f"\n--- Epoch {trainer.epoch} HIPA Thresholds ---")
-        for name, val in threshold_values:
-            print(f"  {name}: {val}")
 
 def train_model():
     """训练 hrsid 船舶检测模型"""
@@ -82,7 +65,6 @@ def train_model():
     model = YOLO(MODEL_NAME)  # 从配置文件开始
 
     # 之后在训练前注册该回调
-    # model.add_callback("on_fit_epoch_end", print_hipa_thresholds)
 
     # 训练配置
     print("开始训练 船舶检测模型...")
