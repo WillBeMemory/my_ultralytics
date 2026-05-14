@@ -227,14 +227,16 @@ def run_experiment(model_path, dataset_root, output_dir,
     enhancer = SoftFillEdgeEnhance(
         c1=in_channels,
         c2=in_channels,
-        n=2,                    # 2 个 Bottleneck 精炼
+        n=2,
         pool_size=3,
-        fill_strength=0.8,
-        bg_thresh_ratio=0.5,
-        ch_sharp=5.0,
+        bg_thresh_ratio=0.3,  # 背景判定阈值（固定）
+        initial_strength=0.5,  # 可学习填充强度的初始值（代替原来的 fill_strength）
+        protect_target=True,  # 开启目标保护
+        target_thresh=2.0,  # 峰值超过均值 2 倍视为目标，不填充
+        ch_sharp=10.0,
         ch_thresh=0.5,
-        edge_sharp=5.0,
-        edge_thresh=0.5,
+        edge_sharp=10.0,
+        edge_thresh=0.8,
         bottleneck_e=0.5,
         bottleneck_shortcut=True
     ).to(device)
