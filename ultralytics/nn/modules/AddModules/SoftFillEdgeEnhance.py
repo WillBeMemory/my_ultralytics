@@ -43,7 +43,7 @@ class AdaptiveBackgroundFill(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         # 基准值：每个通道的全局最小值
-        baseline = x.view(B, C, -1).min(dim=-1)[0].view(B, C, 1, 1)  # (B, C, 1, 1)
+        baseline = x.view(B, C, -1).min(dim=-1)[0].view(B, C, 1, 1)
 
         # 局部对比度：max - min
         pad = self.pool_size // 2
@@ -55,7 +55,7 @@ class AdaptiveBackgroundFill(nn.Module):
         mean_contrast = local_contrast.mean(dim=[2, 3], keepdim=True) + 1e-6
         bg_mask = (local_contrast < self.bg_thresh_ratio * mean_contrast).float()
 
-        # 软填充（标量 fill_strength 直接参与运算，无需 dtype 转换）
+        # 软填充
         out = x * (1 - self.fill_strength * bg_mask) + baseline * self.fill_strength * bg_mask
         return out
 
@@ -74,7 +74,7 @@ class ChannelAwareEdgeEnhance_Attn(nn.Module):
         self.edge_thresh = nn.Parameter(torch.tensor(edge_thresh), requires_grad=False)
 
     def forward(self, x):
-        # 关键修复：根据输入 x 的 dtype 转换超参数（适配 AMP 混合精度训练）
+        # 根据输入 x 的 dtype 转换超参数（适配 AMP 混合精度训练）
         ch_sharp = self.ch_sharp.to(dtype=x.dtype)
         ch_thresh = self.ch_thresh.to(dtype=x.dtype)
         edge_sharp = self.edge_sharp.to(dtype=x.dtype)
@@ -132,6 +132,14 @@ class SoftFillEdgeEnhance(nn.Module):
         self.proj = nn.Conv2d(c1, c2, 1, bias=False) if c1 != c2 else nn.Identity()
 
     def forward(self, x):
+        # 关键修复：将输入 x 对齐到模块内部权重的 dtype（消除 AMP 下的类型不匹配）
+        # 获取第一个可学习参数的 dtype（如 bottlenecks[0].cv1.weight）
+        if len(self.bottlenecks) > 0:
+            target_dtype = self.bottlenecks[0].cv1.weight.dtype
+        else:
+            target_dtype = x.dtype
+        x = x.to(target_dtype)
+
         out = self.bg_fill(x)        # 1. 背景填充
         out = self.attn(out)         # 2. 注意力增强（通道筛选+边缘增强）
         out = self.bottlenecks(out)  # 3. 特征精炼（n 个 Bottleneck）
