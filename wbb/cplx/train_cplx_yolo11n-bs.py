@@ -1,11 +1,8 @@
 # train_hrsc.py
-from ultralytics.engine.trainer import BaseTrainer
 
 from ultralytics import YOLO
 import os
 import torch
-
-from ultralytics.nn.modules.BSTrainer import BSTrainer
 
 MODEL_NAME = "yolo11n-bs.yaml"
 DATASET_PATH = "../cfg/cplx.yaml"

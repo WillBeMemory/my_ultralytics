@@ -47,7 +47,7 @@ from ultralytics.nn.modules.TernaryDPConv import TernaryDPConv
 from ultralytics.nn.modules.SmartAreaAttention import SmartAreaAttention
 from ultralytics.nn.modules.SaveFirstImage import SaveFirstImage
 from ultralytics.nn.modules.BiDirectionalTGFI import BiDirectionalTGFI,BiDirectionalTGFIBlock
-from ultralytics.nn.modules.BackgroundSuppression import BackgroundSuppression
+from ultralytics.nn.modules.AddModules.BackgroundSuppression import BackgroundSuppression
 from ultralytics.nn.modules.TernaryMoEBlock import TernaryMoEBlock
 from ultralytics.nn.modules.DeterministicGateConv import DeterministicGateConv
 from ultralytics.nn.modules.GatedC3k2 import GatedC3k2

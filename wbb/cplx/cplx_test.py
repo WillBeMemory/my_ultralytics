@@ -1,8 +1,5 @@
-from PIL.ImImagePlugin import split
-
 from ultralytics import YOLO
-from ultralytics.utils.CustomLoss import CustomDetectionModel, CustomTrainer
-from ultralytics.nn.modules.BSTrainer import BSTrainer
+
 # 配置参数
 model_path = "./runs/detect/train/weights/best.pt"       # 训练好的模型权重文件
 data_yaml = "../cfg/cplx.yaml"      # 数据集配置文件（包含验证集路径）

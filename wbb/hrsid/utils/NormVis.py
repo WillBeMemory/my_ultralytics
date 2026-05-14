@@ -10,7 +10,8 @@ from ultralytics import YOLO
 
 # ================== 参数配置 ==================
 model_path = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\pt\yolo11n-wavelet-hipa-test-7c46e-5090d.pt"
-dataset_root = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\datasets\HRSID_YOLO"
+# model_path = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\pt\yolo11n-t10.pt"
+dataset_root = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\datasets\HRSID_COMPLEX"
 output_dir = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\simulate\fpn_visualization"
 num_samples = 10
 img_size = 640
@@ -31,11 +32,12 @@ def load_yolo_labels(label_path):
             targets.append((cx, cy, w, h))
     return targets
 
-# ================== 多尺度特征提取器 ==================
+# ================== 特征提取器（新增 PAN 层捕获） ==================
 class FPNFeatureExtractor(nn.Module):
     def __init__(self, model_path, device):
         super().__init__()
-        yolo = YOLO(model_path)
+        # 使用 verbose=False 禁止终端进度条，避免 iShellPro 换行问题
+        yolo = YOLO(model_path, verbose=False)
         self.model = yolo.model
         self.model.eval()
         for param in self.model.parameters():
@@ -54,12 +56,12 @@ class FPNFeatureExtractor(nn.Module):
                 out = output
             if isinstance(out, torch.Tensor) and len(out.shape) == 4:
                 _, _, H, W = out.shape
-                if H == W:  # 正方形特征图
+                if H == W:
                     if H not in self.feature_sequence:
                         self.feature_sequence[H] = []
                     self.feature_sequence[H].append(out.detach())
 
-            # 按模块名称捕获特定层
+            # 捕获 SPPF 和 C2PSA（按模块名称）
             for key in ['sppf', 'c2psa']:
                 if key in module.__class__.__name__.lower():
                     self.named_features[key] = out.detach()
@@ -83,13 +85,25 @@ class FPNFeatureExtractor(nn.Module):
                 return self.feature_sequence[size][1]
             return None
 
+        def get_third(size):
+            if size in self.feature_sequence and len(self.feature_sequence[size]) >= 3:
+                return self.feature_sequence[size][2]
+            return None
+
+        # Backbone
         p3_backbone = get_first(80)
         p4_backbone = get_first(40)
         p5_backbone = get_first(20)
 
+        # FPN（第二次出现）
         p4_fpn = get_second(40)
         p3_fpn = get_second(80)
 
+        # PAN（第三次出现）
+        p4_pan = get_third(40)
+        p5_pan = get_third(20)
+
+        # SPPF / C2PSA
         sppf_feat = self.named_features.get('sppf', None)
         c2psa_feat = self.named_features.get('c2psa', None)
 
@@ -100,7 +114,9 @@ class FPNFeatureExtractor(nn.Module):
             'SPPF': sppf_feat,
             'C2PSA': c2psa_feat,
             'P4_fpn': p4_fpn,
-            'P3_fpn': p3_fpn
+            'P3_fpn': p3_fpn,
+            'P4_pan': p4_pan,
+            'P5_pan': p5_pan
         }
 
     def remove_hooks(self):
@@ -119,7 +135,7 @@ def normalize_and_resize(tensor_map, size):
     img_pil = Image.fromarray(arr).resize((size, size), Image.NEAREST)
     return np.array(img_pil) / 255.0
 
-# ================== 生成 4x8 大图（7个特征列 + 1个原图列） ==================
+# ================== 可视化：4 行 × 10 列 ==================
 def plot_all_features(img_draw, feature_dict, targets, img_size, output_path):
     device = 'cpu'
     for feat in feature_dict.values():
@@ -130,7 +146,8 @@ def plot_all_features(img_draw, feature_dict, targets, img_size, output_path):
     target_sizes = {
         'P3_backbone': 80, 'P4_backbone': 40, 'P5_backbone': 20,
         'SPPF': 20, 'C2PSA': 20,
-        'P4_fpn': 40, 'P3_fpn': 80
+        'P4_fpn': 40, 'P3_fpn': 80,
+        'P4_pan': 40, 'P5_pan': 20
     }
 
     def compute_maps(feat, size):
@@ -157,27 +174,29 @@ def plot_all_features(img_draw, feature_dict, targets, img_size, output_path):
     plt.rc('font', size=14)
     plt.rc('axes', titlesize=16)
 
-    # 关键修改：8列，原图占1列，特征占7列，宽度比例
-    fig = plt.figure(figsize=(64, 28))
-    gs = gridspec.GridSpec(4, 8, figure=fig,
-                           width_ratios=[2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    # 10 列：原图 + 9 特征列，原图稍宽
+    fig = plt.figure(figsize=(80, 28))
+    gs = gridspec.GridSpec(4, 10, figure=fig,
+                           width_ratios=[2.0] + [1.0]*9,
                            wspace=0.05, hspace=0.2)
 
-    # 原图占据全部4行，第0列
+    # 原图（第 0 列，跨 4 行）
     ax_img = fig.add_subplot(gs[0:4, 0])
     ax_img.imshow(img_draw)
     ax_img.set_title('Original Image with GT', fontsize=20, fontweight='bold', pad=15)
     ax_img.axis('off')
 
-    # 7个特征列（顺序固定）
-    col_names = ['P3_backbone', 'P4_backbone', 'P5_backbone', 'SPPF', 'C2PSA', 'P4_fpn', 'P3_fpn']
+    # 特征列顺序（按网络处理流程排列）
+    col_names = ['P3_backbone', 'P4_backbone', 'P5_backbone',
+                 'SPPF', 'C2PSA',
+                 'P4_fpn', 'P3_fpn',
+                 'P4_pan', 'P5_pan']
     row_titles = ['Mean Activation', 'L1 Norm', 'Object Contrast', 'Full Contrast']
     row_cmaps  = ['gray', 'gray', 'plasma', 'plasma']
 
     for col_idx, name in enumerate(col_names):
         feat = feature_dict[name]
-        # 列索引：原图占用第0列，特征从第1列开始
-        col_pos = col_idx + 1
+        col_pos = col_idx + 1  # 特征列从第 1 列开始
 
         if feat is None:
             for row_idx in range(4):
@@ -189,21 +208,25 @@ def plot_all_features(img_draw, feature_dict, targets, img_size, output_path):
 
         mean_map, l1_map, obj_con, full_con = compute_maps(feat, target_sizes[name])
 
+        # 行 1：Mean
         ax1 = fig.add_subplot(gs[0, col_pos])
         ax1.imshow(normalize_and_resize(mean_map, img_size), cmap='gray')
         ax1.set_title(f'{name}\n{row_titles[0]}', fontsize=15, fontweight='bold', pad=8)
         ax1.axis('off')
 
+        # 行 2：L1
         ax2 = fig.add_subplot(gs[1, col_pos])
         ax2.imshow(normalize_and_resize(l1_map, img_size), cmap='gray')
         ax2.set_title(f'{name}\n{row_titles[1]}', fontsize=15, fontweight='bold', pad=8)
         ax2.axis('off')
 
+        # 行 3：Object Contrast
         ax3 = fig.add_subplot(gs[2, col_pos])
         ax3.imshow(normalize_and_resize(obj_con, img_size), cmap='plasma')
         ax3.set_title(f'{name}\n{row_titles[2]}', fontsize=15, fontweight='bold', pad=8)
         ax3.axis('off')
 
+        # 行 4：Full Contrast
         ax4 = fig.add_subplot(gs[3, col_pos])
         ax4.imshow(normalize_and_resize(full_con, img_size), cmap='plasma')
         ax4.set_title(f'{name}\n{row_titles[3]}', fontsize=15, fontweight='bold', pad=8)
@@ -247,8 +270,8 @@ def main():
             draw.rectangle([x1, y1, x2, y2], outline='lime', width=2)
 
         feats = extractor(img_tensor)
-        print(f"Processing {img_name}: SPPF={'OK' if feats['SPPF'] is not None else 'MISS'}, "
-              f"C2PSA={'OK' if feats['C2PSA'] is not None else 'MISS'}, ...")
+        print(f"Processing {img_name}: P4_pan={'OK' if feats['P4_pan'] is not None else 'MISS'}, "
+              f"P5_pan={'OK' if feats['P5_pan'] is not None else 'MISS'}, ...")
 
         out_path = os.path.join(output_dir, f"fpn_compare_{os.path.splitext(img_name)[0]}.png")
         plot_all_features(img_draw, feats, targets, img_size, out_path)
