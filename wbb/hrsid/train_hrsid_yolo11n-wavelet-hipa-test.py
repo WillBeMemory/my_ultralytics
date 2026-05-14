@@ -63,7 +63,13 @@ def train_model():
 
     # 加载模型 - 从配置文件开始（不使用预训练权重）
     print("加载 YOLO 模型...")
-    model = YOLO(MODEL_NAME)  # 从配置文件开始
+
+    class CustomYOLO(YOLO):
+        @property
+        def trainer_class(self):
+            return BSTrainer
+
+    model = CustomYOLO(MODEL_NAME)  # 从配置文件开始
 
     # 之后在训练前注册该回调
 
@@ -85,7 +91,7 @@ def train_model():
             cos_lr=True,  # 余弦退火
             warmup_epochs=3.0,
             # amp = False,
-            trainer=BSTrainer,
+            # trainer=BSTrainer,
 
             patience=0,  # 早停耐心值
             save=True,

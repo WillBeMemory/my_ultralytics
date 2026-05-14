@@ -57,6 +57,7 @@ from ultralytics.nn.modules.SPDConv import SPDConv
 
 from ultralytics.nn.modules.InterpDownsample import InterpDownsample
 from ultralytics.nn.modules.ChannelGateSepConv import ChannelGateSepConv
+from ultralytics.nn.modules.AddModules.ChannelAwareEdgeEnhance import ChannelAwareEdgeEnhance
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1669,6 +1670,7 @@ def parse_model(d, ch, verbose=True):
             SPDConv,
             InterpDownsample,
             ChannelGateSepConv,
+            ChannelAwareEdgeEnhance,
 
             Classify,
             Conv,
@@ -1745,6 +1747,7 @@ def parse_model(d, ch, verbose=True):
             WaveletRefine,
             IWConv,
             ChannelGateSepConv,
+            ChannelAwareEdgeEnhance,
 
             BottleneckCSP,
             C1,

@@ -69,6 +69,7 @@ from ultralytics.nn.modules.IWConv import IWConv
 from ultralytics.nn.modules.SPDConv import SPDConv
 from ultralytics.nn.modules.InterpDownsample import InterpDownsample
 from ultralytics.nn.modules.ChannelGateSepConv import ChannelGateSepConv
+from ultralytics.nn.modules.ChannelGateSepConv import ChannelGateSepConv
 
 
 from .block import (
