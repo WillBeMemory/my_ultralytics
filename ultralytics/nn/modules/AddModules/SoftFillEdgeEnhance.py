@@ -74,30 +74,31 @@ class ChannelAwareEdgeEnhance_Attn(nn.Module):
         self.edge_thresh = nn.Parameter(torch.tensor(edge_thresh), requires_grad=False)
 
     def forward(self, x):
-        # 根据输入 x 的 dtype 转换超参数（适配 AMP 混合精度训练）
+        # 根据输入 x 的 dtype 转换超参数
         ch_sharp = self.ch_sharp.to(dtype=x.dtype)
         ch_thresh = self.ch_thresh.to(dtype=x.dtype)
         edge_sharp = self.edge_sharp.to(dtype=x.dtype)
         edge_thresh = self.edge_thresh.to(dtype=x.dtype)
 
         B, C, H, W = x.shape
-        pad = self.pool_size // 2
         x_abs = x.abs()
 
         # 通道权重：max - avg 差异
-        max_ch = F.adaptive_max_pool2d(x_abs, 1)
+        # 全局最大（确定性的替代写法，不使用 adaptive_max_pool2d）
+        max_ch = x_abs.view(B, C, -1).max(dim=-1, keepdim=True)[0].view(B, C, 1, 1)
+        # 全局平均（保留原方式，也可改但无必要）
         avg_ch = F.adaptive_avg_pool2d(x_abs, 1)
         diff_ch = max_ch - avg_ch
         ch_weight = torch.sigmoid(ch_sharp * (diff_ch - ch_thresh))
 
-        # 空间边缘权重：max - min
+        # 空间边缘权重（保持不变）
+        pad = self.pool_size // 2
         x_spatial = x_abs.mean(dim=1, keepdim=True)
         max_s = F.max_pool2d(x_spatial, self.pool_size, stride=1, padding=pad)
         min_s = -F.max_pool2d(-x_spatial, self.pool_size, stride=1, padding=pad)
         edge = max_s - min_s
         edge_weight = torch.sigmoid(edge_sharp * (edge - edge_thresh))
 
-        # 应用增强
         out = x * ch_weight
         out = out * (1.0 + edge_weight)
         return out
