@@ -11,10 +11,12 @@ from ultralytics import YOLO
 # ================== 参数配置 ==================
 model_path = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\pt\yolo11n-wavelet-hipa-test-7c46e-5090d.pt"
 # model_path = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\pt\yolo11n-t10.pt"
+# model_path = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\pt\yolo11n-wavelet-hipa-test-6f1a4f-5070ti.pt"
 dataset_root = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\datasets\HRSID_COMPLEX"
 output_dir = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\simulate\fpn_visualization"
 num_samples = 10
 img_size = 640
+mode = 'first'  # 可选 'random' 或 'first'，决定选取图片的方式
 
 os.makedirs(output_dir, exist_ok=True)
 
@@ -247,7 +249,14 @@ def main():
     train_img_dir = os.path.join(dataset_root, 'images', 'train')
     train_label_dir = os.path.join(dataset_root, 'labels', 'train')
     all_imgs = [f for f in os.listdir(train_img_dir) if f.lower().endswith(('.jpg', '.png', '.bmp'))]
-    selected_imgs = random.sample(all_imgs, min(num_samples, len(all_imgs)))
+
+    # 根据 mode 选取图片
+    if mode == 'first':
+        selected_imgs = all_imgs[:min(num_samples, len(all_imgs))]
+    elif mode == 'random':
+        selected_imgs = random.sample(all_imgs, min(num_samples, len(all_imgs)))
+    else:
+        raise ValueError(f"Unknown mode: {mode}. Use 'random' or 'first'.")
 
     for img_name in selected_imgs:
         img_path = os.path.join(train_img_dir, img_name)
