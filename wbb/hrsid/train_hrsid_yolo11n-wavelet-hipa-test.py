@@ -3,7 +3,6 @@ from ultralytics import YOLO
 import os
 import torch
 
-from ultralytics.utils.added.BSTrainer import BSTrainer
 
 MODEL_NAME = "yolo11n-wavelet-hipa-test.yaml"
 DATASET_PATH = "../cfg/hrsid.yaml"
@@ -63,15 +62,7 @@ def train_model():
 
     # 加载模型 - 从配置文件开始（不使用预训练权重）
     print("加载 YOLO 模型...")
-
-    class CustomYOLO(YOLO):
-        @property
-        def trainer_class(self):
-            return BSTrainer
-
-    model = CustomYOLO(MODEL_NAME)  # 从配置文件开始
-
-    # 之后在训练前注册该回调
+    model = YOLO(MODEL_NAME)  # 从配置文件开始
 
     # 训练配置
     print("开始训练 船舶检测模型...")
@@ -85,13 +76,11 @@ def train_model():
             device=device,
             optimizer="SGD",  # 改用 SGD
             lr0=0.01,  # 初始学习率 0.01
-            lrf=0.01,  # 最终学习率 = 0.01 * 0.05 = 0.0005
+            lrf=0.01,  # 最终学习率 = 0.01 * 0.01 = 0.0001
             momentum=0.937,  # SGD 动量
             weight_decay=0.0005,  # 权重衰减
             cos_lr=True,  # 余弦退火
             warmup_epochs=3.0,
-            # amp = False,
-            # trainer=BSTrainer,
 
             patience=0,  # 早停耐心值
             save=True,
