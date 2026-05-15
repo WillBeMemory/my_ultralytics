@@ -63,14 +63,19 @@ class SparseBottleneck(nn.Module):
         return out
 
 
-# ================== 背景填充模块（无目标保护） ==================
+# ================== 背景填充模块（固定填充强度，无目标保护） ==================
 class AdaptiveBackgroundFill(nn.Module):
-    def __init__(self, ch, pool_size=3, bg_thresh_ratio=0.5, initial_strength=0.8):
+    """
+    自适应背景填充，使用固定填充强度。
+    - fill_strength: 固定标量，控制背景被拉向全局最小值的程度 (0~1)
+    - bg_thresh_ratio: 背景判定阈值
+    """
+    def __init__(self, ch, pool_size=3, bg_thresh_ratio=0.5, fill_strength=0.8):
         super().__init__()
         self.ch = ch
         self.pool_size = pool_size
         self.bg_thresh_ratio = bg_thresh_ratio
-        self.fill_strength_raw = nn.Parameter(torch.full((1, ch, 1, 1), initial_strength))
+        self.fill_strength = fill_strength      # 固定值，不再可学习
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -82,8 +87,8 @@ class AdaptiveBackgroundFill(nn.Module):
         eps = torch.tensor(1e-6, dtype=x.dtype, device=x.device)
         mean_contrast = local_contrast.mean(dim=[2, 3], keepdim=True) + eps
         bg_mask = (local_contrast < self.bg_thresh_ratio * mean_contrast).to(dtype=x.dtype)
-        strength = torch.sigmoid(self.fill_strength_raw)
-        out = x * (1 - strength * bg_mask) + baseline * strength * bg_mask
+        # 直接使用固定填充强度
+        out = x * (1 - self.fill_strength * bg_mask) + baseline * self.fill_strength * bg_mask
         return out, bg_mask
 
 
@@ -122,15 +127,15 @@ class ChannelAwareEdgeEnhance_Attn(nn.Module):
         return out
 
 
-# ================== 完整模块：SoftFillEdgeEnhance（稀疏 + CPU回退） ==================
+# ================== 完整模块：SoftFillEdgeEnhance（固定填充强度，稀疏+CPU回退） ==================
 class SoftFillEdgeEnhance(nn.Module):
     def __init__(self, c1, c2, n=1, pool_size=3,
-                 bg_thresh_ratio=0.3, initial_strength=0.5,
+                 bg_thresh_ratio=0.3, fill_strength=0.8,
                  ch_sharp=3.0, ch_thresh=0.3,
                  edge_sharp=5.0, edge_thresh=0.5,
                  bottleneck_e=0.5, bottleneck_shortcut=True):
         super().__init__()
-        self.bg_fill = AdaptiveBackgroundFill(c1, pool_size, bg_thresh_ratio, initial_strength)
+        self.bg_fill = AdaptiveBackgroundFill(c1, pool_size, bg_thresh_ratio, fill_strength)
         self.attn = ChannelAwareEdgeEnhance_Attn(c1, pool_size, ch_sharp, ch_thresh, edge_sharp, edge_thresh)
 
         # 同时构建密集和稀疏 Bottleneck
@@ -158,7 +163,6 @@ class SoftFillEdgeEnhance(nn.Module):
         # 3. 判断是否使用稀疏路径：要求 CUDA 且至少有一个激活点
         use_sparse = (x.device.type == 'cuda')
         if use_sparse:
-            # 生成前景掩膜
             bg_mask_mean = bg_mask.mean(dim=1, keepdim=True)
             fg_mask = (bg_mask_mean < 0.5).to(dtype=enhanced.dtype)
             B, C, H, W = enhanced.shape
@@ -173,7 +177,6 @@ class SoftFillEdgeEnhance(nn.Module):
                 sparse_output = self.sparse_bottlenecks(sparse_input)
                 out = sparse_output.dense()
         else:
-            # CPU 环境或回退：使用密集 Bottleneck
             out = self.dense_bottlenecks(enhanced)
 
         # 4. 输出投影
