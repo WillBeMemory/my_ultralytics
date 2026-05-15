@@ -4,9 +4,30 @@ import torch.nn.functional as F
 import spconv.pytorch as spconv
 
 
-# ================== 密集 Bottleneck（CPU 回退 & 对照用） ==================
+# ================== 密集深度可分离卷积 ==================
+class DenseDWConv(nn.Module):
+    def __init__(self, c1, c2, shortcut=True):
+        super().__init__()
+        self.depthwise = nn.Conv2d(c1, c1, 3, padding=1, groups=c1, bias=False)
+        self.dw_bn = nn.BatchNorm2d(c1)
+        self.pointwise = nn.Conv2d(c1, c2, 1, bias=False)
+        self.pw_bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU(inplace=True)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        identity = x
+        out = self.act(self.dw_bn(self.depthwise(x)))
+        out = self.pw_bn(self.pointwise(out))
+        if self.add:
+            out = self.act(out + identity)
+        else:
+            out = self.act(out)
+        return out
+
+
+# ================== 密集 Bottleneck ==================
 class DenseBottleneck(nn.Module):
-    """标准 Bottleneck，用于 CPU 推理或密集路径"""
     def __init__(self, c1, c2, shortcut=True, e=0.5):
         super().__init__()
         c_ = int(c2 * e)
@@ -31,9 +52,8 @@ class DenseBottleneck(nn.Module):
         return out
 
 
-# ================== 稀疏 Bottleneck（GPU 加速） ==================
+# ================== 稀疏 Bottleneck ==================
 class SparseBottleneck(nn.Module):
-    """稀疏 Bottleneck，仅对激活点进行卷积，保持激活点数不变"""
     def __init__(self, c1, c2, shortcut=True, e=0.5):
         super().__init__()
         c_ = int(c2 * e)
@@ -49,13 +69,10 @@ class SparseBottleneck(nn.Module):
     def forward(self, sparse_tensor):
         out = self.cv1(sparse_tensor)
         out = out.replace_feature(self.act(self.bn1(out.features)))
-
         out = self.cv2(out)
         out = out.replace_feature(self.act(self.bn2(out.features)))
-
         out = self.cv3(out)
         out = out.replace_feature(self.bn3(out.features))
-
         if self.add:
             out = out.replace_feature(self.act(out.features + sparse_tensor.features))
         else:
@@ -63,19 +80,14 @@ class SparseBottleneck(nn.Module):
         return out
 
 
-# ================== 背景填充模块（固定填充强度，无目标保护） ==================
+# ================== 背景填充模块（固定强度） ==================
 class AdaptiveBackgroundFill(nn.Module):
-    """
-    自适应背景填充，使用固定填充强度。
-    - fill_strength: 固定标量，控制背景被拉向全局最小值的程度 (0~1)
-    - bg_thresh_ratio: 背景判定阈值
-    """
     def __init__(self, ch, pool_size=3, bg_thresh_ratio=0.5, fill_strength=0.8):
         super().__init__()
         self.ch = ch
         self.pool_size = pool_size
         self.bg_thresh_ratio = bg_thresh_ratio
-        self.fill_strength = fill_strength      # 固定值，不再可学习
+        self.fill_strength = fill_strength
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -87,7 +99,6 @@ class AdaptiveBackgroundFill(nn.Module):
         eps = torch.tensor(1e-6, dtype=x.dtype, device=x.device)
         mean_contrast = local_contrast.mean(dim=[2, 3], keepdim=True) + eps
         bg_mask = (local_contrast < self.bg_thresh_ratio * mean_contrast).to(dtype=x.dtype)
-        # 直接使用固定填充强度
         out = x * (1 - self.fill_strength * bg_mask) + baseline * self.fill_strength * bg_mask
         return out, bg_mask
 
@@ -124,27 +135,69 @@ class ChannelAwareEdgeEnhance_Attn(nn.Module):
         edge_weight = torch.sigmoid(edge_sharp * (edge - edge_thresh))
         out = x * ch_weight
         out = out * (1.0 + edge_weight)
+        return out, edge_weight
+
+
+# ================== 双分支稀疏块 ==================
+class DualPathSparseBlock(nn.Module):
+    """接收密集特征图和前景掩膜，内部构建稀疏张量并执行双分支融合"""
+    def __init__(self, c1, c2, shortcut=True, e=0.5):
+        super().__init__()
+        self.dense_dwconv = DenseDWConv(c1, c2, shortcut=False)
+        self.sparse_bottleneck = SparseBottleneck(c1, c2, shortcut=False, e=e)
+        self.act = nn.SiLU(inplace=True)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, dense_input, fg_mask):
+        # 分支1：密集深度可分离卷积
+        out_dense = self.dense_dwconv(dense_input)
+
+        # 分支2：稀疏路径
+        B, C, H, W = dense_input.shape
+        active_mask = fg_mask.squeeze(1).bool()
+        batch_idx, spatial_y, spatial_x = torch.where(active_mask)
+        if batch_idx.numel() == 0:
+            out_sparse = torch.zeros_like(dense_input)
+        else:
+            features = dense_input[batch_idx, :, spatial_y, spatial_x]
+            indices = torch.stack([batch_idx, spatial_y, spatial_x], dim=1).int()
+            sparse_input = spconv.SparseConvTensor(features, indices, (H, W), B)
+            sparse_out = self.sparse_bottleneck(sparse_input)
+            out_sparse = sparse_out.dense()
+
+        out = out_dense + out_sparse
+        if self.add:
+            out = self.act(out + dense_input)
+        else:
+            out = self.act(out)
         return out
 
 
-# ================== 完整模块：SoftFillEdgeEnhance（固定填充强度，稀疏+CPU回退） ==================
+# ================== 完整模块：SoftFillEdgeEnhance ==================
 class SoftFillEdgeEnhance(nn.Module):
     def __init__(self, c1, c2, n=1, pool_size=3,
                  bg_thresh_ratio=0.3, fill_strength=0.8,
                  ch_sharp=3.0, ch_thresh=0.3,
                  edge_sharp=5.0, edge_thresh=0.5,
-                 bottleneck_e=0.5, bottleneck_shortcut=True):
+                 bottleneck_e=0.5, bottleneck_shortcut=True,
+                 mask_alpha=0.7):
         super().__init__()
         self.bg_fill = AdaptiveBackgroundFill(c1, pool_size, bg_thresh_ratio, fill_strength)
         self.attn = ChannelAwareEdgeEnhance_Attn(c1, pool_size, ch_sharp, ch_thresh, edge_sharp, edge_thresh)
+        self.mask_alpha = mask_alpha
 
-        # 同时构建密集和稀疏 Bottleneck
+        # 密集精炼（CPU 回退时使用）
         self.dense_bottlenecks = nn.Sequential(*[
             DenseBottleneck(c1, c1, shortcut=bottleneck_shortcut, e=bottleneck_e)
             for _ in range(n)
         ])
-        self.sparse_bottlenecks = nn.Sequential(*[
-            SparseBottleneck(c1, c1, shortcut=bottleneck_shortcut, e=bottleneck_e)
+        self.dense_dwconv = nn.Sequential(*[
+            DenseDWConv(c1, c1, shortcut=True) for _ in range(n)
+        ])
+
+        # 稀疏双分支块（使用 ModuleList，非 Sequential）
+        self.dual_sparse_blocks = nn.ModuleList([
+            DualPathSparseBlock(c1, c1, shortcut=bottleneck_shortcut, e=bottleneck_e)
             for _ in range(n)
         ])
 
@@ -157,28 +210,25 @@ class SoftFillEdgeEnhance(nn.Module):
 
         # 1. 背景填充
         filled, bg_mask = self.bg_fill(x)
-        # 2. 注意力增强
-        enhanced = self.attn(filled)
+        # 2. 注意力增强（得到边缘权重）
+        enhanced, edge_w = self.attn(filled)
 
-        # 3. 判断是否使用稀疏路径：要求 CUDA 且至少有一个激活点
-        use_sparse = (x.device.type == 'cuda')
-        if use_sparse:
-            bg_mask_mean = bg_mask.mean(dim=1, keepdim=True)
-            fg_mask = (bg_mask_mean < 0.5).to(dtype=enhanced.dtype)
-            B, C, H, W = enhanced.shape
-            active_mask = fg_mask.squeeze(1).bool()
-            batch_idx, spatial_y, spatial_x = torch.where(active_mask)
-            if batch_idx.numel() == 0:  # 无激活点，直接返回零张量
-                out = torch.zeros_like(enhanced)
-            else:
-                features = enhanced[batch_idx, :, spatial_y, spatial_x]
-                indices = torch.stack([batch_idx, spatial_y, spatial_x], dim=1).int()
-                sparse_input = spconv.SparseConvTensor(features, indices, (H, W), B)
-                sparse_output = self.sparse_bottlenecks(sparse_input)
-                out = sparse_output.dense()
+        # 3. 组合前景掩膜
+        fg_prob = 1.0 - bg_mask                    # 逐通道前景概率
+        fg_max = fg_prob.max(dim=1, keepdim=True)[0]  # 取最大值
+        combined = self.mask_alpha * fg_max + (1.0 - self.mask_alpha) * edge_w
+        fg_mask = (combined > 0.5).to(dtype=enhanced.dtype)  # (B,1,H,W)
+
+        # 4. 根据设备选择路径
+        if x.device.type == 'cuda':
+            out = enhanced
+            for block in self.dual_sparse_blocks:
+                out = block(out, fg_mask)          # 逐层双分支处理
         else:
+            # CPU 回退：密集 Bottleneck + 密集 DWConv
             out = self.dense_bottlenecks(enhanced)
+            out = self.dense_dwconv(out)
 
-        # 4. 输出投影
+        # 5. 输出投影
         out = self.proj(out)
         return out
