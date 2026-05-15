@@ -132,10 +132,10 @@ class SoftFillEdgeEnhance(nn.Module):
     ch_sharp, ch_thresh, edge_sharp, edge_thresh, bottleneck_e, bottleneck_shortcut
     """
     def __init__(self, c1, c2, n=1, pool_size=3,bottleneck_e=0.5,
-                 bg_thresh_ratio=0.3, initial_strength=0.5,
+                 bg_thresh_ratio=0.8, initial_strength=0.5,
                  protect_target=True, target_thresh=2.0,
-                 ch_sharp=10.0, ch_thresh=0.5,
-                 edge_sharp=10.0, edge_thresh=0.8,
+                 ch_sharp=5.0, ch_thresh=0.5,
+                 edge_sharp=5.0, edge_thresh=0.5,
                   bottleneck_shortcut=True):
         super().__init__()
         self.bg_fill = AdaptiveBackgroundFill(
