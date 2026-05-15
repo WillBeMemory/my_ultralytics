@@ -231,8 +231,6 @@ def run_experiment(model_path, dataset_root, output_dir,
         pool_size=3,
         bg_thresh_ratio=0.3,  # 背景判定阈值（固定）
         initial_strength=0.5,  # 可学习填充强度的初始值（代替原来的 fill_strength）
-        protect_target=True,  # 开启目标保护
-        target_thresh=2.0,  # 峰值超过均值 2 倍视为目标，不填充
         ch_sharp=10.0,
         ch_thresh=0.5,
         edge_sharp=10.0,
