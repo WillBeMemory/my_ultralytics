@@ -80,7 +80,7 @@ class SparseBottleneck(nn.Module):
         return out
 
 
-# ================== 背景填充模块（固定强度） ==================
+# ================== 背景填充模块（固定填充强度） ==================
 class AdaptiveBackgroundFill(nn.Module):
     def __init__(self, ch, pool_size=3, bg_thresh_ratio=0.5, fill_strength=0.8):
         super().__init__()
@@ -138,9 +138,9 @@ class ChannelAwareEdgeEnhance_Attn(nn.Module):
         return out, edge_weight
 
 
-# ================== 双分支稀疏块 ==================
+# ================== 双分支稀疏块（内部动态生成稀疏张量） ==================
 class DualPathSparseBlock(nn.Module):
-    """接收密集特征图和前景掩膜，内部构建稀疏张量并执行双分支融合"""
+    """密集深度可分离卷积 + 稀疏 Bottleneck 并行，融合后残差连接"""
     def __init__(self, c1, c2, shortcut=True, e=0.5):
         super().__init__()
         self.dense_dwconv = DenseDWConv(c1, c2, shortcut=False)
@@ -149,10 +149,10 @@ class DualPathSparseBlock(nn.Module):
         self.add = shortcut and c1 == c2
 
     def forward(self, dense_input, fg_mask):
-        # 分支1：密集深度可分离卷积
+        # 密集分支
         out_dense = self.dense_dwconv(dense_input)
 
-        # 分支2：稀疏路径
+        # 稀疏分支：基于硬掩膜生成稀疏张量
         B, C, H, W = dense_input.shape
         active_mask = fg_mask.squeeze(1).bool()
         batch_idx, spatial_y, spatial_x = torch.where(active_mask)
@@ -173,7 +173,7 @@ class DualPathSparseBlock(nn.Module):
         return out
 
 
-# ================== 完整模块：SoftFillEdgeEnhance ==================
+# ================== 完整模块：SoftFillEdgeEnhance（优化掩膜，无密集残差） ==================
 class SoftFillEdgeEnhance(nn.Module):
     def __init__(self, c1, c2, n=1, pool_size=3,
                  bg_thresh_ratio=0.3, fill_strength=0.8,
@@ -186,7 +186,13 @@ class SoftFillEdgeEnhance(nn.Module):
         self.attn = ChannelAwareEdgeEnhance_Attn(c1, pool_size, ch_sharp, ch_thresh, edge_sharp, edge_thresh)
         self.mask_alpha = mask_alpha
 
-        # 密集精炼（CPU 回退时使用）
+        # 可学习掩膜精修：1×1 卷积 + Sigmoid
+        self.mask_refiner = nn.Sequential(
+            nn.Conv2d(1, 1, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+
+        # 密集精炼（CPU 回退用）
         self.dense_bottlenecks = nn.Sequential(*[
             DenseBottleneck(c1, c1, shortcut=bottleneck_shortcut, e=bottleneck_e)
             for _ in range(n)
@@ -195,7 +201,7 @@ class SoftFillEdgeEnhance(nn.Module):
             DenseDWConv(c1, c1, shortcut=True) for _ in range(n)
         ])
 
-        # 稀疏双分支块（使用 ModuleList，非 Sequential）
+        # 稀疏双分支块（ModuleList，非 Sequential，因为需要传入额外参数）
         self.dual_sparse_blocks = nn.ModuleList([
             DualPathSparseBlock(c1, c1, shortcut=bottleneck_shortcut, e=bottleneck_e)
             for _ in range(n)
@@ -210,20 +216,37 @@ class SoftFillEdgeEnhance(nn.Module):
 
         # 1. 背景填充
         filled, bg_mask = self.bg_fill(x)
-        # 2. 注意力增强（得到边缘权重）
+
+        # 2. 注意力增强（获得边缘权重）
         enhanced, edge_w = self.attn(filled)
 
-        # 3. 组合前景掩膜
-        fg_prob = 1.0 - bg_mask                    # 逐通道前景概率
-        fg_max = fg_prob.max(dim=1, keepdim=True)[0]  # 取最大值
-        combined = self.mask_alpha * fg_max + (1.0 - self.mask_alpha) * edge_w
-        fg_mask = (combined > 0.5).to(dtype=enhanced.dtype)  # (B,1,H,W)
+        # 3. 构建优化掩膜
+        fg_prob = 1.0 - bg_mask                     # 逐通道前景概率 (B, C, H, W)
+        fg_max = fg_prob.max(dim=1, keepdim=True)[0] # 最大值 (B, 1, H, W)
+        combined_raw = self.mask_alpha * fg_max + (1.0 - self.mask_alpha) * edge_w
+
+        # 动态阈值：根据全图平均对比度自适应调整
+        thresh = combined_raw.mean(dim=[2, 3], keepdim=True).clamp(0.3, 0.7)
+        hard_mask = (combined_raw > thresh).to(combined_raw.dtype)
+
+        # 平滑：最大池化膨胀 + 再阈值化，填补空洞、消除孤点
+        hard_mask = F.max_pool2d(hard_mask, kernel_size=3, stride=1, padding=1)
+        hard_mask = (hard_mask > 0.5).to(combined_raw.dtype)
+
+        # 可学习精修：输入原始组合图，输出精修后的软掩膜
+        refined_mask = self.mask_refiner(combined_raw)  # (B, 1, H, W)，值域 (0,1)
+
+        # 最终掩膜：以 refined_mask 为主，但在 hard_mask 确定的强背景区域大幅压低
+        # 这样既保留了可学习性，又利用了物理先验
+        fg_mask = refined_mask * hard_mask + refined_mask * (1 - hard_mask) * 0.1
+        # 再硬阈值化，用于生成稀疏索引（可微性稍差，但训练早期可用软掩膜替代，这里保持硬阈值）
+        fg_mask_hard = (fg_mask > 0.5).to(combined_raw.dtype)
 
         # 4. 根据设备选择路径
         if x.device.type == 'cuda':
             out = enhanced
             for block in self.dual_sparse_blocks:
-                out = block(out, fg_mask)          # 逐层双分支处理
+                out = block(out, fg_mask_hard)   # 传入硬掩膜生成稀疏张量
         else:
             # CPU 回退：密集 Bottleneck + 密集 DWConv
             out = self.dense_bottlenecks(enhanced)
