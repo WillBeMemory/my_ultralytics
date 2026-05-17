@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional, Union, Tuple
+from typing import List, Tuple, Optional, Union
 
 
 class SparseSelfAttention(nn.Module):
@@ -33,8 +33,8 @@ class SparseSelfAttention(nn.Module):
 
 class HIPABlock(nn.Module):
     """
-    层级重要性传播注意力模块（增强模式，无门控/填充）。
-    多级金字塔重要性筛选 → 保留原始特征（投影）→ 输出序列供自注意力使用。
+    层级重要性传播注意力模块（支持复杂度门控，门控逻辑已移至 _HIPASingle）
+    多级金字塔重要性筛选 → 保留原始特征（投影）→ 散射回空间图
     """
     def __init__(
         self,
@@ -43,7 +43,9 @@ class HIPABlock(nn.Module):
         num_levels: int = 3,
         keep_ratio: float = 0.3,
         keep_ratios: Optional[List[float]] = None,
+        min_keeps: Union[int, List[int]] = 8,
         use_contrast_norm: bool = True,
+        fill_mode: str = 'center',         # 'center' / 'constant' / 'conv_smooth'
         importance_mode: str = 'l2',
     ):
         super().__init__()
@@ -51,6 +53,7 @@ class HIPABlock(nn.Module):
         self.out_channels = out_channels
         self.num_levels = num_levels
         self.use_contrast_norm = use_contrast_norm
+        self.fill_mode = fill_mode
         self.importance_mode = importance_mode
 
         # 分层保留比例
@@ -60,13 +63,27 @@ class HIPABlock(nn.Module):
         else:
             self.keep_ratios = [keep_ratio] * num_levels
 
-        # 投影层（用于自注意力序列的特征变换）
+        # 最小保留数
+        if isinstance(min_keeps, int):
+            self.min_keeps = [min_keeps] * num_levels
+        else:
+            assert len(min_keeps) == num_levels
+            self.min_keeps = min_keeps
+
+        # 投影层
         self.proj = nn.Sequential(
             nn.LayerNorm(in_channels),
             nn.Linear(in_channels, out_channels)
         )
 
-        self._fill_2d_center = self._fill_2d_center
+        # 平滑卷积（仅 conv_smooth 模式）
+        if fill_mode == 'conv_smooth':
+            self.smooth_conv = nn.Conv2d(
+                out_channels, out_channels, kernel_size=3,
+                padding=1, groups=out_channels, bias=False
+            )
+        else:
+            self.smooth_conv = None
 
     @staticmethod
     def _deterministic_grid_pool(x, grid_size):
@@ -95,13 +112,44 @@ class HIPABlock(nn.Module):
         cx = (coords[..., 0] * W).long().clamp(0, W - 1)
         cy = (coords[..., 1] * H).long().clamp(0, H - 1)
         src = features.transpose(1, 2)
-        # 关键修复：将 src 转换为与 out 相同的数据类型
         src = src.to(out.dtype)
         index = (cy.unsqueeze(1) * W + cx.unsqueeze(1)).expand(-1, self.out_channels, -1)
         out = out.flatten(2).scatter_(2, index, src).view(B, self.out_channels, H, W)
         return out
 
-    def _hipa_core(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _fill_2d_constant(self, features, coords, H, W):
+        B, K, C = features.shape
+        out = torch.zeros(B, self.out_channels, H, W, device=features.device, dtype=features.dtype)
+        for b in range(B):
+            for i in range(K):
+                cx, cy, w, h = coords[b, i]
+                x1 = int((cx - w / 2) * W)
+                y1 = int((cy - h / 2) * H)
+                x2 = int((cx + w / 2) * W)
+                y2 = int((cy + h / 2) * H)
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(W, x2), min(H, y2)
+                if x2 > x1 and y2 > y1:
+                    feat = features[b, i].view(self.out_channels, 1, 1).expand(-1, y2 - y1, x2 - x1)
+                    out[b, :, y1:y2, x1:x2] = feat
+        return out
+
+    def _fill_2d(self, features, coords, H, W):
+        if self.fill_mode == 'center':
+            base = self._fill_2d_center(features, coords, H, W)
+        elif self.fill_mode == 'constant':
+            base = self._fill_2d_constant(features, coords, H, W)
+        elif self.fill_mode == 'conv_smooth':
+            base = self._fill_2d_center(features, coords, H, W)
+        else:
+            raise ValueError(f"Unsupported fill_mode: {self.fill_mode}")
+        # 平滑处理
+        if self.fill_mode == 'conv_smooth' and self.smooth_conv is not None:
+            base = self.smooth_conv(base)
+        return base
+
+    def _hipa_core(self, x: torch.Tensor):
+        """HIPA 核心处理逻辑（不包含门控）"""
         B, C, H, W = x.shape
         device, dtype = x.device, x.dtype
 
@@ -146,7 +194,8 @@ class HIPABlock(nn.Module):
 
             importance = importance.clamp(min=1e-8, max=2e4)
             keep_ratio_l = self.keep_ratios[level]
-            keep_num = max(1, int(N_l * keep_ratio_l))
+            min_keeps_l = self.min_keeps[level]
+            keep_num = max(min_keeps_l, int(N_l * keep_ratio_l))
             keep_num = min(keep_num, N_l)
             topk_indices = torch.topk(importance, k=keep_num, dim=-1)[1]
 
@@ -159,40 +208,36 @@ class HIPABlock(nn.Module):
 
         sparse_seq = torch.cat(kept_features_list, dim=1)
         all_coords = torch.cat(kept_coords_list, dim=1)
+
+        out_sparse = self._fill_2d(sparse_seq, all_coords, H, W)
         total_kept = sparse_seq.size(1)
         sparsity = torch.tensor(total_kept / (H * W), device=device, dtype=dtype).mean()
-
-        return None, sparse_seq, all_coords, sparsity
+        return out_sparse, sparse_seq, all_coords, sparsity
 
     def forward(self, x: torch.Tensor):
         return self._hipa_core(x)
 
 
 class _HIPASingle(nn.Module):
-    """单层 HIPA 封装：稀疏序列 + 可选位置编码 + 可选自注意力 + 残差连接 + 门控（简化分支用 keep_ratio 计算保留数）"""
+    """单层 HIPA 封装：稀疏图 + 可选自注意力 + 残差连接 + 复杂度门控（加权融合，无分支跳转）"""
     def __init__(
         self, in_channels, out_channels, num_levels=3, keep_ratio=0.3,
-        keep_ratios=None, use_contrast_norm=True, num_heads=8,
-        use_self_attn=True, importance_mode='l2',
-        use_positional_encoding=False,
-        use_gate: bool = False,
-        gate_reduction: int = 4,
+        keep_ratios=None, min_keeps=8, use_contrast_norm=True, num_heads=8,
+        fill_mode='center', use_self_attn=True, importance_mode='l2',
+        use_gate=False, gate_threshold=0.5, gate_hidden_ratio=0.25
     ):
         super().__init__()
         self.use_self_attn = use_self_attn
-        self.use_pos = use_positional_encoding
         self.use_gate = use_gate
-        self.out_channels = out_channels
-        self.keep_ratio = keep_ratio
+        self.gate_threshold = gate_threshold
 
         self.hipa = HIPABlock(
             in_channels=in_channels, out_channels=out_channels,
             num_levels=num_levels, keep_ratio=keep_ratio,
-            keep_ratios=keep_ratios,
-            use_contrast_norm=use_contrast_norm,
+            keep_ratios=keep_ratios, min_keeps=min_keeps,
+            use_contrast_norm=use_contrast_norm, fill_mode=fill_mode,
             importance_mode=importance_mode,
         )
-
         if use_self_attn:
             self.attn = SparseSelfAttention(embed_dim=out_channels, num_heads=num_heads)
         else:
@@ -200,118 +245,87 @@ class _HIPASingle(nn.Module):
 
         self.residual_proj = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
-        if self.use_pos:
-            self.pos_encoder = nn.Linear(4, out_channels)
-        else:
-            self.pos_encoder = None
-
+        # 复杂度门控网络
         if use_gate:
+            hidden = max(1, int(in_channels * gate_hidden_ratio))
             self.gate_net = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
-                nn.Linear(in_channels, max(1, in_channels // gate_reduction)),
+                nn.Linear(in_channels, hidden),
                 nn.ReLU(inplace=True),
-                nn.Linear(max(1, in_channels // gate_reduction), 1),
+                nn.Linear(hidden, 1),
                 nn.Sigmoid()
             )
         else:
             self.gate_net = None
 
-    def _simple_branch(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        device, dtype = x.device, x.dtype
-        importance = torch.norm(x.flatten(2), p=2, dim=1)
-        k = max(1, int(H * W * self.keep_ratio))
-        k = min(k, H * W)
-        topk_val, topk_idx = torch.topk(importance, k, dim=-1)
-        x_flat = x.flatten(2).transpose(1, 2)
-        features = torch.gather(x_flat, 1, topk_idx.unsqueeze(-1).expand(-1, -1, C))
-        features = self.hipa.proj(features)
-
-        ys = (topk_idx.float() / W).floor()
-        xs = (topk_idx.float() % W).float()
-        cy = (ys + 0.5) / H
-        cx = (xs + 0.5) / W
-        w = torch.full_like(cx, 1.0 / W)
-        h = torch.full_like(cy, 1.0 / H)
-        coords = torch.stack([cx, cy, w, h], dim=-1)
-
-        if self.use_pos and self.pos_encoder is not None:
-            pos_embed = self.pos_encoder(coords)
-            features = features + pos_embed
-
-        if self.use_self_attn and not isinstance(self.attn, nn.Identity):
-            features = self.attn(features)
-
-        out = torch.zeros(B, self.out_channels, H, W, device=device, dtype=dtype)
-        cx_pix = (coords[..., 0] * W).long().clamp(0, W - 1)
-        cy_pix = (coords[..., 1] * H).long().clamp(0, H - 1)
-        src = features.transpose(1, 2)
-        # 关键修复：将 src 转换为与 out 相同的数据类型
-        src = src.to(out.dtype)
-        index = (cy_pix.unsqueeze(1) * W + cx_pix.unsqueeze(1)).expand(-1, self.out_channels, -1)
-        out = out.flatten(2).scatter_(2, index, src).view(B, self.out_channels, H, W)
-        return out
-
-    def _complex_branch(self, x: torch.Tensor) -> torch.Tensor:
-        _, sparse_seq, coords, _ = self.hipa(x)
-        if self.use_self_attn and not isinstance(self.attn, nn.Identity) and sparse_seq.size(1) > 0:
-            if self.use_pos and self.pos_encoder is not None:
-                pos_embed = self.pos_encoder(coords)
-                sparse_seq = sparse_seq + pos_embed
-            sparse_seq = self.attn(sparse_seq)
-        H, W = x.shape[2:]
-        out = self.hipa._fill_2d_center(sparse_seq, coords, H, W)
-        return out
-
     def forward(self, x):
-        # 关键修复：将输入对齐到 HIPA 内部线性层的 dtype（AMP 下为 float16）
-        target_dtype = self.hipa.proj[1].weight.dtype  # 投影层的 Linear 权重
+        # 修复 AMP：对齐 dtype
+        target_dtype = self.hipa.proj[1].weight.dtype
         x = x.to(target_dtype)
 
-        out_complex = self._complex_branch(x)
+        # 执行 HIPA 核心逻辑（总是执行，后面用门控加权决定保留多少）
+        out_sparse, sparse_seq, coords, _ = self.hipa(x)
+        if self.use_self_attn and not isinstance(self.attn, nn.Identity):
+            sparse_seq = self.attn(sparse_seq)
+            H, W = x.shape[2:]
+            out_sparse = self.hipa._fill_2d(sparse_seq, coords, H, W)
 
-        if self.use_gate and self.gate_net is not None:
-            out_simple = self._simple_branch(x)
-            alpha = self.gate_net(x)  # (B, 1)
-            alpha = alpha.view(-1, 1, 1, 1)
-            out_enhanced = alpha * out_complex + (1 - alpha) * out_simple
+        # 残差连接后的增强特征（复杂路径输出）
+        enhanced = self.residual_proj(x) + out_sparse
+
+        if not self.use_gate or self.gate_net is None:
+            return enhanced
+
+        # ---------- 门控加权融合 ----------
+        complexity = self.gate_net(x)  # (B, 1)
+        if self.training:
+            # Gumbel-Sigmoid 直通估计器
+            noise = -torch.log(-torch.log(torch.rand_like(complexity) + 1e-8) + 1e-8)
+            logit = complexity + noise
+            gate = ((logit > 0).float() - complexity).detach() + complexity  # STE, (B, 1)
         else:
-            out_enhanced = out_complex
+            gate = (complexity > self.gate_threshold).float()  # 硬门控
 
-        return self.residual_proj(x) + out_enhanced
+        gate = gate.view(-1, 1, 1, 1)  # 广播到空间维度
+
+        # 简单路径输出（直通）
+        identity = self.residual_proj(x)
+
+        # 加权混合：gate=1 → 复杂路径，gate=0 → 简单路径
+        out = identity + gate * out_sparse   # 相当于 gate*enhanced + (1-gate)*identity
+        return out
 
 
 class HIPA(nn.Module):
-    """
-    可重复多次的 HIPA 模块（YOLO 接口），n 仅占位不重复执行。
-    支持可选空间位置编码和门控（简化分支比率由 keep_ratio 控制）
-    """
+    """可重复多次的 HIPA 模块（YOLO 接口），n 占位"""
     def __init__(
         self, c1, c2, n=1, num_levels=3, keep_ratio=0.3,
-        keep_ratios=None, use_contrast_norm=True, num_heads=8,
-        use_self_attn=True, importance_mode='l2',
-        use_positional_encoding=True,
-        use_gate: bool = True,
-        gate_reduction: int = 4,
+        keep_ratios=None, min_keeps=8, use_contrast_norm=True, num_heads=8,
+        fill_mode='center', use_self_attn=True, importance_mode='l2',
+        use_gate=True, gate_threshold=0.8, gate_hidden_ratio=0.25
     ):
         super().__init__()
-        # n 占位，不使用
         self.n = n
-        self.block = _HIPASingle(
-            in_channels=c1, out_channels=c2,
-            num_levels=num_levels, keep_ratio=keep_ratio,
-            keep_ratios=keep_ratios,
-            use_contrast_norm=use_contrast_norm, num_heads=num_heads,
-            use_self_attn=use_self_attn,
-            importance_mode=importance_mode,
-            use_positional_encoding=use_positional_encoding,
-            use_gate=use_gate,
-            gate_reduction=gate_reduction,
-        )
+        blocks = []
+        for i in range(n):
+            in_ch = c1 if i == 0 else c2
+            blocks.append(_HIPASingle(
+                in_channels=in_ch, out_channels=c2,
+                num_levels=num_levels, keep_ratio=keep_ratio,
+                keep_ratios=keep_ratios, min_keeps=min_keeps,
+                use_contrast_norm=use_contrast_norm, num_heads=num_heads,
+                fill_mode=fill_mode, use_self_attn=use_self_attn,
+                importance_mode=importance_mode,
+                use_gate=use_gate, gate_threshold=gate_threshold,
+                gate_hidden_ratio=gate_hidden_ratio
+            ))
+        self.blocks = nn.ModuleList(blocks)
 
     def forward(self, x):
-        return self.block(x)
+        for block in self.blocks:
+            x = block(x)
+        return x
 
 
 # ---------- 简单测试 ----------
@@ -319,20 +333,26 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     x = torch.randn(2, 256, 20, 20).to(device)
 
-    # 启用门控，n 占位但实际只执行一次
-    model_gate = HIPA(256, 512, n=2, keep_ratios=[0.5, 0.3, 0.2],
-                      use_self_attn=True, num_heads=8, use_positional_encoding=True,
-                      use_gate=True).to(device)
-    y1 = model_gate(x)
-    print(f"门控版本输出形状: {y1.shape}")
+    # 无门控
+    model_no_gate = HIPA(256, 512, n=1, keep_ratios=[0.5, 0.3, 0.2], min_keeps=4,
+                         use_self_attn=True, use_gate=False).to(device)
+    y1 = model_no_gate(x)
+    print(f"无门控输出形状: {y1.shape}")
 
-    # 关闭门控（原版行为）
-    model_no_gate = HIPA(256, 512, n=1, keep_ratios=[0.5, 0.3, 0.2],
-                         use_self_attn=True, num_heads=8, use_positional_encoding=True,
-                         use_gate=False).to(device)
-    y2 = model_no_gate(x)
-    print(f"无门控版本输出形状: {y2.shape}")
+    # 带门控（训练模式）
+    model_gate = HIPA(256, 512, n=1, keep_ratios=[0.5, 0.3, 0.2], min_keeps=4,
+                      use_self_attn=True, use_gate=True, gate_threshold=0.5).to(device)
+    model_gate.train()
+    y2_train = model_gate(x)
+    print(f"门控训练输出形状: {y2_train.shape}")
 
-    loss = y1.sum() + y2.sum()
+    # 带门控（推理模式）
+    model_gate.eval()
+    with torch.no_grad():
+        y2_eval = model_gate(x)
+    print(f"门控推理输出形状: {y2_eval.shape}")
+
+    # 梯度测试
+    loss = y2_train.sum()
     loss.backward()
     print("反向传播通过，测试完毕。")
