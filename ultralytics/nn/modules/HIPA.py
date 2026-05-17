@@ -90,12 +90,13 @@ class HIPABlock(nn.Module):
         return bboxes.unsqueeze(0).expand(B, -1, -1)
 
     def _fill_2d_center(self, features, coords, H, W):
-        """将特征向量散射到对应网格中心（用于自注意力输出）"""
         B, K, C = features.shape
         out = torch.zeros(B, self.out_channels, H, W, device=features.device, dtype=features.dtype)
         cx = (coords[..., 0] * W).long().clamp(0, W - 1)
         cy = (coords[..., 1] * H).long().clamp(0, H - 1)
         src = features.transpose(1, 2)
+        # 关键修复：将 src 转换为与 out 相同的数据类型
+        src = src.to(out.dtype)
         index = (cy.unsqueeze(1) * W + cx.unsqueeze(1)).expand(-1, self.out_channels, -1)
         out = out.flatten(2).scatter_(2, index, src).view(B, self.out_channels, H, W)
         return out
@@ -246,6 +247,8 @@ class _HIPASingle(nn.Module):
         cx_pix = (coords[..., 0] * W).long().clamp(0, W - 1)
         cy_pix = (coords[..., 1] * H).long().clamp(0, H - 1)
         src = features.transpose(1, 2)
+        # 关键修复：将 src 转换为与 out 相同的数据类型
+        src = src.to(out.dtype)
         index = (cy_pix.unsqueeze(1) * W + cx_pix.unsqueeze(1)).expand(-1, self.out_channels, -1)
         out = out.flatten(2).scatter_(2, index, src).view(B, self.out_channels, H, W)
         return out
@@ -262,6 +265,10 @@ class _HIPASingle(nn.Module):
         return out
 
     def forward(self, x):
+        # 关键修复：将输入对齐到 HIPA 内部线性层的 dtype（AMP 下为 float16）
+        target_dtype = self.hipa.proj[1].weight.dtype  # 投影层的 Linear 权重
+        x = x.to(target_dtype)
+
         out_complex = self._complex_branch(x)
 
         if self.use_gate and self.gate_net is not None:
