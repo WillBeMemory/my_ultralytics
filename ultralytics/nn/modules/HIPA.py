@@ -264,7 +264,7 @@ class _HIPASingle(nn.Module):
         target_dtype = self.hipa.proj[1].weight.dtype
         x = x.to(target_dtype)
 
-        # 执行 HIPA 核心逻辑（总是执行，后面用门控加权决定保留多少）
+        # 执行 HIPA 核心逻辑
         out_sparse, sparse_seq, coords, _ = self.hipa(x)
         if self.use_self_attn and not isinstance(self.attn, nn.Identity):
             sparse_seq = self.attn(sparse_seq)
@@ -277,15 +277,19 @@ class _HIPASingle(nn.Module):
         if not self.use_gate or self.gate_net is None:
             return enhanced
 
-        # ---------- 门控加权融合 ----------
-        complexity = self.gate_net(x)  # (B, 1)
+        # ---------- 门控加权融合（修复类型错误） ----------
+        complexity = self.gate_net(x)  # (B, 1)，类型为 Half
+        dtype = complexity.dtype  # 确保所有操作保持 Half
         if self.training:
             # Gumbel-Sigmoid 直通估计器
             noise = -torch.log(-torch.log(torch.rand_like(complexity) + 1e-8) + 1e-8)
             logit = complexity + noise
-            gate = ((logit > 0).float() - complexity).detach() + complexity  # STE, (B, 1)
+            # 关键修改：用 .to(dtype) 代替 .float()，保持 Half 类型
+            hard = (logit > 0).to(dtype)
+            gate = (hard - complexity).detach() + complexity  # STE, (B, 1)
         else:
-            gate = (complexity > self.gate_threshold).float()  # 硬门控
+            # 推理时硬门控，同样转换为 Half
+            gate = (complexity > self.gate_threshold).to(dtype)
 
         gate = gate.view(-1, 1, 1, 1)  # 广播到空间维度
 
@@ -293,7 +297,7 @@ class _HIPASingle(nn.Module):
         identity = self.residual_proj(x)
 
         # 加权混合：gate=1 → 复杂路径，gate=0 → 简单路径
-        out = identity + gate * out_sparse   # 相当于 gate*enhanced + (1-gate)*identity
+        out = identity + gate * out_sparse
         return out
 
 
