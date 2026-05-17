@@ -176,8 +176,8 @@ class DualPathSparseBlock(nn.Module):
 # ================== 完整模块：SoftFillEdgeEnhance（优化掩膜，无密集残差） ==================
 class SoftFillEdgeEnhance(nn.Module):
     def __init__(self, c1, c2, n=1, pool_size=3,
-                 bg_thresh_ratio=0.3, fill_strength=0.8,
-                 ch_sharp=3.0, ch_thresh=0.3,
+                 bg_thresh_ratio=0.5, fill_strength=0.8,
+                 ch_sharp=5.0, ch_thresh=0.5,
                  edge_sharp=5.0, edge_thresh=0.5,
                  bottleneck_e=0.5, bottleneck_shortcut=True,
                  mask_alpha=0.7):
