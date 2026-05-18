@@ -3,7 +3,14 @@ import torch.nn as nn
 
 
 def channel_shuffle(x, groups):
-    """通道混洗：将通道分成 groups 组，然后转置并展平，实现跨组信息混合"""
+    """
+    通道混洗：将通道分成 groups 组，然后转置并展平，实现跨组信息混合
+    Args:
+        x: (B, C, H, W) 输入特征图
+        groups: 分组数
+    Returns:
+        (B, C, H, W) 混洗后的特征图
+    """
     B, C, H, W = x.shape
     x = x.view(B, groups, C // groups, H, W)
     x = x.transpose(1, 2).contiguous()
@@ -12,8 +19,9 @@ def channel_shuffle(x, groups):
 
 class SPDConv(nn.Module):
     """
-    轻量无损下采样模块（分组交互增强版）：
-    空间到深度 → 分组标准卷积（组数=输入通道数c1） → 通道混洗 → 1×1降维
+    轻量无损下采样模块（分组标准卷积 + 通道混洗 + 1×1降维）
+
+    空间到深度 → 分组标准卷积（组数=输入通道数c1，组内4通道全交互） → 通道混洗 → 1×1降维
 
     - SPD 保留所有空间细节，尺寸减半，通道数扩大 4 倍（c1 → 4*c1）
     - 分组卷积：将 4*c1 个通道分成 c1 组，每组 4 通道，组内标准 3×3 卷积（组内通道全交互）
@@ -37,7 +45,7 @@ class SPDConv(nn.Module):
             kernel_size=kernel_size,
             stride=1,
             padding=kernel_size // 2,
-            groups=c1,          # 关键：分成 c1 组，每组 4 个通道
+            groups=c1,          # 分成 c1 组，每组 4 个通道
             bias=False
         )
         self.group_bn = nn.BatchNorm2d(4 * c1)
@@ -56,7 +64,7 @@ class SPDConv(nn.Module):
         x = self.group_act(self.group_bn(self.group_conv(x)))   # (B, 4*c1, H/2, W/2)
 
         # 通道混洗：打破组间壁垒，为后续 1×1 提供更好的初始化
-        x = channel_shuffle(x, groups=self.group_conv.groups)   # (B, 4*c1, H/2, W/2)
+        x = channel_shuffle(x, groups=self.group_conv.groups)   # groups = c1
 
         # 1×1 降维
         x = self.pw_act(self.pw_bn(self.pointwise(x)))          # (B, c2, H/2, W/2)
@@ -85,14 +93,5 @@ if __name__ == "__main__":
 
     # 参数量与计算量（粗略）
     total_params = sum(p.numel() for p in spd_conv.parameters())
-    # 计算 MACs
-    H_out, W_out = 40, 40
-    # 分组卷积 MACs = groups * (4 * 4 * 9) * H_out * W_out = c1 * 144 * H_out * W_out
-    macs_group = 16 * 144 * H_out * W_out
-    # 1×1 MACs = 4*c1 * c2 * H_out * W_out = 64 * 32 * H_out * W_out
-    macs_pw = 64 * 32 * H_out * W_out
-    total_macs = macs_group + macs_pw
     print(f"Total parameters: {total_params:,}")
-    print(f"Estimated MACs: {total_macs:,} (≈ {total_macs/1e6:.2f} M)")
-
     print("Test passed!")
