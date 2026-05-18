@@ -1,73 +1,91 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-def channel_shuffle(x, groups):
+class ConvElection(nn.Module):
     """
-    通道混洗：将通道分成 groups 组，然后转置并展平，实现跨组信息混合
-    Args:
-        x: (B, C, H, W) 输入特征图
-        groups: 分组数
-    Returns:
-        (B, C, H, W) 混洗后的特征图
+    基于卷积的学习选举模块。
+    通过轻量卷积预测 2 组 × 4 个权重，对 SPD 后的 4 个偏移像素进行加权聚合，压缩为 2C 通道。
     """
-    B, C, H, W = x.shape
-    x = x.view(B, groups, C // groups, H, W)
-    x = x.transpose(1, 2).contiguous()
-    return x.view(B, C, H, W)
+    def __init__(self, channels, mid_ratio=0.5):
+        super().__init__()
+        self.channels = channels
+        mid = max(1, int(channels * 4 * mid_ratio))
+
+        # 预测网络：输出 8 通道（2 组 × 4 像素权重）
+        self.pred = nn.Sequential(
+            nn.Conv2d(channels * 4, mid, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(mid, mid, kernel_size=3, padding=1, groups=mid, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(mid, 8, kernel_size=1, bias=False)  # 8 = 2 heads × 4 pixels
+        )
+
+    def forward(self, x):
+        # x: (B, 4C, H, W)
+        B, C4, H, W = x.shape
+        C = self.channels
+
+        # 预测权重 (B, 8, H, W)
+        w = self.pred(x)                       # (B, 8, H, W)
+        w = w.view(B, 2, 4, H, W)              # (B, 2, 4, H, W)  -> 2 个输出头，每个头有 4 个像素的权重
+
+        # 对每个头进行 softmax，使其在 4 个像素间归一化
+        w = F.softmax(w, dim=2)               # 在 dim=2 上归一化
+
+        # 重塑特征图为 (B, C, 4, H, W)
+        x_blocks = x.view(B, C, 4, H, W)      # (B, C, 4, H, W)
+
+        # 加权聚合
+        # w: (B, 2, 4, H, W) -> unsqueeze(2) -> (B, 2, 1, 4, H, W)
+        # x_blocks: (B, C, 4, H, W) -> unsqueeze(1) -> (B, 1, C, 4, H, W)
+        w_expand = w.unsqueeze(2)              # (B, 2, 1, 4, H, W)
+        x_expand = x_blocks.unsqueeze(1)       # (B, 1, C, 4, H, W)
+
+        # 相乘并求和 dim=3（像素维度） => (B, 2, C, H, W)
+        out = (w_expand * x_expand).sum(dim=3)
+
+        # 重塑为 (B, 2*C, H, W)
+        out = out.reshape(B, 2 * C, H, W)
+
+        # 信息完整性缩放因子（此处不进行额外缩放，返回全1以便后续模块可选择使用）
+        info_scale = torch.ones(B, 1, H, W, device=out.device, dtype=out.dtype)
+        return out, info_scale
 
 
 class SPDConv(nn.Module):
     """
-    轻量无损下采样模块（分组标准卷积 + 通道混洗 + 1×1降维）
+    轻量无损下采样模块（卷积学习选举 + 深度可分离卷积 + 1x1降维）
 
-    空间到深度 → 分组标准卷积（组数=输入通道数c1，组内4通道全交互） → 通道混洗 → 1×1降维
-
-    - SPD 保留所有空间细节，尺寸减半，通道数扩大 4 倍（c1 → 4*c1）
-    - 分组卷积：将 4*c1 个通道分成 c1 组，每组 4 通道，组内标准 3×3 卷积（组内通道全交互）
-    - 通道混洗：零参数打破组间隔离，促进跨组信息流通
-    - 1×1 卷积：融合所有通道并降维到目标通道 c2
-
-    Args:
-        c1 (int): 输入通道数
-        c2 (int): 输出通道数
-        kernel_size (int): 分组卷积的核大小，默认 3
-        activation (nn.Module): 激活函数，默认 SiLU(inplace=True)
+    参数:
+        c1, c2      : 输入/输出通道数
+        kernel_size : 深度卷积核大小
+        activation  : 激活函数
+        mid_ratio   : 选举模块中预测网络的中间通道比例
     """
-    def __init__(self, c1, c2, kernel_size=3, activation=nn.SiLU):
+    def __init__(self, c1, c2, kernel_size=3, activation=nn.SiLU, mid_ratio=0.5):
         super().__init__()
-        # 1. 空间到深度（无损下采样），输出 (4*c1, H/2, W/2)
         self.spd = nn.PixelUnshuffle(downscale_factor=2)
+        self.election = ConvElection(c1, mid_ratio=mid_ratio)
 
-        # 2. 分组标准卷积：groups = c1，每组输入/输出均为 4 通道，组内标准卷积实现通道全交互
-        self.group_conv = nn.Conv2d(
-            4 * c1, 4 * c1,
-            kernel_size=kernel_size,
-            stride=1,
-            padding=kernel_size // 2,
-            groups=c1,          # 分成 c1 组，每组 4 个通道
-            bias=False
-        )
-        self.group_bn = nn.BatchNorm2d(4 * c1)
-        self.group_act = activation(inplace=True) if activation == nn.SiLU else activation()
-
-        # 3. 1×1 卷积降维（通道交互 + 压缩到 c2）
-        self.pointwise = nn.Conv2d(4 * c1, c2, kernel_size=1, stride=1, bias=False)
+        self.depthwise = nn.Conv2d(2 * c1, 2 * c1, kernel_size, padding=kernel_size // 2,
+                                   groups=2 * c1, bias=False)
+        self.dw_bn = nn.BatchNorm2d(2 * c1)
+        self.pointwise = nn.Conv2d(2 * c1, c2, kernel_size=1, bias=False)
         self.pw_bn = nn.BatchNorm2d(c2)
-        self.pw_act = activation(inplace=True) if activation == nn.SiLU else activation()
+        self.act = activation(inplace=True) if activation == nn.SiLU else activation()
 
     def forward(self, x):
-        # 无损下采样
-        x = self.spd(x)                                          # (B, 4*c1, H/2, W/2)
+        x = self.spd(x)                     # (B, 4*c1, H/2, W/2)
+        x, info_scale = self.election(x)    # (B, 2*c1, H/2, W/2), info_scale (B,1,H/2,W/2)
 
-        # 分组卷积（组内通道交互 + 空间滤波）
-        x = self.group_act(self.group_bn(self.group_conv(x)))   # (B, 4*c1, H/2, W/2)
-
-        # 通道混洗：打破组间壁垒，为后续 1×1 提供更好的初始化
-        x = channel_shuffle(x, groups=self.group_conv.groups)   # groups = c1
-
-        # 1×1 降维
-        x = self.pw_act(self.pw_bn(self.pointwise(x)))          # (B, c2, H/2, W/2)
+        x = self.act(self.dw_bn(self.depthwise(x)))
+        x = self.act(self.pw_bn(self.pointwise(x)))
+        # info_scale 当前为全1，如需启用可取消注释下一行
+        # x = x * info_scale
         return x
 
 
@@ -76,22 +94,20 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    # 模拟输入：batch=2, 通道=16, 空间=80x80
     x = torch.randn(2, 16, 80, 80).to(device)
-
-    # 创建模块：输入16通道，输出32通道
     spd_conv = SPDConv(c1=16, c2=32, kernel_size=3).to(device)
     print(spd_conv)
 
-    # 前向传播
     y = spd_conv(x)
     print(f"Input shape:  {x.shape}")
     print(f"Output shape: {y.shape}")
 
-    # 验证输出尺寸：应为 (2, 32, 40, 40)
-    assert y.shape == (2, 32, 40, 40), f"Shape mismatch! Expected (2, 32, 40, 40), got {y.shape}"
+    assert y.shape == (2, 32, 40, 40), f"Shape mismatch! Expected (2,32,40,40), got {y.shape}"
 
-    # 参数量与计算量（粗略）
+    loss = y.sum()
+    loss.backward()
+    print("Backward pass succeeded.")
+
     total_params = sum(p.numel() for p in spd_conv.parameters())
     print(f"Total parameters: {total_params:,}")
     print("Test passed!")
