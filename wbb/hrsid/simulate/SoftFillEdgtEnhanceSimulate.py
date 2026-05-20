@@ -10,12 +10,12 @@ import os
 import random
 
 from ultralytics import YOLO
-# 假设 SoftFillEdgeEnhance 已经定义并可通过此路径导入
+# 导入 SoftFillEdgeEnhance 模块（请确保路径正确）
 from ultralytics.nn.modules.AddModules.SoftFillEdgeEnhance import SoftFillEdgeEnhance
 
 
-# ================== 固定 Backbone（提取 P5） ==================
-class PretrainedBackboneP5(nn.Module):
+# ================== 固定 Backbone（提取 P4） ==================
+class PretrainedBackboneP4(nn.Module):
     def __init__(self, model_path, device):
         super().__init__()
         yolo = YOLO(model_path, verbose=False)
@@ -26,7 +26,7 @@ class PretrainedBackboneP5(nn.Module):
         self.device = device
         self.model.to(device)
 
-        self.p5_feature = None
+        self.p4_feature = None
         self._register_hook()
 
     def _register_hook(self):
@@ -34,11 +34,11 @@ class PretrainedBackboneP5(nn.Module):
             features = output
             if isinstance(features, (list, tuple)):
                 for feat in features:
-                    if isinstance(feat, torch.Tensor) and feat.shape[-1] == 20:
-                        self.p5_feature = feat
+                    if isinstance(feat, torch.Tensor) and feat.shape[-1] == 40:
+                        self.p4_feature = feat
                         break
-            elif isinstance(features, torch.Tensor) and features.shape[-1] == 20:
-                self.p5_feature = features
+            elif isinstance(features, torch.Tensor) and features.shape[-1] == 40:
+                self.p4_feature = features
 
         self.hook_handles = []
         for layer in self.model.model:
@@ -46,18 +46,18 @@ class PretrainedBackboneP5(nn.Module):
 
     def forward(self, x):
         with torch.no_grad():
-            self.p5_feature = None
+            self.p4_feature = None
             _ = self.model(x)
-            if self.p5_feature is None:
-                raise RuntimeError("无法捕获 P5 特征")
-            return self.p5_feature
+            if self.p4_feature is None:
+                raise RuntimeError("无法捕获 P4 特征")
+            return self.p4_feature
 
     def remove_hooks(self):
         for h in self.hook_handles:
             h.remove()
 
 
-# ================== 简易检测头 ==================
+# ================== 简易检测头（适配 40×40） ==================
 class SimpleDetectionHead(nn.Module):
     def __init__(self, in_channels, num_classes=1):
         super().__init__()
@@ -73,8 +73,8 @@ class SimpleDetectionHead(nn.Module):
         return self.conv(x)
 
 
-# ================== 检测损失（P5 尺寸 20x20） ==================
-def detection_loss(pred, targets, feat_h=20, feat_w=20):
+# ================== 检测损失（特征图尺寸 40×40） ==================
+def detection_loss(pred, targets, feat_h=40, feat_w=40):
     B = pred.shape[0]
     obj_pred = pred[:, 0:1, :, :]
     tx = pred[:, 1:2, :, :]
@@ -148,29 +148,24 @@ def compute_maps(feat, targets, img_size):
     return mean_map, l1_map, contrast_masked, contrast_full
 
 
-def visualize_results(img_draw, p5_raw, p5_enhanced, targets, img_size, save_path):
-    maps_raw = compute_maps(p5_raw.cpu(), targets, img_size)
-    maps_enh = compute_maps(p5_enhanced.cpu(), targets, img_size)
+def visualize_results(img_draw, p4_raw, p4_enhanced, targets, img_size, save_path):
+    maps_raw = compute_maps(p4_raw.cpu(), targets, img_size)
+    maps_enh = compute_maps(p4_enhanced.cpu(), targets, img_size)
 
     plt.rc('font', size=14)
     plt.rc('axes', titlesize=16)
-    fig = plt.figure(figsize=(24, 30))
-    gs = gridspec.GridSpec(4, 3, figure=fig,
-                           width_ratios=[2.0, 1.5, 1.5],
+    fig = plt.figure(figsize=(18, 24))
+    gs = gridspec.GridSpec(4, 2, figure=fig,
+                           width_ratios=[1.5, 1.5],
                            wspace=0.05, hspace=0.25)
-
-    ax_img = fig.add_subplot(gs[0:4, 0])
-    ax_img.imshow(img_draw)
-    ax_img.set_title('Original Image with GT', fontsize=20, fontweight='bold', pad=15)
-    ax_img.axis('off')
 
     row_titles = ['Mean Activation', 'L1 Norm', 'Object Contrast', 'Full Contrast']
     row_cmaps  = ['gray', 'gray', 'plasma', 'plasma']
-    col_titles = ['P5 Backbone', 'P5 SoftFillEdge']
+    col_titles = ['P4 Backbone (40×40)', 'SoftFillEdgeEnhance Output (40×40)']
 
     for row_idx in range(4):
         for col_idx, (maps, title) in enumerate(zip([maps_raw, maps_enh], col_titles)):
-            ax = fig.add_subplot(gs[row_idx, col_idx+1])
+            ax = fig.add_subplot(gs[row_idx, col_idx])
             feat_map = maps[row_idx]
             ax.imshow(normalize_and_resize(feat_map, img_size), cmap=row_cmaps[row_idx])
             ax.set_title(title, fontsize=15, fontweight='bold', pad=8)
@@ -216,25 +211,26 @@ def run_experiment(model_path, dataset_root, output_dir,
         data.append((img_tensor, targets, img_name))
 
     # ---------- 加载 Backbone ----------
-    backbone = PretrainedBackboneP5(model_path, device)
+    backbone = PretrainedBackboneP4(model_path, device)
     dummy_img = data[0][0].unsqueeze(0).to(device)
     with torch.no_grad():
-        p5_sample = backbone(dummy_img)
-        in_channels = p5_sample.shape[1]
-    print(f"P5 channels: {in_channels}")
+        p4_sample = backbone(dummy_img)
+        in_channels = p4_sample.shape[1]
+    print(f"P4 channels: {in_channels}")
 
     # ---------- 实例化 SoftFillEdgeEnhance ----------
     enhancer = SoftFillEdgeEnhance(
         c1=in_channels,
-        c2=in_channels,
-        n=2,
-        pool_size=3,
-        bg_thresh_ratio=0.3,  # 背景判定阈值（固定）
-        initial_strength=0.5,  # 可学习填充强度的初始值（代替原来的 fill_strength）
-        ch_sharp=10.0,
+        c2=in_channels,          # 保持通道数不变
+        n=2,                     # 2 个 Bottleneck 精炼
+        pool_size=3,             # P4 特征图建议用 3
+        fill_strength_high=0.9,
+        fill_strength_low=0.3,
+        bg_thresh_ratio=0.5,
+        ch_sharp=5.0,
         ch_thresh=0.5,
-        edge_sharp=10.0,
-        edge_thresh=0.8,
+        edge_sharp=5.0,
+        edge_thresh=0.5,
         bottleneck_e=0.5,
         bottleneck_shortcut=True
     ).to(device)
@@ -259,10 +255,10 @@ def run_experiment(model_path, dataset_root, output_dir,
 
             optimizer.zero_grad()
             with torch.no_grad():
-                p5_feats = backbone(imgs)
-            enhanced = enhancer(p5_feats)
+                p4_feats = backbone(imgs)
+            enhanced = enhancer(p4_feats)          # 输出 (B, C, 40, 40)
             pred = head(enhanced)
-            loss = detection_loss(pred, targets_batch)
+            loss = detection_loss(pred, targets_batch)  # feat_h=feat_w=40
             if torch.isnan(loss):
                 print(f"NaN at epoch {epoch+1}")
                 continue
@@ -284,8 +280,8 @@ def run_experiment(model_path, dataset_root, output_dir,
         img_np = img_tensor.permute(1, 2, 0).numpy()
         img_t = img_tensor.unsqueeze(0).to(device)
         with torch.no_grad():
-            p5_raw = backbone(img_t)
-            p5_enhanced = enhancer(p5_raw)
+            p4_raw = backbone(img_t)
+            p4_enhanced = enhancer(p4_raw)
 
         # 原图 + 标注
         img_draw = Image.fromarray((img_np * 255).astype(np.uint8))
@@ -298,7 +294,7 @@ def run_experiment(model_path, dataset_root, output_dir,
             draw.rectangle([x1, y1, x2, y2], outline='lime', width=2)
 
         out_path = os.path.join(output_dir, f"vis_{img_name}.png")
-        visualize_results(img_draw, p5_raw, p5_enhanced, targets, 640, out_path)
+        visualize_results(img_draw, p4_raw, p4_enhanced, targets, 640, out_path)
 
     backbone.remove_hooks()
     print("All visualizations saved to", output_dir)
@@ -306,9 +302,9 @@ def run_experiment(model_path, dataset_root, output_dir,
 
 # ================== 入口 ==================
 if __name__ == "__main__":
-    model_path = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\pt\yolo11n-wavelet-hipa-test-7c46e-5090d.pt"
+    model_path = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\pt\hrsid-yolo11n-f4c3ec-5090d.pt"
     dataset_root = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\datasets\HRSID_YOLO"
-    output_dir = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\simulate\softfill_edge_enhance_visual"
+    output_dir = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\simulate\softfill_p4_visual"
 
     run_experiment(
         model_path=model_path,
