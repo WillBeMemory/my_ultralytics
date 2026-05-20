@@ -5,9 +5,6 @@ import math
 
 
 class LogWaveletDenoise(nn.Module):
-    """
-    同态小波去噪 + 可选卷积下采样 (YOLO 风格接口)
-    """
     def __init__(self, c1, c2, threshold_factor=0.5, level=1, downsample=True, kernel_size=3):
         super().__init__()
         self.downsample = downsample
@@ -26,9 +23,9 @@ class LogWaveletDenoise(nn.Module):
         self.register_buffer('rec_filters', self.dec_filters.clone())
 
         if self.downsample:
-            self.down_conv = nn.Conv2d(c1, c2, kernel_size, stride=2, padding=kernel_size//2, bias=False)
-            self.down_bn   = nn.BatchNorm2d(c2)
-            self.down_act  = nn.SiLU(inplace=True)
+            self.down_conv = nn.Conv2d(c1, c2, kernel_size, stride=2, padding=kernel_size // 2, bias=False)
+            self.down_bn = nn.BatchNorm2d(c2)
+            self.down_act = nn.SiLU(inplace=True)
 
     def _dwt(self, x):
         B, C, H, W = x.shape
@@ -49,21 +46,28 @@ class LogWaveletDenoise(nn.Module):
         return out[:, :, :2*H, :2*W]
 
     def _median_deterministic(self, x):
-        """确定性中值：排序取中间值（替代 torch.median）"""
+        """确定性中值，返回 (B,) 张量"""
         sorted_x = torch.sort(x, dim=1)[0]
         k = x.shape[1] // 2
         if x.shape[1] % 2 == 1:
             return sorted_x[:, k]
         else:
-            return (sorted_x[:, k-1] + sorted_x[:, k]) / 2.0
+            return (sorted_x[:, k - 1] + sorted_x[:, k]) / 2.0
 
     def _estimate_noise_sigma(self, HH):
         hh_abs = torch.abs(HH.reshape(HH.shape[0], -1))
         median = self._median_deterministic(hh_abs)
-        return median / 0.6745
+        # 分离梯度，防止通过中值反向传播
+        return (median / 0.6745).detach()
 
     def _soft_threshold(self, coeff, lambd):
-        return torch.sign(coeff) * torch.clamp(torch.abs(coeff) - lambd, min=0)
+        """可微软阈值：使用 torch.where 保证梯度流通"""
+        # lambd 的形状需广播到 coeff 的大小，已在调用处处理为 (B,1,1,1)
+        return torch.where(
+            coeff > lambd,
+            coeff - lambd,
+            torch.where(coeff < -lambd, coeff + lambd, torch.zeros_like(coeff))
+        )
 
     def _multilevel_denoise(self, x_log):
         detail_coeffs = []
@@ -73,13 +77,13 @@ class LogWaveletDenoise(nn.Module):
             detail_coeffs.append((LH, HL, HH))
             current = LL
 
-        sigma = self._estimate_noise_sigma(detail_coeffs[0][2])
+        sigma = self._estimate_noise_sigma(detail_coeffs[0][2])  # (B,)
 
         for lvl in reversed(range(self.level)):
             LH, HL, HH = detail_coeffs[lvl]
             N = LH.numel()
             lambd = sigma * math.sqrt(2.0 * math.log(N)) * self.threshold_factor
-            lambd = lambd.view(-1, 1, 1, 1)
+            lambd = lambd.view(-1, 1, 1, 1)  # (B,1,1,1)
             LH = self._soft_threshold(LH, lambd)
             HL = self._soft_threshold(HL, lambd)
             HH = self._soft_threshold(HH, lambd)
@@ -87,7 +91,7 @@ class LogWaveletDenoise(nn.Module):
         return current
 
     def forward(self, x):
-        x_log = torch.log(x + 1e-10)
+        x_log = torch.log(torch.clamp(x, min=1e-6))
         rec_log = self._multilevel_denoise(x_log)
         out = torch.exp(rec_log)
 
