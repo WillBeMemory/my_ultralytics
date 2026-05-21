@@ -60,6 +60,7 @@ from ultralytics.nn.modules.ChannelGateSepConv import ChannelGateSepConv
 from ultralytics.nn.modules.AddModules.ChannelAwareEdgeEnhance import ChannelAwareEdgeEnhance
 from ultralytics.nn.modules.AddModules.SoftFillEdgeEnhance import SoftFillEdgeEnhance
 from ultralytics.nn.modules.AddModules.LogWaveletDenoise import LogWaveletDenoise
+from ultralytics.nn.modules.AddModules.EFC_FPN import EFC_FPN
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1825,7 +1826,8 @@ def parse_model(d, ch, verbose=True):
             c2 = sum(ch[x] for x in f)
         elif m in (
             BiFPN,
-            CCFPN
+            CCFPN,
+            EFC_FPN
         ):
             raw_channels = args[0]
             scaled_channels = [make_divisible(min(ch, max_channels) * width, 8) for ch in raw_channels]
