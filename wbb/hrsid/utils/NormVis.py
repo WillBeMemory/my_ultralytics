@@ -10,6 +10,7 @@ from ultralytics import YOLO
 
 # ================== 参数配置 ==================
 model_path = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\pt\yolo11s-test-44729c-5090d.pt"
+model_path = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\pt\yolo11n-t10.pt"
 dataset_root = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\datasets\HRSID_COMPLEX"
 output_dir = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\simulate\fpn_visualization_modules"
 num_samples = 10
