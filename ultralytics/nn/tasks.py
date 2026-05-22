@@ -61,7 +61,7 @@ from ultralytics.nn.modules.AddModules.ChannelAwareEdgeEnhance import ChannelAwa
 from ultralytics.nn.modules.AddModules.SoftFillEdgeEnhance import SoftFillEdgeEnhance
 from ultralytics.nn.modules.AddModules.LogWaveletDenoise import LogWaveletDenoise
 from ultralytics.nn.modules.AddModules.EFC_FPN import EFC_FPN
-from ultralytics.nn.modules.AddModules.PRN import PRN
+from ultralytics.nn.modules.AddModules.PRN_ import PRN
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
