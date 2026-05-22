@@ -35,28 +35,28 @@ backbone:
 # YOLO11n head
 head:
   #   BiFPN 接收 P2~P5，输出 P3~P5
-  - [ [ 2, 4, 10 ], 1, PRN, [ [ 256, 512, 512 ], [ 128, 256, 512 ] ] ] # 注意 out_channels 也变为3个值
-
-  # 只需要三个 SplitList
-  - [ 11, 1, SplitList, [ 128,  0 ] ]   # P2_out
-  - [ 11, 1, SplitList, [ 256,  1 ] ]   # P3_out
-  - [ 11, 1, SplitList, [ 512,  2 ] ]   # P4_out
-##
-##  # 检测头 (3个输入)
-  - [ [ 12, 13, 14 ], 1, Detect, [ nc ] ]
+#  - [ [ 2, 4, 10 ], 1, PRN, [ [ 256, 512, 512 ], [ 128, 256, 512 ] ] ] # 注意 out_channels 也变为3个值
+#
+#  # 只需要三个 SplitList
+#  - [ 11, 1, SplitList, [ 128,  0 ] ]   # P2_out
+#  - [ 11, 1, SplitList, [ 256,  1 ] ]   # P3_out
+#  - [ 11, 1, SplitList, [ 512,  2 ] ]   # P4_out
+###
+###  # 检测头 (3个输入)
+#  - [ [ 12, 13, 14 ], 1, Detect, [ nc ] ]
 
 #  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
 #  - [[-1, 6], 1, Concat, [1]] # cat backbone P4
 #  - [-1, 2, C3k2, [512, False]] # 13
 
-#  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-#  - [[-1, 4], 1, Concat, [1]] # cat backbone P3
-#  - [-1, 2, C3k2, [256, False]] # 13 (P3/8-small)
-#
-#  - [ -1, 1, nn.Upsample, [ None, 2, "nearest" ] ]
-#  - [ [ -1, 2 ], 1, Concat, [ 1 ] ] # cat backbone P2
-#  - [ -1, 2, C3k2, [ 128, False ] ] # 16 (P2/4-xsmall)
-#
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]] # cat backbone P3
+  - [-1, 2, C3k2, [256, False]] # 13 (P3/8-small)
+
+  - [ -1, 1, nn.Upsample, [ None, 2, "nearest" ] ]
+  - [ [ -1, 2 ], 1, Concat, [ 1 ] ] # cat backbone P2
+  - [ -1, 2, C3k2, [ 128, False ] ] # 16 (P2/4-xsmall)
+
 #  - [ -1, 1, Conv, [ 128, 3, 2 ] ]
 #  - [ [ -1, 13 ], 1, Concat, [ 1 ] ] # cat head P3
 #  - [ -1, 2, C3k2, [ 256, False ] ] # 19 (P3/8-small)
@@ -64,7 +64,7 @@ head:
 #  - [-1, 1, Conv, [256, 3, 2]]
 #  - [[-1, 10], 1, Concat, [1]] # cat head P4
 #  - [-1, 2, C3k2, [512, False]] # 22 (P4/16-medium)
-#
-#  - [[16, 19, 22], 1, Detect, [nc]] # Detect(P2, P3, P4)
+
+  - [[16, 13, 10], 1, Detect, [nc]] # Detect(P2, P3, P4)
 #  - [[10], 1, Detect, [nc]] # Detect(P2,P3, P4, P5)
 
