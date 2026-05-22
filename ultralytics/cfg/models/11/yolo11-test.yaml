@@ -50,7 +50,7 @@ head:
 #  - [-1, 2, C3k2, [512, False]] # 13
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 4], 1, EFCFusion, [512,512,256]] # cat backbone P3
+  - [[-1, 4], 1, Concat, []] # cat backbone P3
   - [-1, 2, C3k2, [256, False]] # 13 (P3/8-small)
 
   - [ -1, 1, nn.Upsample, [ None, 2, "nearest" ] ]
