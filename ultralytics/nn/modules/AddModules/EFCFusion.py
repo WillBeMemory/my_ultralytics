@@ -34,7 +34,7 @@ class EFCFusion(nn.Module):
 
         # 可学习缩放/偏移
         self.gamma = nn.Parameter(torch.randn(out_channels, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(out_channels, 1, 1))
+        self.beta  = nn.Parameter(torch.zeros(out_channels, 1, 1))
 
         # 门控生成器（bias=False）
         self.gate_generator = nn.Sequential(
@@ -57,7 +57,7 @@ class EFCFusion(nn.Module):
     def forward(self, x):
         x1, x2 = x
 
-        # AMP 安全：将输入转换为与模块权重一致的 dtype
+        # AMP 安全：对齐 dtype
         target_dtype = self.conv1.weight.dtype
         x1 = x1.to(target_dtype)
         x2 = x2.to(target_dtype)
@@ -90,14 +90,14 @@ class EFCFusion(nn.Module):
         out_r = out.reshape(N, G, C // G, H, W).reshape(N, G, -1)
         X_r = X_GLOBAL.reshape(N, G, C // G, H, W).reshape(N, G, -1)
         mean = X_r.mean(dim=2, keepdim=True)
-        std = X_r.std(dim=2, keepdim=True)
+        std  = X_r.std(dim=2, keepdim=True)
         out_norm = ((out_r - mean) / (std + self.eps)).reshape(N, C, H, W)
         out_norm = out_norm * self.gamma + self.beta
 
-        # 5. 强弱特征分离（硬阈值，与官方一致）
+        # 5. 强弱特征分离（关键修复：用 .to(target_dtype) 替代 .float()）
         reweights = self.sigmoid(self.apt(X_GLOBAL))
-        x_strong = ((reweights >= w1).float() + (reweights >= w2).float()) * X_GLOBAL
-        x_weak = ((reweights < w1).float() + (reweights < w2).float()) * X_GLOBAL
+        x_strong = ((reweights >= w1).to(target_dtype) + (reweights >= w2).to(target_dtype)) * X_GLOBAL
+        x_weak   = ((reweights <  w1).to(target_dtype) + (reweights <  w2).to(target_dtype)) * X_GLOBAL
 
         # 6. 弱特征处理
         x_weak = self.conv3(self.dwconv(x_weak))
