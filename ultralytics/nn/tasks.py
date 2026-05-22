@@ -62,6 +62,7 @@ from ultralytics.nn.modules.AddModules.SoftFillEdgeEnhance import SoftFillEdgeEn
 from ultralytics.nn.modules.AddModules.LogWaveletDenoise import LogWaveletDenoise
 from ultralytics.nn.modules.AddModules.EFC_FPN import EFC_FPN
 from ultralytics.nn.modules.AddModules.PRN_ import PRN
+from ultralytics.nn.modules.AddModules.GoldNeck_P234 import GoldNeck_P234
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1829,7 +1830,8 @@ def parse_model(d, ch, verbose=True):
             BiFPN,
             CCFPN,
             EFC_FPN,
-            PRN
+            PRN,
+            GoldNeck_P234,
         ):
             raw_channels = args[0]
             scaled_channels = [make_divisible(min(ch, max_channels) * width, 8) for ch in raw_channels]
