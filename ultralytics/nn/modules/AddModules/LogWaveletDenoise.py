@@ -56,19 +56,7 @@ class DirectionalConv(nn.Module):
 
 
 class LogWaveletDenoise(nn.Module):
-    """
-    对数-小波去噪 + 方向性子带增强模块
-    在可学习软阈值去噪后，对 LH/HL/HH/LL 子带分别进行方向性深度卷积，
-    再通过小波重构和指数变换恢复图像。
-    """
-    def __init__(
-        self,
-        c1, c2,
-        level=1,
-        downsample=True,
-        kernel_size=3,
-        use_directional=True,          # 是否启用子带方向卷积
-    ):
+    def __init__(self, c1, c2, level=1, downsample=True, kernel_size=3, use_directional=True):
         super().__init__()
         self.downsample = downsample
         self.level = level
@@ -84,7 +72,7 @@ class LogWaveletDenoise(nn.Module):
         self.register_buffer('dec_filters', torch.cat([dec_LL, dec_LH, dec_HL, dec_HH], dim=0))
         self.register_buffer('rec_filters', self.dec_filters.clone())
 
-        # 可学习的逐通道软阈值参数
+        # 可学习阈值（逐通道）
         self.log_thresh_LH = nn.ParameterList([
             nn.Parameter(torch.full((1, c1, 1, 1), -2.0)) for _ in range(level)
         ])
@@ -95,25 +83,16 @@ class LogWaveletDenoise(nn.Module):
             nn.Parameter(torch.full((1, c1, 1, 1), -2.0)) for _ in range(level)
         ])
 
-        # 方向性子带卷积（每个子带一组，深度可分离，参数量极小）
+        # 方向性子带卷积（每组一个）
         if self.use_directional:
-            self.ll_convs = nn.ModuleList([
-                DirectionalConv(c1, 'll') for _ in range(level)
-            ])
-            self.lh_convs = nn.ModuleList([
-                DirectionalConv(c1, 'lh') for _ in range(level)
-            ])
-            self.hl_convs = nn.ModuleList([
-                DirectionalConv(c1, 'hl') for _ in range(level)
-            ])
-            self.hh_convs = nn.ModuleList([
-                DirectionalConv(c1, 'hh', use_diag_init=True) for _ in range(level)
-            ])
+            self.ll_convs = nn.ModuleList([DirectionalConv(c1, 'll') for _ in range(level)])
+            self.lh_convs = nn.ModuleList([DirectionalConv(c1, 'lh') for _ in range(level)])
+            self.hl_convs = nn.ModuleList([DirectionalConv(c1, 'hl') for _ in range(level)])
+            self.hh_convs = nn.ModuleList([DirectionalConv(c1, 'hh') for _ in range(level)])
 
-        # 可选的下采样卷积层
+        # 下采样卷积
         if self.downsample:
-            self.down_conv = nn.Conv2d(c1, c2, kernel_size, stride=2,
-                                       padding=kernel_size // 2, bias=False)
+            self.down_conv = nn.Conv2d(c1, c2, kernel_size, stride=2, padding=kernel_size//2, bias=False)
             self.down_bn = nn.BatchNorm2d(c2)
             self.down_act = nn.SiLU(inplace=True)
 
@@ -143,17 +122,19 @@ class LogWaveletDenoise(nn.Module):
         )
 
     def _multilevel_denoise(self, x_log):
+        # 分解：保存每一层的完整子带 (LL, LH, HL, HH)
         detail_coeffs = []
         current = x_log
         for lvl in range(self.level):
             LL, LH, HL, HH = self._dwt(current)
-            detail_coeffs.append((LL, LH, HL, HH))   # 保存 LL 用于后续增强
+            detail_coeffs.append((LL, LH, HL, HH))
             current = LL
 
+        # 重构：从最深层开始，逐层向上
         for lvl in reversed(range(self.level)):
-            LL, LH, HL, HH = detail_coeffs[lvl]
+            LL, LH, HL, HH = detail_coeffs[lvl]  # 当前层的四个子带
 
-            # 可学习软阈值
+            # 可学习软阈值（仅作用于细节子带）
             tau_lh = F.softplus(self.log_thresh_LH[lvl])
             tau_hl = F.softplus(self.log_thresh_HL[lvl])
             tau_hh = F.softplus(self.log_thresh_HH[lvl])
@@ -161,24 +142,23 @@ class LogWaveletDenoise(nn.Module):
             HL = self._soft_threshold(HL, tau_hl)
             HH = self._soft_threshold(HH, tau_hh)
 
-            # 方向性子带卷积（增强边缘和纹理）
             if self.use_directional:
-                LL = self.ll_convs[lvl](LL)
+                # 方向卷积增强各子带
                 LH = self.lh_convs[lvl](LH)
                 HL = self.hl_convs[lvl](HL)
                 HH = self.hh_convs[lvl](HH)
+                # 对低频 current（即上一级重构的 LL）进行增强
+                current = self.ll_convs[lvl](current)
 
-            current = self._idwt(current, LH, HL, HH) if lvl > 0 else self._idwt(LL, LH, HL, HH)
-            # 注意：最后一级重构时需要传入 LL，其余级别 current 即为 LL？
-            # 修正：在循环中，current 始终是上一级重构后的 LL 部分，最后一次重构需要传入最终的 LL。
-            # 原代码中 current = LL 被赋值后，在重构时直接使用 current 作为 LL，但 current 实际上是 LL，正确。
+            # 关键修正：始终使用 current 作为低频部分，结合本层细节逆变换
+            current = self._idwt(current, LH, HL, HH)
+
         return current
 
     def forward(self, x):
         x_log = torch.log(torch.clamp(x, min=1e-6))
         rec_log = self._multilevel_denoise(x_log)
         out = torch.exp(rec_log)
-
         if self.downsample:
             out = self.down_act(self.down_bn(self.down_conv(out)))
         return out
