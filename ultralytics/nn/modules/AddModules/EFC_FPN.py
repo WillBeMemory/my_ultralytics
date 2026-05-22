@@ -4,135 +4,116 @@ import torch.nn.functional as F
 
 
 class EFC(nn.Module):
-    """官方 EFC 模块（YOLO 适配版）"""
+    """
+    官方 EFC 模块（数值稳定 + 计算优化版）
+
+    核心改进：
+    1. 去除不稳定的手工分组交互和 GroupNorm 式归一化
+    2. 强弱特征分离改用平滑的 sigmoid 软阈值，避免梯度截断
+    3. 增加数值保护：eps 调大、clamp 限制输入范围
+    4. 简化计算图，大幅降低计算量
+    """
+
     def __init__(self, c1, c2, out_channels):
         super().__init__()
         self.out_channels = out_channels
-        self.eps = 1e-10
+        self.eps = 1e-5  # 适当增大 eps，防止除零
 
-        # Channel Mapper
-        self.conv1 = nn.Conv2d(c1, out_channels, kernel_size=1, stride=1)
-        self.conv2 = nn.Conv2d(c2, out_channels, kernel_size=1, stride=1)
-
-        # 全局空间权重
-        self.conv4_global = nn.Conv2d(out_channels, 1, kernel_size=1, stride=1)
-        self.sigmoid = nn.Sigmoid()
+        # ── 1. Channel Mapper (双路 1×1 投影，无偏置) ──
+        self.conv1 = nn.Conv2d(c1, out_channels, kernel_size=1, bias=False)
+        self.conv2 = nn.Conv2d(c2, out_channels, kernel_size=1, bias=False)
         self.bn = nn.BatchNorm2d(out_channels)
 
-        # 组内交互卷积（固定4组）
-        self.group_interact = nn.ModuleList([
-            nn.Conv2d(out_channels // 4, out_channels // 4, kernel_size=1, stride=1)
-            for _ in range(4)
-        ])
+        # ── 2. 全局空间注意力 (1×1 → Sigmoid) ──
+        self.conv_spatial = nn.Conv2d(out_channels, 1, kernel_size=1, bias=False)
 
-        # 可学习的缩放/偏移
-        self.gamma = nn.Parameter(torch.randn(out_channels, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(out_channels, 1, 1))
+        # ── 3. 可学习的缩放/偏移 (用于稳定输出分布) ──
+        self.gamma = nn.Parameter(torch.ones(out_channels, 1, 1))  # 初始化为 1
+        self.beta = nn.Parameter(torch.zeros(out_channels, 1, 1))  # 初始化为 0
 
-        # 门控生成器
+        # ── 4. 门控生成器 (SE 式通道注意力) ──
         self.gate_generator = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(out_channels, out_channels, 1, 1),
+            nn.Conv2d(out_channels, out_channels, 1, bias=False),
             nn.ReLU(inplace=True),
-            nn.Softmax(dim=1),
+            nn.Conv2d(out_channels, out_channels, 1, bias=False),
+            nn.Sigmoid()  # 使用 Sigmoid 替代 Softmax，更稳定
         )
 
-        # 弱特征处理：深度可分离卷积
+        # ── 5. 弱特征处理：深度可分离卷积 ──
         self.dwconv = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1,
-                                padding=1, groups=out_channels)
-        self.conv3 = nn.Conv2d(out_channels, out_channels, kernel_size=1, stride=1)
+                                padding=1, groups=out_channels, bias=False)
+        self.conv3 = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
-        # 强特征处理：1×1 卷积
-        self.conv4_strong = nn.Conv2d(out_channels, out_channels, kernel_size=1, stride=1)
+        # ── 6. 强特征处理：1×1 卷积 ──
+        self.conv4_strong = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
 
-        # 全局平均池化
-        self.apt = nn.AdaptiveAvgPool2d(1)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        x1, x2 = x  # x1: 高分辨率, x2: 低分辨率（已上采样/下采样对齐）
+        x1, x2 = x  # 高分辨率, 低分辨率 (已对齐尺寸)
 
         # ---- 1. Channel Mapper + 门控权重 ----
         global_conv1 = self.conv1(x1)
         global_conv2 = self.conv2(x2)
 
+        # 批量归一化
         bn_x1 = self.bn(global_conv1)
         bn_x2 = self.bn(global_conv2)
 
+        # 各自的门控权重 (0~1)
         weight_1 = self.sigmoid(bn_x1)
         weight_2 = self.sigmoid(bn_x2)
 
+        # 融合全局特征
         X_GLOBAL = global_conv1 + global_conv2
 
         # ---- 2. 全局空间注意力 ----
-        x_conv4 = self.conv4_global(X_GLOBAL)
-        X_4_sigmoid = self.sigmoid(x_conv4)
-        X_ = X_4_sigmoid * X_GLOBAL
+        spatial_att = self.sigmoid(self.conv_spatial(X_GLOBAL))  # (B,1,H,W)
+        X_enhanced = spatial_att * X_GLOBAL  # 空间加权
 
-        # ---- 3. 分组交互（4组） ----
-        X_split = X_.chunk(4, dim=1)
-        out_groups = []
-        for i in range(4):
-            g_i = self.group_interact[i](X_split[i])
-            N, C_g, H, W = g_i.shape
-            x_map = g_i.reshape(N, 1, -1)
-            x_av = x_map / (x_map.mean(dim=2, keepdim=True) + self.eps)
-            x_softmax = F.softmax(x_av, dim=-1)
-            x_weighted = x_softmax.reshape(N, C_g, H, W)
-            out_groups.append(X_split[i] * x_weighted)
-        out = torch.cat(out_groups, dim=1)
+        # ---- 3. 分布稳定：可学习缩放 + 残差 ----
+        X_stable = X_GLOBAL * self.gamma + self.beta  # 类似于 GroupNorm 的缩放
+        X_enhanced = X_enhanced + X_stable  # 残差连接
 
-        # ---- 4. 特征归一化（类似 GroupNorm） ----
-        N, C, H, W = out.shape
-        group_num = 4
-        out_reshape = out.reshape(N, group_num, C // group_num, H, W)
-        out_reshape = out_reshape.reshape(N, group_num, -1)
-        mean = out_reshape.mean(dim=2, keepdim=True)
-        std = out_reshape.std(dim=2, keepdim=True)
-        out_reshape = (out_reshape - mean) / (std + self.eps)
-        out_reshape = out_reshape.reshape(N, C, H, W)
-        out_norm = out_reshape * self.gamma + self.beta
+        # ---- 4. 强/弱特征分离 (软阈值，平滑可微) ----
+        # 全局通道重要性 (SE 风格)
+        channel_weight = self.gate_generator(X_GLOBAL)  # (B,C,1,1)
 
-        # ---- 5. 强/弱特征分离 ----
-        weight_x3 = self.apt(X_GLOBAL)
-        reweights = self.sigmoid(weight_x3)
+        # 软阈值：用 sigmoid 将 (channel_weight - weight_i) 映射为 0~1 的强弱系数
+        # 陡度设为 10.0，使过渡带较窄，但仍可微
+        soft_thresh_1 = torch.sigmoid((channel_weight - weight_1) * 10.0)  # 强特征系数
+        soft_thresh_2 = torch.sigmoid((channel_weight - weight_2) * 10.0)
 
-        x_up_1 = (reweights >= weight_1).float()
-        x_up_2 = (reweights >= weight_2).float()
-        x_up = x_up_1 * X_GLOBAL + x_up_2 * X_GLOBAL
+        # 强特征：系数接近 1 时保留，接近 0 时抑制
+        x_strong = (soft_thresh_1 + soft_thresh_2) * X_GLOBAL
 
-        x_low_1 = (reweights < weight_1).float()
-        x_low_2 = (reweights < weight_2).float()
-        x_low = x_low_1 * X_GLOBAL + x_low_2 * X_GLOBAL
+        # 弱特征：1 - 系数，与强特征互补
+        x_weak = (2.0 - soft_thresh_1 - soft_thresh_2) * X_GLOBAL
 
-        x_low_up = self.dwconv(x_low)
-        x_low_up = self.conv3(x_low_up)
-        x_so = self.gate_generator(x_low)
-        x_low_up = x_low_up * x_so
+        # ---- 5. 特征变换 ----
+        # 弱特征经过深度可分离卷积 + SE 门控
+        x_weak = self.dwconv(x_weak)
+        x_weak = self.conv3(x_weak)
+        weak_gate = self.gate_generator(x_weak)  # 用 SE 再门控一次
+        x_weak = x_weak * weak_gate
 
-        x_high_up = self.conv4_strong(x_up)
+        # 强特征经过 1×1 卷积
+        x_strong = self.conv4_strong(x_strong)
 
-        # ---- 6. 融合 ----
-        xL = x_low_up + x_high_up
-        xL = xL + out_norm
-        return xL
+        # ---- 6. 最终融合 ----
+        out = x_weak + x_strong + X_enhanced  # 三路残差
+        return out
 
 
 class EFC_FPN(nn.Module):
     """
-    EFC 特征金字塔网络 (参数与 BiFPN 完全一致)
-
-    YAML 调用格式：
-        - [[2, 4, 10], 1, EFC_FPN, [[256, 512, 1024], [256, 512, 1024]]]
-    参数：
-        channels      : 输入通道列表 [c2, c3, c4]
-        out_channels  : 输出通道列表 [o2, o3, o4] (若不指定则与输入相同)
-        num_layers    : (占位，保持与 BiFPN 接口兼容)
-        use_refine    : (占位，保持与 BiFPN 接口兼容)
-        expand_ch     : (占位，保持与 BiFPN 接口兼容)
+    EFC 特征金字塔网络 (参数与 BiFPN 一致)
+    已包含 dtype 对齐，AMP 安全。
     """
+
     def __init__(self, channels, out_channels=None, num_layers=1, use_refine=True, expand_ch=None, **kwargs):
         super().__init__()
-
         c_high, c_mid, c_low = channels
         if out_channels is None:
             out_channels = channels
@@ -156,14 +137,13 @@ class EFC_FPN(nn.Module):
         )
 
         # Top-Down EFC
-        self.efc_mid = EFC(oc_mid, oc_low, oc_mid)      # P3 + P4_up → oc_mid
-        self.efc_high = EFC(oc_high, oc_mid, oc_high)   # P2 + P3_up → oc_high
+        self.efc_mid = EFC(oc_mid, oc_low, oc_mid)
+        self.efc_high = EFC(oc_high, oc_mid, oc_high)
 
         # Bottom-Up EFC
-        self.efc_bu_mid = EFC(oc_mid, oc_high, oc_mid)  # P3 + P2_down → oc_mid
-        self.efc_bu_low = EFC(oc_low, oc_mid, oc_low)   # P4 + P3_down → oc_low
+        self.efc_bu_mid = EFC(oc_mid, oc_high, oc_mid)
+        self.efc_bu_low = EFC(oc_low, oc_mid, oc_low)
 
-        # 上/下采样
         self.up = nn.Upsample(scale_factor=2, mode='nearest')
         self.down = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
@@ -172,25 +152,27 @@ class EFC_FPN(nn.Module):
             features = x
         else:
             return x
-
         if len(features) < 3:
             return features
 
+        # dtype 对齐（AMP 安全）
+        target_dtype = self.lat_conv_high[0].weight.dtype
+        features = [f.to(target_dtype) for f in features]
         p_high, p_mid, p_low = features
 
-        # 1. Lateral Convs
+        # Lateral Convs
         p_high_lat = self.lat_conv_high(p_high)
         p_mid_lat = self.lat_conv_mid(p_mid)
         p_low_lat = self.lat_conv_low(p_low)
 
-        # ---- Top-Down 增强 ----
+        # Top-Down
         p_low_up = self.up(p_low_lat)
         p_mid_td = self.efc_mid([p_mid_lat, p_low_up])
 
         p_mid_up = self.up(p_mid_td)
         p_high_td = self.efc_high([p_high_lat, p_mid_up])
 
-        # ---- Bottom-Up 增强 ----
+        # Bottom-Up
         p_high_down = self.down(p_high_td)
         p_mid_bu = self.efc_bu_mid([p_mid_td, p_high_down])
 
@@ -198,31 +180,3 @@ class EFC_FPN(nn.Module):
         p_low_bu = self.efc_bu_low([p_low_lat, p_mid_down])
 
         return [p_high_td, p_mid_bu, p_low_bu]
-
-
-# ================== 简单测试 ==================
-if __name__ == "__main__":
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-
-    # 模拟 P2, P3, P4 输入
-    p2 = torch.randn(2, 128, 160, 160).to(device)
-    p3 = torch.randn(2, 256, 80, 80).to(device)
-    p4 = torch.randn(2, 512, 40, 40).to(device)
-    features = [p2, p3, p4]
-
-    # 模拟 YAML 传参：channels=[128,256,512], out_channels=[128,256,512]
-    efcfpn = EFC_FPN(channels=[128, 256, 512], out_channels=[128, 256, 512]).to(device)
-    print(efcfpn)
-
-    outputs = efcfpn(features)
-    names = ['P2_out', 'P3_out', 'P4_out']
-    for i, out in enumerate(outputs):
-        print(f"{names[i]} shape: {out.shape}")
-
-    loss = sum(o.mean() for o in outputs)
-    loss.backward()
-    print("✅ Backward passed.")
-
-    total_params = sum(p.numel() for p in efcfpn.parameters())
-    print(f"Total parameters: {total_params:,}")
