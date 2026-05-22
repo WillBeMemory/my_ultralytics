@@ -63,12 +63,14 @@ from ultralytics.nn.modules.AddModules.LogWaveletDenoise import LogWaveletDenois
 from ultralytics.nn.modules.AddModules.EFC_FPN import EFC_FPN
 from ultralytics.nn.modules.AddModules.PRN_ import PRN
 from ultralytics.nn.modules.AddModules.GoldNeck_P234 import GoldNeck_P234
+from ultralytics.nn.modules.AddModules.EFCFusion import EFCFusion
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
     AIFI,
     C1,
     C2,
+    C2PSA,
     C2PSA,
     C3,
     C3TR,
@@ -1826,6 +1828,24 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+
+        elif m is EFCFusion:
+            if len(args) >= 3:
+                raw_c1 = args[0]
+                raw_c2 = args[1]
+                raw_out = args[2]
+            else:
+                raw_c1 = ch[f[0]] if f[0] >= 0 else ch[-1]
+                raw_c2 = ch[f[1]] if f[1] >= 0 else ch[-1]
+                raw_out = raw_c1
+
+            c1 = make_divisible(min(raw_c1, max_channels) * width, 8)
+            c2 = make_divisible(min(raw_c2, max_channels) * width, 8)
+            out_ch = make_divisible(min(raw_out, max_channels) * width, 8)
+
+            args = [c1, c2, out_ch]
+            c2 = out_ch  # 更新输出通道数，后续会自动加入 ch 列表
+
         elif m in (
             BiFPN,
             CCFPN,
