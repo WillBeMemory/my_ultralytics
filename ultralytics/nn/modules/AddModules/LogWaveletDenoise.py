@@ -5,13 +5,7 @@ import math
 
 
 class DirectionalConv(nn.Module):
-    """
-    方向性深度卷积（与 WaveletStem 中一致）
-    - LL: 标准 3×3 深度卷积
-    - LH: (1, 3) 垂直条状深度卷积（增强水平边缘）
-    - HL: (3, 1) 水平条状深度卷积（增强垂直边缘）
-    - HH: 3×3 深度卷积，可初始化为对角模式（强化对角边缘）
-    """
+    """方向性深度卷积（对数域适配版：更保守的初始化）"""
     def __init__(self, channels: int, mode: str, use_diag_init: bool = True):
         super().__init__()
         self.mode = mode
@@ -31,31 +25,46 @@ class DirectionalConv(nn.Module):
                 self._init_diag_weights()
         else:
             raise ValueError(f"Invalid mode: {mode}")
+
+        # 强制使用 Kaiming 初始化并缩放，让初始状态接近恒等映射
+        for m in [self.conv]:
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            with torch.no_grad():
+                m.weight.mul_(0.01)  # 大幅度缩小初始权重
+
         self.bn = nn.BatchNorm2d(channels)
         self.act = nn.SiLU(inplace=True)
 
     def _init_diag_weights(self):
-        """初始化 HH 卷积核为对角增强模式（主对角线正，反对角线负）"""
         with torch.no_grad():
-            weight = self.conv.weight  # (C, 1, 3, 3)
+            weight = self.conv.weight
             nn.init.zeros_(weight)
-            # 主对角线 (+)
             weight[:, 0, 0, 0] = 1.0
             weight[:, 0, 1, 1] = 1.0
             weight[:, 0, 2, 2] = 1.0
-            # 反对角线 (-)
             weight[:, 0, 0, 2] = -0.5
-            weight[:, 0, 1, 1] -= 1.0  # 中心点调整
+            weight[:, 0, 1, 1] -= 1.0
             weight[:, 0, 2, 0] = -0.5
-            # 归一化
             C = weight.shape[0]
             weight /= weight.view(C, -1).norm(p=2, dim=1).view(C, 1, 1, 1) + 1e-6
 
     def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+        out = self.conv(x)
+        out = torch.clamp(out, min=-10.0, max=10.0)   # 裁剪极端值
+        return self.act(self.bn(out))
 
 
 class LogWaveletDenoise(nn.Module):
+    """
+    对数-小波去噪 + 对数域方向卷积增强（含数值保护）
+
+    Args:
+        c1: 输入通道数
+        c2: 输出通道数
+        level: 小波分解级数
+        downsample: 是否在末端使用 stride=2 卷积下采样
+        use_directional: 是否在对数域启用方向卷积（默认 False）
+    """
     def __init__(self, c1, c2, level=1, downsample=True, kernel_size=3, use_directional=True):
         super().__init__()
         self.downsample = downsample
@@ -72,7 +81,7 @@ class LogWaveletDenoise(nn.Module):
         self.register_buffer('dec_filters', torch.cat([dec_LL, dec_LH, dec_HL, dec_HH], dim=0))
         self.register_buffer('rec_filters', self.dec_filters.clone())
 
-        # 可学习阈值（逐通道）
+        # 可学习的逐通道阈值参数
         self.log_thresh_LH = nn.ParameterList([
             nn.Parameter(torch.full((1, c1, 1, 1), -2.0)) for _ in range(level)
         ])
@@ -83,16 +92,17 @@ class LogWaveletDenoise(nn.Module):
             nn.Parameter(torch.full((1, c1, 1, 1), -2.0)) for _ in range(level)
         ])
 
-        # 方向性子带卷积（每组一个）
+        # 对数域方向卷积（每组一个）
         if self.use_directional:
             self.ll_convs = nn.ModuleList([DirectionalConv(c1, 'll') for _ in range(level)])
             self.lh_convs = nn.ModuleList([DirectionalConv(c1, 'lh') for _ in range(level)])
             self.hl_convs = nn.ModuleList([DirectionalConv(c1, 'hl') for _ in range(level)])
             self.hh_convs = nn.ModuleList([DirectionalConv(c1, 'hh') for _ in range(level)])
 
-        # 下采样卷积
+        # 下采样卷积层
         if self.downsample:
-            self.down_conv = nn.Conv2d(c1, c2, kernel_size, stride=2, padding=kernel_size//2, bias=False)
+            self.down_conv = nn.Conv2d(c1, c2, kernel_size, stride=2,
+                                       padding=kernel_size // 2, bias=False)
             self.down_bn = nn.BatchNorm2d(c2)
             self.down_act = nn.SiLU(inplace=True)
 
@@ -122,7 +132,9 @@ class LogWaveletDenoise(nn.Module):
         )
 
     def _multilevel_denoise(self, x_log):
-        # 分解：保存每一层的完整子带 (LL, LH, HL, HH)
+        # 数值保护
+        x_log = torch.clamp(x_log, min=-10.0, max=10.0)
+
         detail_coeffs = []
         current = x_log
         for lvl in range(self.level):
@@ -130,11 +142,10 @@ class LogWaveletDenoise(nn.Module):
             detail_coeffs.append((LL, LH, HL, HH))
             current = LL
 
-        # 重构：从最深层开始，逐层向上
         for lvl in reversed(range(self.level)):
-            LL, LH, HL, HH = detail_coeffs[lvl]  # 当前层的四个子带
+            LL, LH, HL, HH = detail_coeffs[lvl]
 
-            # 可学习软阈值（仅作用于细节子带）
+            # 可学习软阈值
             tau_lh = F.softplus(self.log_thresh_LH[lvl])
             tau_hl = F.softplus(self.log_thresh_HL[lvl])
             tau_hh = F.softplus(self.log_thresh_HH[lvl])
@@ -142,23 +153,25 @@ class LogWaveletDenoise(nn.Module):
             HL = self._soft_threshold(HL, tau_hl)
             HH = self._soft_threshold(HH, tau_hh)
 
+            # 对数域方向卷积（逐子带增强）
             if self.use_directional:
-                # 方向卷积增强各子带
+                LL = self.ll_convs[lvl](LL)
                 LH = self.lh_convs[lvl](LH)
                 HL = self.hl_convs[lvl](HL)
                 HH = self.hh_convs[lvl](HH)
-                # 对低频 current（即上一级重构的 LL）进行增强
-                current = self.ll_convs[lvl](current)
 
-            # 关键修正：始终使用 current 作为低频部分，结合本层细节逆变换
+            # 重构
             current = self._idwt(current, LH, HL, HH)
-
         return current
 
     def forward(self, x):
+        # 对数变换
         x_log = torch.log(torch.clamp(x, min=1e-6))
+        # 去噪 + 可选方向增强
         rec_log = self._multilevel_denoise(x_log)
-        out = torch.exp(rec_log)
+        # 指数变换
+        out = torch.exp(torch.clamp(rec_log, min=-10.0, max=10.0))
+
         if self.downsample:
             out = self.down_act(self.down_bn(self.down_conv(out)))
         return out
