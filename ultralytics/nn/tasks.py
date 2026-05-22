@@ -61,6 +61,7 @@ from ultralytics.nn.modules.AddModules.ChannelAwareEdgeEnhance import ChannelAwa
 from ultralytics.nn.modules.AddModules.SoftFillEdgeEnhance import SoftFillEdgeEnhance
 from ultralytics.nn.modules.AddModules.LogWaveletDenoise import LogWaveletDenoise
 from ultralytics.nn.modules.AddModules.EFC_FPN import EFC_FPN
+from ultralytics.nn.modules.AddModules.PRN import PRN
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1827,7 +1828,8 @@ def parse_model(d, ch, verbose=True):
         elif m in (
             BiFPN,
             CCFPN,
-            EFC_FPN
+            EFC_FPN,
+            PRN
         ):
             raw_channels = args[0]
             scaled_channels = [make_divisible(min(ch, max_channels) * width, 8) for ch in raw_channels]
