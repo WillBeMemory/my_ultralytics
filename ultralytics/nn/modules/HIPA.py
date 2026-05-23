@@ -6,7 +6,7 @@ from typing import List, Tuple, Optional, Union
 
 class UniformWindowAttention(nn.Module):
     """
-    统一窗口尺寸的稀疏注意力（确定性、训练极快）
+    统一窗口尺寸的稀疏注意力（AMP 安全、确定性、训练极快）
 
     以 Top-K 高响应位置为中心，固定裁剪 win_size×win_size 的窗口，
     在窗口内进行多头自注意力，最后散射回空间图。
@@ -29,14 +29,14 @@ class UniformWindowAttention(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         device = x.device
-        dtype = x.dtype
+        dtype = x.dtype  # AMP 下为 float16
         half = self.win_size // 2
 
         # ---------- 1. 反射填充 ----------
         x_padded = F.pad(x, (half, half, half, half), mode='reflect')
 
         # ---------- 2. 重要性筛选 Top‑K ----------
-        importance = torch.norm(x.flatten(2), p=2, dim=1)   # (B, H*W)
+        importance = torch.norm(x.flatten(2), p=2, dim=1)  # (B, H*W)
         N = H * W
         k = max(self.min_keeps, int(N * self.keep_ratio))
         k = min(k, N)
@@ -45,49 +45,41 @@ class UniformWindowAttention(nn.Module):
         y_coords = (topk_indices // W).long()
         x_coords = (topk_indices % W).long()
 
-        # ---------- 3. 构建广播一致的索引 ----------
-        # 用于窗口内坐标偏移
-        dy = torch.arange(self.win_size, device=device).view(1, 1, -1, 1)   # (1,1,win_size,1)
-        dx = torch.arange(self.win_size, device=device).view(1, 1, 1, -1)   # (1,1,1,win_size)
+        # ---------- 3. 批量提取窗口 ----------
+        dy = torch.arange(self.win_size, device=device).view(1, 1, -1, 1)  # (1,1,win_size,1)
+        dx = torch.arange(self.win_size, device=device).view(1, 1, 1, -1)  # (1,1,1,win_size)
 
-        # 扩展坐标
-        y_idx = y_coords.unsqueeze(-1).unsqueeze(-1) + dy    # (B, K, win_size, 1)
-        x_idx = x_coords.unsqueeze(-1).unsqueeze(-1) + dx    # (B, K, 1, win_size)
+        y_idx = y_coords.unsqueeze(-1).unsqueeze(-1) + dy  # (B, K, win_size, 1)
+        x_idx = x_coords.unsqueeze(-1).unsqueeze(-1) + dx  # (B, K, 1, win_size)
 
-        # 批量索引
-        b_idx = torch.arange(B, device=device).view(B, 1, 1, 1)   # (B,1,1,1)
+        b_idx = torch.arange(B, device=device).view(B, 1, 1, 1)  # (B,1,1,1)
 
-        # 从填充图中提取窗口：形状 (B, K, win_size, win_size, C)
+        # 从填充图中提取窗口：(B, K, C, win_size, win_size)
         windows = x_padded[b_idx, :, y_idx, x_idx]
-        # 调整维度： (B, K, C, win_size, win_size)
-        windows = windows.permute(0, 1, 4, 2, 3)
-        # 展平 batch 和 token 维度 -> (B*K, C, win_size, win_size)
+        windows = windows.permute(0, 1, 4, 2, 3)  # (B, K, C, win_size, win_size)
         windows = windows.reshape(B * k, C, self.win_size, self.win_size)
 
-        # ---------- 4. 窗口内自注意力 ----------
+        # ---------- 4. 窗口内自注意力（保持原始 dtype，不转 float32） ----------
         L = self.win_size * self.win_size
-        window_seq = windows.flatten(2).permute(0, 2, 1)       # (B*K, L, C)
+        window_seq = windows.flatten(2).permute(0, 2, 1)  # (B*K, L, C)
         pos_embed = self.pos_embed[:, :L, :].to(dtype)
         window_seq = window_seq + pos_embed
 
-        # 强制 float32 避免 AMP 内部类型提升
-        window_seq_fp32 = window_seq.float()
-        attn_out, _ = self.attn(window_seq_fp32, window_seq_fp32, window_seq_fp32)
-        attn_out = self.norm(window_seq_fp32 + attn_out)
-        attn_out = attn_out.to(dtype)
+        attn_out, _ = self.attn(window_seq, window_seq, window_seq)
+        attn_out = self.norm(window_seq + attn_out)
 
-        # ---------- 5. 聚合中心 token ----------
+        # ---------- 5. 聚合为中心 token ----------
         center_idx = L // 2
-        enhanced_token = attn_out[:, center_idx, :]            # (B*K, C)
-        enhanced_token = enhanced_token.reshape(B, k, C)       # (B, k, C)
+        enhanced_token = attn_out[:, center_idx, :]  # (B*K, C)
+        enhanced_token = enhanced_token.reshape(B, k, C)  # (B, k, C)
 
         # ---------- 6. 散射回空间图 ----------
         out = torch.zeros(B, C, H, W, device=device, dtype=dtype)
         cx_pix = x_coords
         cy_pix = y_coords
-        index = (cy_pix * W + cx_pix)                          # (B, k)
-        index = index.unsqueeze(1).expand(B, C, k)            # (B, C, k)
-        src = enhanced_token.permute(0, 2, 1).to(dtype)       # (B, C, k)
+        index = (cy_pix * W + cx_pix)  # (B, k)
+        index = index.unsqueeze(1).expand(B, C, k)  # (B, C, k)
+        src = enhanced_token.permute(0, 2, 1).to(dtype)  # (B, C, k)
         out = out.flatten(2).scatter_(2, index, src).view(B, C, H, W)
 
         return out
@@ -96,8 +88,11 @@ class UniformWindowAttention(nn.Module):
 class _HIPASingle(nn.Module):
     """单层简化 HIPA：Top‑K 窗口注意力 + 残差连接"""
 
-    def __init__(self, in_channels, out_channels,
-                 num_heads=4, keep_ratio=0.3, min_keeps=8, win_size=7):
+    def __init__(
+        self, in_channels, out_channels,
+        num_heads=4, keep_ratio=0.3, min_keeps=8,
+        win_size=7
+    ):
         super().__init__()
         self.attn = UniformWindowAttention(
             channels=in_channels,
@@ -109,8 +104,10 @@ class _HIPASingle(nn.Module):
         self.proj = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x):
+        # 对齐 dtype（AMP 安全）
         target_dtype = self.proj.weight.dtype if isinstance(self.proj, nn.Conv2d) else x.dtype
         x = x.to(target_dtype)
+
         out_attn = self.attn(x)
         return self.proj(x + out_attn)
 
@@ -118,8 +115,11 @@ class _HIPASingle(nn.Module):
 class HIPA(nn.Module):
     """HIPA 模块（YOLO 接口，n 占位）"""
 
-    def __init__(self, c1, c2, n=1,
-                 num_heads=4, keep_ratio=0.25, min_keeps=4, win_size=7):
+    def __init__(
+        self, c1, c2, n=1,
+        num_heads=4, keep_ratio=0.3, min_keeps=8,
+        win_size=7
+    ):
         super().__init__()
         self.n = n
         blocks = []
