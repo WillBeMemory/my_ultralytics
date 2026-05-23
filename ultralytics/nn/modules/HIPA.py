@@ -117,8 +117,8 @@ class HIPA(nn.Module):
 
     def __init__(
         self, c1, c2, n=1,
-        num_heads=4, keep_ratio=0.3, min_keeps=8,
-        win_size=7
+        num_heads=4, keep_ratio=0.25, min_keeps=4,
+        win_size=4
     ):
         super().__init__()
         self.n = n
