@@ -1,42 +1,45 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ultralytics.nn.modules.block import Conv  # YOLO 标准卷积块
+from ultralytics.nn.modules.block import Conv
 
 
-# ================== 统一窗口注意力（添加 DWConv 位置编码） ==================
-class UniformWindowAttention(nn.Module):
+class SparseGlobalAttention(nn.Module):
     """
-    统一窗口尺寸的稀疏注意力 + 深度可分离位置编码
+    稀疏区域全局注意力
 
-    以 Top‑K 高响应位置为中心，固定裁剪 win_size×win_size 的窗口，
-    在窗口内进行多头自注意力，最终散射回空间图。
-    窗口提取后、展平前通过 3×3 DWConv 注入空间位置信息。
+    1. 基于 L2 范数选择 Top‑K 高响应位置。
+    2. 以每个位置为中心，固定裁剪 win_size×win_size 的窗口。
+    3. 收集所有窗口内的 token，附加位置编码（局部 + 窗口级）。
+    4. 在所有 token 组成的序列上执行一次全局多头自注意力。
+    5. 将增强后的中心 token 散射回空间图。
     """
 
-    def __init__(self, channels, num_heads=4, keep_ratio=0.3, min_keeps=8,
-                 win_size=7, use_pe=True):
+    def __init__(self, channels, num_heads=4, keep_ratio=0.3, min_keeps=8, win_size=7):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
         self.keep_ratio = keep_ratio
         self.min_keeps = min_keeps
         self.win_size = win_size
-        self.use_pe = use_pe
 
+        # 全局多头自注意力
         self.attn = nn.MultiheadAttention(
             embed_dim=channels, num_heads=num_heads, dropout=0.0, batch_first=True
         )
-        # 简单可学习绝对位置嵌入（保留，与 DWConv PE 互补）
-        self.pos_embed = nn.Parameter(torch.randn(1, win_size * win_size, channels) * 0.02)
-        self.norm = nn.LayerNorm(channels)
 
-        if self.use_pe:
-            # 3×3 深度可分离卷积作为位置编码，零初始化，残差连接
-            self.pe_conv = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False)
-            nn.init.zeros_(self.pe_conv.weight)   # 零初始化，让训练逐渐学习
-        else:
-            self.pe_conv = nn.Identity()
+        # 局部位置编码（窗口内相对位置）
+        self.local_pos = nn.Parameter(torch.randn(1, win_size * win_size, channels) * 0.02)
+
+        # 窗口级位置编码（由中心坐标生成）
+        self.win_pos_encoder = nn.Sequential(
+            nn.Linear(2, channels),
+            nn.SiLU(inplace=True),
+            nn.Linear(channels, channels),
+        )
+
+        # 输出 LayerNorm
+        self.norm = nn.LayerNorm(channels)
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -44,10 +47,10 @@ class UniformWindowAttention(nn.Module):
         dtype = x.dtype
         half = self.win_size // 2
 
-        # 1. 反射填充
+        # ---------- 1. 反射填充，确保窗口不越界 ----------
         x_padded = F.pad(x, (half, half, half, half), mode='reflect')
 
-        # 2. 重要性筛选 Top‑K
+        # ---------- 2. 重要性筛选 Top‑K ----------
         importance = torch.norm(x.flatten(2), p=2, dim=1)          # (B, H*W)
         N = H * W
         k = max(self.min_keeps, int(N * self.keep_ratio))
@@ -57,41 +60,50 @@ class UniformWindowAttention(nn.Module):
         y_coords = (topk_indices // W).long()
         x_coords = (topk_indices % W).long()
 
-        # 3. 批量提取固定窗口
+        # ---------- 3. 批量提取固定窗口 ----------
         dy = torch.arange(self.win_size, device=device).view(1, 1, -1, 1)   # (1,1,win_size,1)
         dx = torch.arange(self.win_size, device=device).view(1, 1, 1, -1)   # (1,1,1,win_size)
         y_idx = y_coords.unsqueeze(-1).unsqueeze(-1) + dy
         x_idx = x_coords.unsqueeze(-1).unsqueeze(-1) + dx
         b_idx = torch.arange(B, device=device).view(B, 1, 1, 1)
 
-        # (B, K, C, win_size, win_size)
+        # 提取窗口 (B, K, C, win_size, win_size)
         windows = x_padded[b_idx, :, y_idx, x_idx]
         windows = windows.permute(0, 1, 4, 2, 3)                     # (B, K, C, win_size, win_size)
         windows = windows.reshape(B * k, C, self.win_size, self.win_size)  # (B*K, C, win_size, win_size)
 
-        # 4. 深度可分离位置编码（残差连接）
-        if self.use_pe:
-            windows = windows + self.pe_conv(windows)
-
-        # 5. 展平为序列，做自注意力
+        # ---------- 4. 展平 token，附加位置编码 ----------
         L = self.win_size * self.win_size
-        window_seq = windows.flatten(2).permute(0, 2, 1)              # (B*K, L, C)
-        pos_embed = self.pos_embed[:, :L, :].to(dtype)
-        window_seq = window_seq + pos_embed
+        tokens = windows.flatten(2).permute(0, 2, 1)                 # (B*K, L, C)
 
-        attn_out, _ = self.attn(window_seq, window_seq, window_seq)
-        attn_out = self.norm(window_seq + attn_out)
+        # 局部位置编码
+        local_pos = self.local_pos[:, :L, :].to(dtype)
+        tokens = tokens + local_pos
 
-        # 6. 聚合为中心 token
+        # 窗口级位置编码
+        cx = x_coords.float() / W   # 归一化到 [0,1]
+        cy = y_coords.float() / H
+        win_coords = torch.stack([cx, cy], dim=-1)                   # (B, K, 2)
+        win_pos = self.win_pos_encoder(win_coords.to(dtype))         # (B, K, C)
+        # 扩展并加到每个窗口的所有 token 上
+        tokens = tokens.reshape(B, k, L, C)
+        tokens = tokens + win_pos.unsqueeze(2)                       # (B, K, L, C)
+        tokens = tokens.flatten(1, 2)                                 # (B, K*L, C)
+
+        # ---------- 5. 全局自注意力 ----------
+        attn_out, _ = self.attn(tokens, tokens, tokens)              # (B, K*L, C)
+        attn_out = self.norm(tokens + attn_out)                      # 残差 + 归一化
+
+        # ---------- 6. 聚合为中心 token ----------
+        attn_out = attn_out.reshape(B, k, L, C)                      # (B, K, L, C)
         center_idx = L // 2
-        enhanced_token = attn_out[:, center_idx, :]                   # (B*K, C)
-        enhanced_token = enhanced_token.reshape(B, k, C)              # (B, k, C)
+        enhanced_token = attn_out[:, :, center_idx, :]               # (B, K, C)
 
-        # 7. 散射回空间图
+        # ---------- 7. 散射回空间图 ----------
         out = torch.zeros(B, C, H, W, device=device, dtype=dtype)
         cx_pix = x_coords
         cy_pix = y_coords
-        index = (cy_pix * W + cx_pix)                                # (B, k)
+        index = (cy_pix * W + cx_pix)                                # (B, K)
         index = index.unsqueeze(1).expand(B, C, k)                   # (B, C, k)
         src = enhanced_token.permute(0, 2, 1).to(dtype)              # (B, C, k)
         out = out.flatten(2).scatter_(2, index, src).view(B, C, H, W)
@@ -99,74 +111,47 @@ class UniformWindowAttention(nn.Module):
         return out
 
 
-# ================== 单层 HIPA（CSP 结构） ==================
 class _HIPASingle(nn.Module):
-    """
-    采用 CSP 结构的 HIPA 单层：
-    - cv1 压缩至 2*c（c = int(c2 * e)）
-    - 分流 a (恒等) 与 b (窗口注意力增强)
-    - cv2 融合输出
-    若 c1 == c2，额外添加全局残差连接（可选）。
-    """
+    """采用 CSP 结构的单层 HIPA（稀疏区域全局注意力版）"""
 
     def __init__(
         self, c1, c2, e=0.5, num_heads=4, keep_ratio=0.3, min_keeps=8,
-        win_size=7, use_pe=True, shortcut=True
+        win_size=7, shortcut=True
     ):
         super().__init__()
-        self.c = int(c2 * e)                # CSP 隐藏通道
-        self.cv1 = Conv(c1, 2 * self.c, 1)  # 1x1 压缩
-        self.cv2 = Conv(2 * self.c, c2, 1)  # 1x1 融合
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1)
+        self.cv2 = Conv(2 * self.c, c2, 1)
 
-        # 窗口注意力作用于 b 分支（self.c 通道）
-        self.attn = UniformWindowAttention(
+        self.attn = SparseGlobalAttention(
             channels=self.c,
             num_heads=num_heads,
             keep_ratio=keep_ratio,
             min_keeps=min_keeps,
-            win_size=win_size,
-            use_pe=use_pe
+            win_size=win_size
         )
 
-        # 是否添加全局残差连接（要求 c1 == c2）
         self.shortcut = shortcut and c1 == c2
 
     def forward(self, x):
-        # 对齐 dtype（AMP 安全）
         target_dtype = self.cv1.conv.weight.dtype
         x = x.to(target_dtype)
 
-        # 1. CSP 分流
         a, b = self.cv1(x).split((self.c, self.c), dim=1)
-
-        # 2. b 分支经过窗口注意力（保持通道数不变）
-        b = b + self.attn(b)                # 残差连接
-
-        # 3. 拼接并融合
+        b = b + self.attn(b)                     # 残差连接
         out = self.cv2(torch.cat([a, b], dim=1))
 
-        # 4. 可选全局残差
         if self.shortcut:
             out = out + x
         return out
 
 
-# ================== HIPA 顶层模块 ==================
 class HIPA(nn.Module):
-    """
-    HIPA 模块（YOLO 接口，支持 CSP + 深度可分离位置编码）
+    """HIPA 模块（YOLO 接口，CSP + 稀疏区域全局注意力）"""
 
-    参数:
-        c1, c2 : 输入/输出通道
-        n      : 重复次数（占位，默认为 1）
-        e      : CSP 压缩比
-        num_heads, keep_ratio, min_keeps, win_size : 窗口注意力参数
-        use_pe : 是否启用 DWConv 位置编码
-        shortcut: 是否添加全局残差连接
-    """
     def __init__(
-        self, c1, c2, n=1, e=0.5, num_heads=4, keep_ratio=0.5,
-        min_keeps=4, win_size=7, use_pe=True, shortcut=True
+        self, c1, c2, n=1, e=0.5, num_heads=4, keep_ratio=0.3,
+        min_keeps=8, win_size=7, shortcut=True
     ):
         super().__init__()
         self.n = n
@@ -179,7 +164,6 @@ class HIPA(nn.Module):
                 keep_ratio=keep_ratio,
                 min_keeps=min_keeps,
                 win_size=win_size,
-                use_pe=use_pe,
                 shortcut=shortcut
             ))
         self.blocks = nn.ModuleList(blocks)
@@ -195,12 +179,10 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    # 模拟 P5 特征图
     x = torch.randn(2, 256, 20, 20).to(device)
 
-    # 实例化 HIPA（CSP + PE）
     model = HIPA(256, 256, n=1, e=0.5, keep_ratio=0.3, min_keeps=4,
-                 num_heads=4, win_size=7, use_pe=True, shortcut=True).to(device)
+                 num_heads=4, win_size=7, shortcut=True).to(device)
     y = model(x)
     print(f"Input: {x.shape}  Output: {y.shape}")
 
