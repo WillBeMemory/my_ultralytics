@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from typing import List
 
 
 class SparseSelfAttention(nn.Module):
@@ -34,7 +32,10 @@ class SparseSelfAttention(nn.Module):
 
 class HIPABlock(nn.Module):
     """
-    基于局部极差 + 贪婪无重叠窗口合并的 HIPA 核心
+    高效 HIPA 核心：局部极差选点 + 固定窗口扩张（向量化）
+    1. 计算局部极差，top‑k 选取高响应像素。
+    2. 以每个选中点为中心生成 win_size × win_size 窗口，收集所有窗口内像素坐标并去重。
+    3. 提取去重像素特征，投影，输出 token 序列、坐标和初始散射图。
     """
     def __init__(
         self,
@@ -43,8 +44,7 @@ class HIPABlock(nn.Module):
         keep_ratio=0.3,
         min_keeps=8,
         local_range_kernel=3,
-        allowed_sizes=(7, 5, 3, 1),
-        min_pts_in_window=2,
+        win_size=7,               # 窗口扩张大小
         fill_mode='center',
     ):
         super().__init__()
@@ -53,18 +53,15 @@ class HIPABlock(nn.Module):
         self.keep_ratio = keep_ratio
         self.min_keeps = min_keeps
         self.local_range_kernel = local_range_kernel
-        self.allowed_sizes = allowed_sizes
-        self.min_pts_in_window = min_pts_in_window
+        self.win_size = win_size
         self.fill_mode = fill_mode
 
         self.proj = nn.Sequential(
             nn.LayerNorm(in_channels),
             nn.Linear(in_channels, out_channels)
         )
-
         if fill_mode == 'conv_smooth':
-            self.smooth_conv = nn.Conv2d(out_channels, out_channels, 3,
-                                         padding=1, groups=out_channels, bias=False)
+            self.smooth_conv = nn.Conv2d(out_channels, out_channels, 3, padding=1, groups=out_channels, bias=False)
         else:
             self.smooth_conv = None
 
@@ -73,57 +70,6 @@ class HIPABlock(nn.Module):
         max_val = F.max_pool2d(feat, k, stride=1, padding=k // 2)
         min_val = -F.max_pool2d(-feat, k, stride=1, padding=k // 2)
         return (max_val - min_val).mean(dim=1)   # (B, H, W)
-
-    @staticmethod
-    def _greedy_windows_for_sample(indices, H, W, allowed_sizes, min_pts):
-        """单张图的贪婪窗口放置"""
-        k = indices.shape[0]
-        if k == 0:
-            return []
-
-        ys = (indices // W).cpu().numpy()
-        xs = (indices % W).cpu().numpy()
-        uncovered = set((y, x) for y, x in zip(ys, xs))
-        covered = np.zeros((H, W), dtype=bool)
-        windows = []
-
-        for size in allowed_sizes:
-            if size == 1:
-                continue
-            half = size // 2
-            while True:
-                best_win = None
-                best_count = 0
-                for y, x in list(uncovered):
-                    y1 = max(0, y - half)
-                    x1 = max(0, x - half)
-                    y2 = min(H - 1, y + half)
-                    x2 = min(W - 1, x + half)
-                    if np.any(covered[y1:y2+1, x1:x2+1]):
-                        continue
-                    cnt = 0
-                    for dy in range(y1, y2 + 1):
-                        for dx in range(x1, x2 + 1):
-                            if (dy, dx) in uncovered:
-                                cnt += 1
-                    if cnt >= min_pts and cnt > best_count:
-                        best_count = cnt
-                        best_win = (y1, x1, y2, x2)
-                if best_win is None:
-                    break
-                y1, x1, y2, x2 = best_win
-                for dy in range(y1, y2 + 1):
-                    for dx in range(x1, x2 + 1):
-                        uncovered.discard((dy, dx))
-                covered[y1:y2+1, x1:x2+1] = True
-                windows.append((y1, x1, y2, x2, size))
-
-        for y, x in uncovered:
-            if not covered[y, x]:
-                covered[y, x] = True
-                windows.append((y, x, y, x, 1))
-
-        return windows
 
     def _fill_2d_center(self, features, coords, H, W):
         """将特征放置在网格中心点（coords 已归一化）"""
@@ -141,48 +87,65 @@ class HIPABlock(nn.Module):
         device = x.device
 
         # 1. 局部极差 + top‑k 选点
-        range_map = self.compute_local_range(x)
+        range_map = self.compute_local_range(x)      # (B, H, W)
         N = H * W
-        flat_range = range_map.flatten(1)
+        flat_range = range_map.flatten(1)            # (B, N)
         k = max(self.min_keeps, int(N * self.keep_ratio))
         k = min(k, N)
         _, topk_idx = torch.topk(flat_range, k=k, dim=-1)   # (B, k)
 
-        # 2. 逐样本生成窗口并收集像素
+        # 2. 向量化窗口扩张并去重 (逐样本 GPU 操作)
+        half = self.win_size // 2
+        # 创建相对偏移
+        dy, dx = torch.meshgrid(
+            torch.arange(-half, half + 1, device=device, dtype=torch.long),
+            torch.arange(-half, half + 1, device=device, dtype=torch.long),
+            indexing='ij'
+        )  # (win_size, win_size)
+        dy = dy.reshape(1, 1, -1)  # (1, 1, win^2)
+        dx = dx.reshape(1, 1, -1)
+
         token_list = []
         coord_list = []
         out_sparse = torch.zeros(B, self.out_channels, H, W, device=device, dtype=x.dtype)
 
         for b in range(B):
-            idx_b = topk_idx[b]
-            windows = self._greedy_windows_for_sample(idx_b, H, W,
-                                                       self.allowed_sizes,
-                                                       self.min_pts_in_window)
-            # 收集该样本所有窗口内的像素坐标
-            pixels = set()
-            for y1, x1, y2, x2, _ in windows:
-                for dy in range(y1, y2 + 1):
-                    for dx in range(x1, x2 + 1):
-                        pixels.add((dy, dx))
+            idx = topk_idx[b]           # (k,)
+            yc = idx // W               # (k,)
+            xc = idx % W                # (k,)
 
-            if not pixels:
+            # 绝对坐标 (k, win^2)
+            y_abs = yc.unsqueeze(1) + dy   # (k, win^2)
+            x_abs = xc.unsqueeze(1) + dx
+            y_abs = y_abs.clamp(0, H - 1)
+            x_abs = x_abs.clamp(0, W - 1)
+
+            # 展平并拼接为 (k*win^2, 2)
+            y_flat = y_abs.reshape(-1)
+            x_flat = x_abs.reshape(-1)
+            coords_flat = torch.stack([y_flat, x_flat], dim=-1)   # (M, 2)
+
+            # 去重
+            coords_unique = torch.unique(coords_flat, dim=0)      # (M_unique, 2)
+            M = coords_unique.shape[0]
+
+            if M == 0:
                 token_list.append(torch.empty(0, self.out_channels, device=device))
                 coord_list.append(torch.empty(0, 2, dtype=torch.long, device=device))
                 continue
 
-            coords_t = torch.tensor(list(pixels), dtype=torch.long, device=device)  # (M, 2)
-            # 修正：索引后转置，确保形状为 (M, C)
-            feats = x[b, :, coords_t[:, 0], coords_t[:, 1]].transpose(0, 1)  # (M, C)
-            feats_proj = self.proj(feats)                                     # (M, out_channels)
+            # 提取特征 (M, C)
+            feats = x[b, :, coords_unique[:, 0], coords_unique[:, 1]].transpose(0, 1)  # (M, C)
+            feats_proj = self.proj(feats)   # (M, out_channels)
             token_list.append(feats_proj)
-            coord_list.append(coords_t)
+            coord_list.append(coords_unique)
 
-            # 生成初始散射图（用于残差）
-            cx = (coords_t[:, 1].float() + 0.5) / W
-            cy = (coords_t[:, 0].float() + 0.5) / H
-            w_coord = torch.full((coords_t.shape[0],), 1.0 / W, device=device)
-            h_coord = torch.full((coords_t.shape[0],), 1.0 / H, device=device)
-            norm_coords = torch.stack([cx, cy, w_coord, h_coord], dim=-1).unsqueeze(0)  # (1, M, 4)
+            # 初始散射图（用于残差）
+            cx = (coords_unique[:, 1].float() + 0.5) / W
+            cy = (coords_unique[:, 0].float() + 0.5) / H
+            w = torch.full((M,), 1.0 / W, device=device)
+            h = torch.full((M,), 1.0 / H, device=device)
+            norm_coords = torch.stack([cx, cy, w, h], dim=-1).unsqueeze(0)  # (1, M, 4)
             out_sparse[b] = self._fill_2d_center(feats_proj.unsqueeze(0), norm_coords, H, W)
 
         sparsity = torch.tensor(sum(t.shape[0] for t in token_list) / (B * N), device=device)
@@ -190,23 +153,18 @@ class HIPABlock(nn.Module):
 
 
 class _HIPASingle(nn.Module):
-    """单层 HIPA 封装：稀疏图 + 逐样本自注意力 + 残差"""
+    """单层 HIPA：稀疏图 + 逐样本自注意力 + 残差"""
     def __init__(self, in_channels, out_channels,
-                 keep_ratio=0.3, min_keeps=8,
-                 num_heads=8, fill_mode='center',
-                 use_self_attn=True,
-                 local_range_kernel=3,
-                 allowed_sizes=(7,5,3,1),
-                 min_pts_in_window=2):
+                 keep_ratio=0.3, min_keeps=8, num_heads=8,
+                 win_size=7, fill_mode='center', use_self_attn=True,
+                 local_range_kernel=3):
         super().__init__()
         self.use_self_attn = use_self_attn
         self.hipa = HIPABlock(
             in_channels=in_channels, out_channels=out_channels,
             keep_ratio=keep_ratio, min_keeps=min_keeps,
             local_range_kernel=local_range_kernel,
-            allowed_sizes=allowed_sizes,
-            min_pts_in_window=min_pts_in_window,
-            fill_mode=fill_mode
+            win_size=win_size, fill_mode=fill_mode
         )
         self.attn = SparseSelfAttention(out_channels, num_heads) if use_self_attn else nn.Identity()
         self.residual_proj = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
@@ -221,7 +179,7 @@ class _HIPASingle(nn.Module):
             B, _, H, W = x.shape
             new_out = torch.zeros_like(out_sparse)
             for b in range(B):
-                tokens = token_list[b]          # (M, out_channels)
+                tokens = token_list[b]          # (M, C)
                 if tokens.shape[0] == 0:
                     continue
                 seq = tokens.unsqueeze(0)       # (1, M, C)
@@ -240,13 +198,9 @@ class _HIPASingle(nn.Module):
 
 class HIPA(nn.Module):
     """YOLO 接口的 HIPA 模块"""
-    def __init__(self, c1, c2, n=1,
-                 keep_ratio=0.3, min_keeps=8,
-                 num_heads=8, fill_mode='center',
-                 use_self_attn=True,
-                 local_range_kernel=3,
-                 allowed_sizes=(7,5,3,1),
-                 min_pts_in_window=2):
+    def __init__(self, c1, c2, n=1, keep_ratio=0.3, min_keeps=8,
+                 num_heads=8, win_size=7, fill_mode='center',
+                 use_self_attn=True, local_range_kernel=3):
         super().__init__()
         self.n = n
         blocks = []
@@ -255,11 +209,9 @@ class HIPA(nn.Module):
             blocks.append(_HIPASingle(
                 in_channels=in_ch, out_channels=c2,
                 keep_ratio=keep_ratio, min_keeps=min_keeps,
-                num_heads=num_heads, fill_mode=fill_mode,
-                use_self_attn=use_self_attn,
-                local_range_kernel=local_range_kernel,
-                allowed_sizes=allowed_sizes,
-                min_pts_in_window=min_pts_in_window
+                num_heads=num_heads, win_size=win_size,
+                fill_mode=fill_mode, use_self_attn=use_self_attn,
+                local_range_kernel=local_range_kernel
             ))
         self.blocks = nn.ModuleList(blocks)
 
@@ -269,11 +221,12 @@ class HIPA(nn.Module):
         return x
 
 
+# 测试
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     x = torch.randn(2, 256, 20, 20).to(device)
     model = HIPA(256, 512, n=1, keep_ratio=0.3, min_keeps=4,
-                 allowed_sizes=(7,5,3,1), min_pts_in_window=2).to(device)
+                 win_size=7, use_self_attn=True).to(device)
     y = model(x)
     print(f"Output shape: {y.shape}")
     loss = y.sum()
