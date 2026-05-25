@@ -64,6 +64,7 @@ from ultralytics.nn.modules.AddModules.EFC_FPN import EFC_FPN
 from ultralytics.nn.modules.AddModules.PRN_ import PRN
 from ultralytics.nn.modules.AddModules.GoldNeck_P234 import GoldNeck_P234
 from ultralytics.nn.modules.AddModules.EFCFusion import EFCFusion
+from ultralytics.nn.modules.AddModules.C3k2_Sparse import C3k2_Sparse
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1680,6 +1681,7 @@ def parse_model(d, ch, verbose=True):
             ChannelAwareEdgeEnhance,
             SoftFillEdgeEnhance,
             LogWaveletDenoise,
+            C3k2_Sparse,
 
             Classify,
             Conv,
@@ -1758,6 +1760,7 @@ def parse_model(d, ch, verbose=True):
             ChannelGateSepConv,
             ChannelAwareEdgeEnhance,
             SoftFillEdgeEnhance,
+            C3k2_Sparse,
 
             BottleneckCSP,
             C1,
