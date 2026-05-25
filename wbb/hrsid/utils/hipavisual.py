@@ -1,43 +1,38 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image, ImageDraw
-import matplotlib.pyplot as plt
 from ultralytics import YOLO
 import os
-import random
 
-# ===================== 配置参数（已使用你的路径） =====================
-# 模型路径（任选一个，可自行切换）
+# ===================== 配置参数 =====================
 MODEL_PATH = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\pt\yolo11s-test-44729c-5090d.pt"
-# MODEL_PATH = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\pt\yolo11n-t10.pt"
-
-# 数据集根目录（用于读取图片和标签）
-DATASET_ROOT = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\datasets\HRSID_YOLO"
+DATASET_ROOT = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\datasets\HRSID_COMPLEX"
 TRAIN_IMG_DIR = os.path.join(DATASET_ROOT, "images", "train")
 TRAIN_LABEL_DIR = os.path.join(DATASET_ROOT, "labels", "train")
+OUTPUT_DIR = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\simulate\hipa_level_vis"
 
-# 输出目录
-OUTPUT_DIR = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\simulate\hipa_visualization"
-
-# 图像处理参数
 IMG_SIZE = 640
-NUM_SAMPLES = 50                # 随机抽取几张图可视化
-MODE = 'random'                # 'random' 或 'first'
+MAX_IMAGES = 200                    # 处理前200张图片
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# 模型层索引（P5特征图所在层，需根据你的模型结构调整）
-LAYER_IDX = 5                  # yolo11s 中 model.model[5] 通常是 20x20 特征图
-# 若使用模块名（优先级更高），可填写例如 "model.5"，否则留空
-LAYER_NAME = ""
+LAYER_IDX = 5                       # P5 特征图所在层
 
-# HIPA 超参数
-KEEP_RATIO = 0.0618
-MIN_KEEPS = 0
-WIN_SIZE = 3
-# ===================================================================
+# top‑k 保留参数
+KEEP_RATIO = 0.3                    # 保留比例
+MIN_KEEPS = 4                       # 最少保留网格数
+
+# 局部极差窗口大小
+LOCAL_RANGE_KERNEL = 3              # 窗口大小（通常为奇数）
+
+# 可视化颜色
+HIPA_COLOR = (255, 0, 0)            # 选中网格框（红色）
+GT_COLOR = (0, 255, 0)              # 真实目标框（亮绿）
+# ===================================================
 
 
 def load_yolo_labels(label_path):
-    """读取 YOLO 格式标签，返回归一化的 (cx, cy, w, h) 列表"""
+    """读取 YOLO 格式标签，返回归一化 (cx, cy, w, h) 列表"""
     targets = []
     if not os.path.exists(label_path):
         return targets
@@ -46,93 +41,90 @@ def load_yolo_labels(label_path):
             parts = line.strip().split()
             if len(parts) < 5:
                 continue
-            cls, cx, cy, w, h = map(float, parts)
+            _, cx, cy, w, h = map(float, parts)
             targets.append((cx, cy, w, h))
     return targets
 
 
-def get_hipa_high_response(feat_map, keep_ratio=0.3, min_keeps=8, win_size=7):
-    """根据 HIPA 逻辑提取高响应中心点和窗口"""
-    B, C, H, W = feat_map.shape
-    half = win_size // 2
+def compute_local_range(feat, kernel_size=3):
+    """
+    计算特征图每个空间位置的局部极差（max - min），沿通道取平均。
+    feat: (1, C, H, W)
+    返回: (1, H, W) 局部极差图
+    """
+    # 局部最大值池化
+    max_val = F.max_pool2d(feat, kernel_size, stride=1, padding=kernel_size // 2)
+    # 局部最小值池化（用负输入的最大池化技巧）
+    min_val = -F.max_pool2d(-feat, kernel_size, stride=1, padding=kernel_size // 2)
+    # 极差，沿通道平均得到单通道响应图
+    range_val = (max_val - min_val).mean(dim=1)   # (1, H, W)
+    return range_val
 
-    importance = torch.norm(feat_map.flatten(2), p=2, dim=1)  # (1, H*W)
+
+def select_topk_from_map(scores, keep_ratio, min_keeps, H, W):
+    """
+    从分数图 (1, H, W) 中选取 top‑k 网格，返回归一化坐标 (1, K, 4)
+    """
     N = H * W
+    scores_flat = scores.flatten(1)                         # (1, N)
+
     k = max(min_keeps, int(N * keep_ratio))
     k = min(k, N)
-    _, topk_idx = torch.topk(importance, k, dim=1)
+    topk_idx = torch.topk(scores_flat, k=k, dim=-1)[1]      # (1, k)
 
-    y_c = (topk_idx // W).long()
-    x_c = (topk_idx % W).long()
-    centers = torch.stack([y_c, x_c], dim=-1).squeeze(0).cpu().numpy()
+    y_idx = topk_idx // W   # (1, k)
+    x_idx = topk_idx % W    # (1, k)
 
-    y1 = (y_c - half).clamp(0, H - 1)
-    x1 = (x_c - half).clamp(0, W - 1)
-    y2 = (y_c + half).clamp(0, H - 1)
-    x2 = (x_c + half).clamp(0, W - 1)
-    windows = torch.stack([y1, x1, y2, x2], dim=-1).squeeze(0).cpu().numpy()
+    grid_h = 1.0 / H
+    grid_w = 1.0 / W
+    cx = (x_idx.float() + 0.5) * grid_w
+    cy = (y_idx.float() + 0.5) * grid_h
+    w = torch.full_like(cx, grid_w)
+    h = torch.full_like(cy, grid_h)
 
-    return centers, windows
+    boxes = torch.stack([cx, cy, w, h], dim=-1)   # (1, k, 4)
+    return boxes
 
 
-def draw_hipa_and_gt(image_pil, centers, windows, gt_boxes, feat_H, feat_W, img_size):
-    """在图像上绘制 HIPA 窗口/中心点 和 GT 框"""
+def draw_results(image_pil, selected_boxes, gt_boxes, img_size):
+    """绘制 GT 框（绿色）和局部极差高响应框（红色）"""
     draw_img = image_pil.copy()
     draw = ImageDraw.Draw(draw_img)
+    W_img, H_img = img_size, img_size
 
-    scale_y = img_size / feat_H
-    scale_x = img_size / feat_W
-
-    # 绘制 GT 框（绿色）
     for cx, cy, w, h in gt_boxes:
-        x1 = (cx - w/2) * img_size
-        y1 = (cy - h/2) * img_size
-        x2 = (cx + w/2) * img_size
-        y2 = (cy + h/2) * img_size
-        draw.rectangle([x1, y1, x2, y2], outline='lime', width=2)
+        x1 = (cx - w/2) * W_img
+        y1 = (cy - h/2) * H_img
+        x2 = (cx + w/2) * W_img
+        y2 = (cy + h/2) * H_img
+        draw.rectangle([x1, y1, x2, y2], outline=GT_COLOR, width=3)
 
-    # 绘制窗口（蓝色）
-    for y1, x1, y2, x2 in windows:
-        rect = [x1 * scale_x, y1 * scale_y, (x2 + 1) * scale_x, (y2 + 1) * scale_y]
-        draw.rectangle(rect, outline='blue', width=2)
-
-    # 绘制中心点（红色实心圆）
-    for y, x in centers:
-        cx = x * scale_x
-        cy = y * scale_y
-        r = 4
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill='red', outline='red')
-
+    if selected_boxes.shape[1] > 0:
+        boxes_np = selected_boxes.squeeze(0).cpu().numpy()
+        for bbox in boxes_np:
+            cx, cy, w, h = bbox
+            x1 = (cx - w/2) * W_img
+            y1 = (cy - h/2) * H_img
+            x2 = (cx + w/2) * W_img
+            y2 = (cy + h/2) * H_img
+            draw.rectangle([x1, y1, x2, y2], outline=HIPA_COLOR, width=2)
     return draw_img
 
 
 def main():
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
+    print(f"Using device: {DEVICE}")
 
-    # 加载模型
     yolo = YOLO(MODEL_PATH, verbose=False)
     model = yolo.model
     model.eval()
-    model.to(device)
+    model.to(DEVICE)
 
-    # 定位目标层
-    target_layer = None
-    if LAYER_NAME:
-        for name, module in model.named_modules():
-            if name == LAYER_NAME:
-                target_layer = module
-                break
-        if target_layer is None:
-            raise ValueError(f"Layer '{LAYER_NAME}' not found.")
-    else:
-        try:
-            target_layer = model.model[LAYER_IDX]
-        except IndexError:
-            raise ValueError(f"Layer index {LAYER_IDX} out of range. model.model has {len(model.model)} layers.")
+    try:
+        target_layer = model.model[LAYER_IDX]
+    except IndexError:
+        raise ValueError(f"Layer index {LAYER_IDX} out of range. model.model has {len(model.model)} layers.")
 
     feat_container = []
-
     def hook_fn(module, input, output):
         if isinstance(output, (list, tuple)):
             feat = output[0].detach()
@@ -143,58 +135,53 @@ def main():
 
     hook = target_layer.register_forward_hook(hook_fn)
 
-    # 收集待处理图像
-    all_imgs = [f for f in os.listdir(TRAIN_IMG_DIR) if f.lower().endswith(('.jpg', '.png', '.jpeg', '.bmp'))]
-    if MODE == 'first':
-        selected_imgs = all_imgs[:min(NUM_SAMPLES, len(all_imgs))]
-    elif MODE == 'random':
-        selected_imgs = random.sample(all_imgs, min(NUM_SAMPLES, len(all_imgs)))
-    else:
-        raise ValueError(f"Unknown mode: {MODE}. Use 'random' or 'first'.")
+    all_imgs = sorted([f for f in os.listdir(TRAIN_IMG_DIR)
+                       if f.lower().endswith(('.jpg', '.png', '.jpeg', '.bmp'))])
+    selected_imgs = all_imgs[:min(MAX_IMAGES, len(all_imgs))]
+    print(f"Total images: {len(all_imgs)}, processing first {len(selected_imgs)}")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     for img_name in selected_imgs:
         img_path = os.path.join(TRAIN_IMG_DIR, img_name)
         label_path = os.path.join(TRAIN_LABEL_DIR, os.path.splitext(img_name)[0] + '.txt')
+        print(f"Processing {img_path} ...")
 
-        print(f"Processing: {img_path}")
         img = Image.open(img_path).convert('RGB')
         img_resized = img.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
-        img_tensor = torch.from_numpy(np.array(img_resized) / 255.0).permute(2, 0, 1).unsqueeze(0).float().to(device)
+        img_tensor = torch.from_numpy(np.array(img_resized)/255.0).permute(2,0,1).unsqueeze(0).float().to(DEVICE)
 
-        # 加载 GT 框
         gt_boxes = load_yolo_labels(label_path)
 
-        # 前向推理，捕获特征图
         feat_container.clear()
         with torch.no_grad():
             _ = model(img_tensor)
 
         if not feat_container:
-            print(f"  Warning: no feature map captured. Check layer index/name.")
+            print(f"  未捕获到特征图，跳过 {img_name}")
             continue
 
-        p5_feat = feat_container[0]
-        _, C, H, W = p5_feat.shape
-        print(f"  Feature shape: {p5_feat.shape}")
+        p5_feat = feat_container[0]   # (1, C, H, W)
+        H, W = p5_feat.shape[2:]
+        print(f"  P5 特征图形状: {p5_feat.shape}")
 
-        centers, windows = get_hipa_high_response(
-            p5_feat,
-            keep_ratio=KEEP_RATIO,
-            min_keeps=MIN_KEEPS,
-            win_size=WIN_SIZE
-        )
-        print(f"  Selected {len(centers)} high‑response centers.")
+        # 计算局部极差
+        range_map = compute_local_range(p5_feat, kernel_size=LOCAL_RANGE_KERNEL)
 
-        result_img = draw_hipa_and_gt(img_resized, centers, windows, gt_boxes, H, W, IMG_SIZE)
+        # 选取 top‑k 网格
+        selected_boxes = select_topk_from_map(range_map, KEEP_RATIO, MIN_KEEPS, H, W)
+
+        k = selected_boxes.shape[1]
+        print(f"  局部极差 top‑k 网格数: {k}，GT 框数: {len(gt_boxes)}")
+
+        result_img = draw_results(img_resized, selected_boxes, gt_boxes, IMG_SIZE)
         base_name = os.path.splitext(img_name)[0]
-        save_path = os.path.join(OUTPUT_DIR, f"{base_name}_hipa.png")
+        save_path = os.path.join(OUTPUT_DIR, f"{base_name}_localrange_topk.png")
         result_img.save(save_path)
-        print(f"  Saved to {save_path}")
+        print(f"  保存至 {save_path}")
 
     hook.remove()
-    print("All done.")
+    print("全部完成。")
 
 
 if __name__ == "__main__":
