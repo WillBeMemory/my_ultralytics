@@ -106,12 +106,13 @@ class LogWaveletDenoise(nn.Module):
         x = x.float()  # 强制 float32 以保证数值稳定
         x_log = torch.log(torch.clamp(x, min=1e-6))
         rec_log = self._multilevel_denoise(x_log)
-        out = torch.exp(rec_log)
+        out = torch.exp(rec_log)  # 此时 out 为 float32
 
+        # 下采样分支（在恢复 dtype 之前执行，确保输入与权重类型一致）
         if self.downsample:
             out = self.down_act(self.down_bn(self.down_conv(out)))
 
-        # 恢复原始数据类型（兼容 float16）
+        # 最后恢复原始数据类型（兼容 float16）
         out = out.to(orig_dtype)
         return out
 
