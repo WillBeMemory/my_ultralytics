@@ -100,12 +100,17 @@ class LogWaveletDenoise(nn.Module):
 
     def forward(self, x):
         orig_dtype = x.dtype
-        # 强制禁用混合精度，内部全部 float32
+        # 1. 小波变换全程在 float32 下运行
         with torch.amp.autocast('cuda', enabled=False):
             x = x.float()
             x_log = torch.log(torch.clamp(x, min=1e-6))
             rec_log = self._multilevel_denoise(x_log)
-            out = torch.exp(rec_log)
+            out = torch.exp(rec_log)  # float32
+
+            # 2. 下采样分支：将输出转为权重类型（通常是 half），避免类型不匹配
             if self.downsample:
+                out = out.to(self.down_conv.weight.dtype)
                 out = self.down_act(self.down_bn(self.down_conv(out)))
+
+        # 3. 最终输出与原始输入类型一致
         return out.to(orig_dtype)
