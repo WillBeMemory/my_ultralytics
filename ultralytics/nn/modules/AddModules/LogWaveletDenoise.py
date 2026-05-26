@@ -103,19 +103,18 @@ class LogWaveletDenoise(nn.Module):
 
     def forward(self, x):
         orig_dtype = x.dtype
-        x = x.float()  # 强制 float32 以保证数值稳定
-        x_log = torch.log(torch.clamp(x, min=1e-6))
-        rec_log = self._multilevel_denoise(x_log)
-        out = torch.exp(rec_log)  # 此时 out 为 float32
-
-        # 下采样分支（在恢复 dtype 之前执行，确保输入与权重类型一致）
-        if self.downsample:
-            out = self.down_act(self.down_bn(self.down_conv(out)))
-
-        # 最后恢复原始数据类型（兼容 float16）
+        # 强制使用 float32 进行小波变换和去噪（AMP 不会插手）
+        with torch.amp.autocast('cuda', enabled=False):
+            x = x.float()
+            x_log = torch.log(torch.clamp(x, min=1e-6))
+            rec_log = self._multilevel_denoise(x_log)
+            out = torch.exp(rec_log)
+            # 下采样分支（此时 out 必然是 float32，与权重类型一致）
+            if self.downsample:
+                out = self.down_act(self.down_bn(self.down_conv(out)))
+        # 恢复原始精度（通常是 float16）
         out = out.to(orig_dtype)
         return out
-
 
 # ========== 简单测试 ==========
 if __name__ == "__main__":
