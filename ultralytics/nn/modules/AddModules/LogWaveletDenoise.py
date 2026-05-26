@@ -47,25 +47,27 @@ class LogWaveletDenoise(nn.Module):
             self.down_bn = nn.BatchNorm2d(c2)
             self.down_act = nn.SiLU(inplace=True)
 
-    # ---------- 小波变换 ----------
+    # ---------- 小波变换核心（内部自动对齐 dtype） ----------
     def _dwt(self, x):
         B, C, H, W = x.shape
-        pad_len = self.dec_filters.shape[-1] // 2
+        dec_f = self.dec_filters.to(x.dtype)  # 关键：对齐滤波器与输入精度
+        pad_len = dec_f.shape[-1] // 2
         pad_h = (2 - H % 2) % 2
         pad_w = (2 - W % 2) % 2
         if pad_h > 0 or pad_w > 0:
             x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
         x = F.pad(x, (pad_len, pad_len, pad_len, pad_len), mode='reflect')
-        filters = self.dec_filters.repeat(C, 1, 1, 1)
+        filters = dec_f.repeat(C, 1, 1, 1)
         coeffs = F.conv2d(x, filters, stride=2, groups=C)
         coeffs = coeffs.view(B, C, 4, coeffs.shape[-2], coeffs.shape[-1])
         return coeffs[:, :, 0], coeffs[:, :, 1], coeffs[:, :, 2], coeffs[:, :, 3]
 
     def _idwt(self, LL, LH, HL, HH, out_h, out_w):
+        rec_f = self.rec_filters.to(LL.dtype)
         B, C, H, W = LL.shape
         coeffs = torch.stack([LL, LH, HL, HH], dim=2).reshape(B, C * 4, H, W)
-        pad_len = self.rec_filters.shape[-1] // 2
-        filters = self.rec_filters.repeat(C, 1, 1, 1)
+        pad_len = rec_f.shape[-1] // 2
+        filters = rec_f.repeat(C, 1, 1, 1)
         out = F.conv_transpose2d(coeffs, filters, stride=2, padding=pad_len, groups=C)
         return out[:, :, :out_h, :out_w]
 
@@ -86,7 +88,7 @@ class LogWaveletDenoise(nn.Module):
 
         for lvl in reversed(range(self.level)):
             LH, HL, HH, in_h, in_w = detail_coeffs[lvl]
-            # 关键修复：将阈值参数显式转为 float32，避免 model.half() 的影响
+            # 阈值也显式转为 float32
             tau_lh = F.softplus(self.log_thresh_LH[lvl].float())
             tau_hl = F.softplus(self.log_thresh_HL[lvl].float())
             tau_hh = F.softplus(self.log_thresh_HH[lvl].float())
@@ -98,7 +100,7 @@ class LogWaveletDenoise(nn.Module):
 
     def forward(self, x):
         orig_dtype = x.dtype
-        # 完全禁用 AMP，强制全程 float32
+        # 强制禁用混合精度，内部全部 float32
         with torch.amp.autocast('cuda', enabled=False):
             x = x.float()
             x_log = torch.log(torch.clamp(x, min=1e-6))
