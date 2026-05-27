@@ -4,6 +4,12 @@ import torch.nn.functional as F
 import math
 import pywt
 
+from ultralytics.nn.modules.SPDConv import SPDConv
+
+
+# 导入已有的 SPDConv 模块（请根据实际路径调整）
+  # 假设 SPDConv 类定义在 spdconv.py 中
+
 class LogWaveletDenoise(nn.Module):
     def __init__(self, c1, c2, level=1, downsample=True, kernel_size=3, wavelet='bior4.4'):
         super().__init__()
@@ -40,17 +46,17 @@ class LogWaveletDenoise(nn.Module):
             nn.Parameter(torch.full((1, c1, 1, 1), -2.0)) for _ in range(level)
         ])
 
-        # ---------- 下采样分支 ----------
+        # ---------- 下采样分支：使用 SPDConv ----------
         if self.downsample:
-            self.down_conv = nn.Conv2d(c1, c2, kernel_size, stride=2,
-                                       padding=kernel_size // 2, bias=False)
-            self.down_bn = nn.BatchNorm2d(c2)
-            self.down_act = nn.SiLU(inplace=True)
+            # SPDConv 替代原来的 Conv+BN+SiLU，s=2 执行无损下采样，内部包含激活和BN
+            self.spd_conv = SPDConv(c1, c2, k=kernel_size, s=2, act=True)
+        else:
+            self.spd_conv = nn.Identity()
 
     # ---------- 小波变换核心（内部自动对齐 dtype） ----------
     def _dwt(self, x):
         B, C, H, W = x.shape
-        dec_f = self.dec_filters.to(x.dtype)  # 关键：对齐滤波器与输入精度
+        dec_f = self.dec_filters.to(x.dtype)
         pad_len = dec_f.shape[-1] // 2
         pad_h = (2 - H % 2) % 2
         pad_w = (2 - W % 2) % 2
@@ -88,7 +94,6 @@ class LogWaveletDenoise(nn.Module):
 
         for lvl in reversed(range(self.level)):
             LH, HL, HH, in_h, in_w = detail_coeffs[lvl]
-            # 阈值也显式转为 float32
             tau_lh = F.softplus(self.log_thresh_LH[lvl].float())
             tau_hl = F.softplus(self.log_thresh_HL[lvl].float())
             tau_hh = F.softplus(self.log_thresh_HH[lvl].float())
@@ -100,17 +105,40 @@ class LogWaveletDenoise(nn.Module):
 
     def forward(self, x):
         orig_dtype = x.dtype
-        # 1. 小波变换全程在 float32 下运行
         with torch.amp.autocast('cuda', enabled=False):
             x = x.float()
             x_log = torch.log(torch.clamp(x, min=1e-6))
             rec_log = self._multilevel_denoise(x_log)
-            out = torch.exp(rec_log)  # float32
+            out = torch.exp(rec_log)          # float32
 
-            # 2. 下采样分支：将输出转为权重类型（通常是 half），避免类型不匹配
             if self.downsample:
-                out = out.to(self.down_conv.weight.dtype)
-                out = self.down_act(self.down_bn(self.down_conv(out)))
+                # SPDConv 内部会处理精度，无需手动对齐
+                out = self.spd_conv(out)
 
-        # 3. 最终输出与原始输入类型一致
         return out.to(orig_dtype)
+
+
+# ---------- 简单测试 ----------
+if __name__ == "__main__":
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+
+    # 测试下采样模式（包含 SPDConv）
+    model = LogWaveletDenoise(c1=64, c2=128, level=1, downsample=True, kernel_size=3).to(device)
+    model.train()
+    x = torch.randn(2, 64, 32, 32, dtype=torch.float16).to(device)
+    y = model(x)
+    print(f"Input shape: {x.shape}, Output shape: {y.shape} (expected [2,128,16,16])")
+    loss = y.mean()
+    loss.backward()
+    print("Backward passed. Test OK!")
+
+    # 测试不下采样模式
+    model2 = LogWaveletDenoise(c1=32, c2=32, level=2, downsample=False).to(device)
+    model2.train()
+    x2 = torch.randn(1, 32, 20, 20, dtype=torch.float16).to(device)
+    y2 = model2(x2)
+    print(f"Input shape: {x2.shape}, Output shape: {y2.shape} (expected [1,32,20,20])")
+    loss2 = y2.mean()
+    loss2.backward()
+    print("Backward passed. Test OK!")
