@@ -14,14 +14,14 @@ def autopad(k, p=None, d=1):
 
 class SPDConv(nn.Module):
     """
-    SPDConv with Max-Min based edge attention and grouped channel mixing.
+    SPDConv with edge attention and grouped channel mixing.
 
     Args:
         c1 (int): 输入通道数。
         c2 (int): 输出通道数。
         k (int): 压缩卷积核大小。默认 1。
         s (int): 下采样步长。2 启用 SPD + 边缘注意力 + 分组混洗；1 则退化为普通卷积。
-        g (int): 边缘注意力的分组数（用于计算 Max-Min 差异）。
+        g (int): 边缘注意力的分组数（用于计算 Max-Avg 差异）。
         act (bool): 是否使用 SiLU 激活函数。默认 True。
     """
 
@@ -68,21 +68,20 @@ class SPDConv(nn.Module):
             # ---------- SPD 层：空间到深度 ----------
             pad_h = (2 - H % 2) % 2
             pad_w = (2 - W % 2) % 2
-            if pad_h or pad_w:
+            if pad_h > 0 or pad_w > 0:
                 x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
             x_spd = F.pixel_unshuffle(x, downscale_factor=2)  # (B, 4C, H/2, W/2)
 
-            # ---------- 边缘注意力：分组 Max - Min ----------
+            # ---------- 边缘注意力 ----------
             C_mid = x_spd.shape[1]  # 4*C
             C_per_grp = C_mid // self.g
             x_grp = x_spd.view(B, self.g, C_per_grp, x_spd.shape[2], x_spd.shape[3])
-            grp_max = x_grp.max(dim=2, keepdim=False)[0]     # (B, g, H/2, W/2)
-            grp_min = x_grp.min(dim=2, keepdim=False)[0]     # (B, g, H/2, W/2)
-            grp_edge = grp_max - grp_min                     # 极差，突出局部变化幅度
-
-            grp_edge_up = grp_edge.repeat_interleave(C_per_grp, dim=1)  # (B, 4C, H/2, W/2)
-            edge_weight = self.edge_attn(grp_edge_up)                   # 可学习软权重
-            x_edge = x_spd * edge_weight + x_spd                        # 残差增强
+            grp_max = x_grp.max(dim=2, keepdim=False)[0]
+            grp_avg = x_grp.mean(dim=2, keepdim=False)
+            grp_edge = grp_max - grp_avg
+            grp_edge_up = grp_edge.repeat_interleave(C_per_grp, dim=1)
+            edge_weight = self.edge_attn(grp_edge_up)
+            x_edge = x_spd * edge_weight + x_spd  # 残差连接
 
             # ---------- 分组混洗（每4通道交互） ----------
             x_group = self.group_act(self.group_bn(self.group_mixer(x_edge)))
@@ -106,7 +105,7 @@ if __name__ == "__main__":
     model1.train()
     x1 = torch.randn(2, 64, 32, 32).to(device)
     y1 = model1(x1)
-    print(f"SPD mode: input {x1.shape} -> output {y1.shape} (expected [2,128,16,16])")
+    print(f"SPD mode input: {x1.shape} -> output: {y1.shape} (expected: [2,128,16,16])")
     loss1 = y1.mean()
     loss1.backward()
     print("Gradients OK for SPD mode")
@@ -116,7 +115,7 @@ if __name__ == "__main__":
     model2.train()
     x2 = torch.randn(2, 64, 32, 32).to(device)
     y2 = model2(x2)
-    print(f"Normal mode: input {x2.shape} -> output {y2.shape} (expected [2,64,32,32])")
+    print(f"Normal mode input: {x2.shape} -> output: {y2.shape} (expected: [2,64,32,32])")
     loss2 = y2.mean()
     loss2.backward()
     print("Gradients OK for normal mode")
