@@ -109,12 +109,11 @@ class LogWaveletDenoise(nn.Module):
             x = x.float()
             x_log = torch.log(torch.clamp(x, min=1e-6))
             rec_log = self._multilevel_denoise(x_log)
-            out = torch.exp(rec_log)          # float32
-
+            out = torch.exp(rec_log)  # float32
             if self.downsample:
-                # SPDConv 内部会处理精度，无需手动对齐
+                # 对齐 SPDConv 权重的 dtype（通常为 float16）
+                out = out.to(next(self.spd_conv.parameters()).dtype)
                 out = self.spd_conv(out)
-
         return out.to(orig_dtype)
 
 
