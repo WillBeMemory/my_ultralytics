@@ -26,7 +26,7 @@ class Bottleneck(nn.Module):
         return out
 
 
-# ================== 背景软填充 ==================
+# ================== 背景填充模块（软填充） ==================
 class AdaptiveBackgroundFill(nn.Module):
     def __init__(self, ch, pool_size=3, fill_strength=0.8, bg_thresh_ratio=0.5):
         super().__init__()
@@ -42,25 +42,29 @@ class AdaptiveBackgroundFill(nn.Module):
         max_s = F.max_pool2d(x, self.pool_size, stride=1, padding=pad)
         min_s = -F.max_pool2d(-x, self.pool_size, stride=1, padding=pad)
         local_contrast = max_s - min_s
+        # 与 x 同类型的 epsilon
         eps = torch.tensor(1e-6, dtype=x.dtype, device=x.device)
         mean_contrast = local_contrast.mean(dim=[2, 3], keepdim=True) + eps
+        # 生成背景掩膜，并强制转为 x 的 dtype
         bg_mask = (local_contrast < self.bg_thresh_ratio * mean_contrast).to(dtype=x.dtype)
         out = x * (1 - self.fill_strength * bg_mask) + baseline * self.fill_strength * bg_mask
         return out
 
 
-# ================== 通道感知边缘增强 ==================
+# ================== 通道感知边缘增强（注意力） ==================
 class ChannelAwareEdgeEnhance_Attn(nn.Module):
     def __init__(self, ch, pool_size=3, ch_sharp=5.0, ch_thresh=0.5, edge_sharp=5.0, edge_thresh=0.5):
         super().__init__()
         self.ch = ch
         self.pool_size = pool_size
+        # 用 register_buffer 存储超参数，随模型移动设备，但不参与梯度
         self.register_buffer('ch_sharp', torch.tensor(ch_sharp))
         self.register_buffer('ch_thresh', torch.tensor(ch_thresh))
         self.register_buffer('edge_sharp', torch.tensor(edge_sharp))
         self.register_buffer('edge_thresh', torch.tensor(edge_thresh))
 
     def forward(self, x):
+        # 动态转换为与输入相同的 dtype，消除 AMP 类型冲突
         dtype = x.dtype
         ch_sharp = self.ch_sharp.to(dtype)
         ch_thresh = self.ch_thresh.to(dtype)
@@ -71,7 +75,7 @@ class ChannelAwareEdgeEnhance_Attn(nn.Module):
         pad = self.pool_size // 2
         x_abs = x.abs()
 
-        # 通道权重
+        # 通道权重（用 view + max 替代 adaptive_max_pool2d，避免确定性警告）
         max_ch = x_abs.view(B, C, -1).max(dim=-1, keepdim=True)[0].view(B, C, 1, 1)
         avg_ch = F.adaptive_avg_pool2d(x_abs, 1)
         diff_ch = max_ch - avg_ch
@@ -89,100 +93,34 @@ class ChannelAwareEdgeEnhance_Attn(nn.Module):
         return out
 
 
-# ================== 增强 Bottleneck（背景填充 + 边缘增强 + Bottleneck） ==================
-class SoftFillEdgeBottleneck(nn.Module):
-    def __init__(self, c, pool_size=3,
-                 fill_strength=0.8, bg_thresh_ratio=0.5,
-                 ch_sharp=5.0, ch_thresh=0.5,
-                 edge_sharp=5.0, edge_thresh=0.5,
-                 bottleneck_e=0.5, bottleneck_shortcut=True):
-        super().__init__()
-        self.bg_fill = AdaptiveBackgroundFill(c, pool_size, fill_strength, bg_thresh_ratio)
-        self.attn = ChannelAwareEdgeEnhance_Attn(c, pool_size, ch_sharp, ch_thresh, edge_sharp, edge_thresh)
-        self.bottleneck = Bottleneck(c, c, shortcut=bottleneck_shortcut, e=bottleneck_e)
-
-    def forward(self, x):
-        # 对齐 Bottleneck 权重的 dtype
-        target_dtype = self.bottleneck.cv1.weight.dtype
-        x = x.to(target_dtype)
-        out = self.bg_fill(x)
-        out = self.attn(out)
-        out = self.bottleneck(out)
-        return out
-
-
-# ================== CSP 结构的 SoftFillEdgeEnhance（类似 C3k2） ==================
+# ================== 完整模块：SoftFillEdgeEnhance ==================
 class SoftFillEdgeEnhance(nn.Module):
-    """
-    CSP 版本的 SoftFillEdgeEnhance，参考 C3k2 结构。
-    参数：
-        c1, c2: 输入/输出通道数
-        n: 增强分支中 SoftFillEdgeBottleneck 重复次数
-        e: CSP 隐藏通道扩展比（隐藏通道数 = int(c2 * e)）
-        其他参数用于内部背景填充和边缘增强。
-    """
-    def __init__(self, c1, c2, n=1, e=0.5,
-                 pool_size=3,
+    def __init__(self, c1, c2, n=1, pool_size=3,bottleneck_e=0.5,
                  fill_strength=0.8, bg_thresh_ratio=0.5,
                  ch_sharp=5.0, ch_thresh=0.5,
                  edge_sharp=5.0, edge_thresh=0.5,
-                 bottleneck_e=0.5, bottleneck_shortcut=True):
+                  bottleneck_shortcut=True):
         super().__init__()
-        self.c = int(c2 * e)          # 隐藏通道数
-        self.cv1 = nn.Conv2d(c1, 2 * self.c, 1, bias=False)
-        self.cv2 = nn.Conv2d((2 + n) * self.c, c2, 1, bias=False)
+        self.bg_fill = AdaptiveBackgroundFill(c1, pool_size, fill_strength, bg_thresh_ratio)
+        self.attn = ChannelAwareEdgeEnhance_Attn(c1, pool_size, ch_sharp, ch_thresh, edge_sharp, edge_thresh)
 
-        # 增强分支（n 个串联的 SoftFillEdgeBottleneck）
-        self.m = nn.ModuleList([
-            SoftFillEdgeBottleneck(
-                self.c, pool_size,
-                fill_strength, bg_thresh_ratio,
-                ch_sharp, ch_thresh, edge_sharp, edge_thresh,
-                bottleneck_e, bottleneck_shortcut
-            )
+        self.bottlenecks = nn.Sequential(*[
+            Bottleneck(c1, c1, shortcut=bottleneck_shortcut, e=bottleneck_e)
             for _ in range(n)
         ])
 
+        self.proj = nn.Conv2d(c1, c2, 1, bias=False) if c1 != c2 else nn.Identity()
+
     def forward(self, x):
-        # 对齐 cv1 权重的 dtype（AMP 兼容）
-        target_dtype = self.cv1.weight.dtype
+        # 关键：将输入 x 对齐到 Bottleneck 权重的 dtype（AMP 下为 float16），避免类型冲突
+        if len(self.bottlenecks) > 0:
+            target_dtype = self.bottlenecks[0].cv1.weight.dtype
+        else:
+            target_dtype = x.dtype
         x = x.to(target_dtype)
 
-        # 1. 1x1 卷积分裂
-        y = list(self.cv1(x).chunk(2, dim=1))   # y[0] 直接透传, y[1] 进入增强分支
-
-        # 2. 增强分支依次执行，并将每个 block 的输出追加到列表（模拟 C2f 的梯度流）
-        y.extend(m(y[-1]) for m in self.m)
-
-        # 3. 拼接并投影
-        return self.cv2(torch.cat(y, dim=1))
-
-if __name__ == "__main__":
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-
-    # 实例化模块：输入128通道，输出256通道，n=2个增强块，CSP扩展比e=0.5
-    model = SoftFillEdgeEnhance(
-        c1=128, c2=256, n=2, e=0.5,
-        pool_size=3,
-        fill_strength=0.8, bg_thresh_ratio=0.5,
-        ch_sharp=5.0, ch_thresh=0.5,
-        edge_sharp=5.0, edge_thresh=0.5,
-        bottleneck_e=0.5, bottleneck_shortcut=True
-    ).to(device)
-    model.train()  # 设置为训练模式，使AMP兼容性测试有效
-
-    # 随机输入：batch=2, channels=128, height=32, width=32
-    x = torch.randn(2, 128, 32, 32).to(device)
-
-    # 前向传播
-    y = model(x)
-
-    # 输出形状
-    print(f"Input  shape: {x.shape}")  # (2, 128, 32, 32)
-    print(f"Output shape: {y.shape}")  # 期望 (2, 256, 32, 32)
-
-    # 反向传播测试
-    loss = y.mean()
-    loss.backward()
-    print("Backward passed. Test OK!")
+        out = self.bg_fill(x)
+        out = self.attn(out)
+        out = self.bottlenecks(out)
+        out = self.proj(out)
+        return out
