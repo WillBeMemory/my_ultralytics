@@ -4,12 +4,6 @@ import torch.nn.functional as F
 import math
 import pywt
 
-from ultralytics.nn.modules.SPDConv import SPDConv
-
-
-# 导入已有的 SPDConv 模块（请根据实际路径调整）
-  # 假设 SPDConv 类定义在 spdconv.py 中
-
 class LogWaveletDenoise(nn.Module):
     def __init__(self, c1, c2, level=1, downsample=True, kernel_size=3, wavelet='bior4.4'):
         super().__init__()
@@ -46,12 +40,12 @@ class LogWaveletDenoise(nn.Module):
             nn.Parameter(torch.full((1, c1, 1, 1), -2.0)) for _ in range(level)
         ])
 
-        # ---------- 下采样分支：使用 SPDConv ----------
+        # ---------- 下采样分支：普通卷积 ----------
         if self.downsample:
-            # SPDConv 替代原来的 Conv+BN+SiLU，s=2 执行无损下采样，内部包含激活和BN
-            self.spd_conv = SPDConv(c1, c2, k=kernel_size, s=2, act=True)
-        else:
-            self.spd_conv = nn.Identity()
+            self.down_conv = nn.Conv2d(c1, c2, kernel_size, stride=2,
+                                       padding=kernel_size // 2, bias=False)
+            self.down_bn = nn.BatchNorm2d(c2)
+            self.down_act = nn.SiLU(inplace=True)
 
     # ---------- 小波变换核心（内部自动对齐 dtype） ----------
     def _dwt(self, x):
@@ -109,11 +103,13 @@ class LogWaveletDenoise(nn.Module):
             x = x.float()
             x_log = torch.log(torch.clamp(x, min=1e-6))
             rec_log = self._multilevel_denoise(x_log)
-            out = torch.exp(rec_log)  # float32
+            out = torch.exp(rec_log)          # float32
+
             if self.downsample:
-                # 对齐 SPDConv 权重的 dtype（通常为 float16）
-                out = out.to(next(self.spd_conv.parameters()).dtype)
-                out = self.spd_conv(out)
+                # 对齐下采样卷积权重的 dtype（通常为 half）
+                out = out.to(self.down_conv.weight.dtype)
+                out = self.down_act(self.down_bn(self.down_conv(out)))
+
         return out.to(orig_dtype)
 
 
@@ -122,7 +118,7 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    # 测试下采样模式（包含 SPDConv）
+    # 测试下采样模式（包含普通 Conv）
     model = LogWaveletDenoise(c1=64, c2=128, level=1, downsample=True, kernel_size=3).to(device)
     model.train()
     x = torch.randn(2, 64, 32, 32, dtype=torch.float16).to(device)
