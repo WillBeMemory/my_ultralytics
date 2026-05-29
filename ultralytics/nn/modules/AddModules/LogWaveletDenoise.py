@@ -5,7 +5,7 @@ import math
 import pywt
 
 class LogWaveletDenoise(nn.Module):
-    def __init__(self, c1, c2, level=2, downsample=True, kernel_size=3, wavelet='bior4.4'):
+    def __init__(self, c1, c2, level=1, downsample=True, kernel_size=3, wavelet='bior4.4'):
         super().__init__()
         self.downsample = downsample
         self.level = level
