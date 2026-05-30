@@ -66,14 +66,12 @@ class LogWaveletDenoise(nn.Module):
         )
 
     def _estimate_noise_base(self, HH):
-        # 使用 sort 代替 median 以避免 CUDA 确定性模式警告
-        hh_abs = torch.abs(HH.reshape(HH.size(0), HH.size(1), -1))  # (B, C, N)
+        hh_abs = torch.abs(HH.reshape(HH.size(0), HH.size(1), -1))
         sorted_abs = torch.sort(hh_abs, dim=-1)[0]
         N = hh_abs.shape[-1]
-        k = N // 2  # 取中间位置作为中位数近似（偶数时取偏左，对噪声估计影响极小）
-        sigma = sorted_abs[:, :, k] / 0.6745  # (B, C)
-        lambd_base = sigma * math.sqrt(2.0 * math.log(N + 1e-6))
-        return lambd_base  # (B, C)
+        k = N // 2
+        sigma = sorted_abs[:, :, k] / 0.6745
+        return sigma * math.sqrt(2.0 * math.log(N + 1e-6))  # (B, C)
 
     def _multilevel_denoise(self, x_log):
         B, C, H, W = x_log.shape
@@ -87,10 +85,16 @@ class LogWaveletDenoise(nn.Module):
 
         for lvl in reversed(range(self.level)):
             LH, HL, HH, orig_h, orig_w = detail_coeffs[lvl]
-            # 阈值 = softplus(scale) * noise_sigma
-            tau_lh = F.softplus(self.thresh_scale_LH[lvl]) * self.noise_sigma[lvl].view(1, -1, 1, 1)
-            tau_hl = F.softplus(self.thresh_scale_HL[lvl]) * self.noise_sigma[lvl].view(1, -1, 1, 1)
-            tau_hh = F.softplus(self.thresh_scale_HH[lvl]) * self.noise_sigma[lvl].view(1, -1, 1, 1)
+
+            # 显式转 float32，避免半精度冲突
+            scale_lh = F.softplus(self.thresh_scale_LH[lvl].float())
+            scale_hl = F.softplus(self.thresh_scale_HL[lvl].float())
+            scale_hh = F.softplus(self.thresh_scale_HH[lvl].float())
+            noise = self.noise_sigma[lvl].float().view(1, -1, 1, 1)
+
+            tau_lh = scale_lh * noise
+            tau_hl = scale_hl * noise
+            tau_hh = scale_hh * noise
 
             LH = self._soft_threshold(LH, tau_lh)
             HL = self._soft_threshold(HL, tau_hl)
@@ -104,29 +108,33 @@ class LogWaveletDenoise(nn.Module):
 
     def forward(self, x):
         orig_dtype = x.dtype
+        # 全程强制 float32 运算
         with torch.amp.autocast('cuda', enabled=False):
             x = x.float()
             x_clamped = torch.clamp(x, min=1e-6)
             x_log = torch.log(x_clamped)
 
-            # 噪声估计初始化（仅训练时首次前向）
+            # 首次训练前向时初始化噪声基值
             if self.training and not self.noise_initialized:
                 with torch.no_grad():
                     _, _, _, HH = self._dwt(x_log)
-                    noise_base = self._estimate_noise_base(HH)  # (B, C)
-                    noise_base = noise_base.mean(dim=0)  # (C,)
-                    self.noise_sigma.copy_(noise_base.unsqueeze(0).expand(self.level, -1))
+                    noise_base = self._estimate_noise_base(HH).mean(dim=0)  # (C,)
+                    # 写入 buffer 时确保与 buffer 类型一致 (float32)
+                    self.noise_sigma.copy_(
+                        noise_base.unsqueeze(0).expand(self.level, -1).float()
+                    )
                     self.noise_initialized.copy_(torch.tensor(True))
 
             rec_log = self._multilevel_denoise(x_log)
             rec_log = torch.clamp(rec_log, max=20.0)
             out = torch.exp(rec_log)
 
-            # 残差融合
+            # 残差融合（类型统一为 float32）
             if out.shape == x.shape:
-                out = 0.5 * out + 0.5 * x
+                out = 0.5 * out + 0.5 * x.float()
 
             if self.downsample:
+                # 下采样前转到权重类型（通常 half）
                 out = out.to(self.down_conv.weight.dtype)
                 out = self.down_act(self.down_bn(self.down_conv(out)))
 
