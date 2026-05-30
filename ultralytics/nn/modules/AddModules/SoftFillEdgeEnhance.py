@@ -89,7 +89,7 @@ class ChannelAwareEdgeEnhance_Attn(nn.Module):
         return out
 
 
-# ================== SoftFillEdgeEnhance（仅移除主残差） ==================
+# ================== SoftFillEdgeEnhance（仅移除投影 BN） ==================
 class SoftFillEdgeEnhance(nn.Module):
     def __init__(self, c1, c2, n=1, pool_size=3, bottleneck_e=0.5,
                  fill_strength=0.8, bg_thresh_ratio=0.5,
@@ -98,7 +98,7 @@ class SoftFillEdgeEnhance(nn.Module):
                  bottleneck_shortcut=True):
         super().__init__()
         assert pool_size % 2 == 1, "pool_size must be odd"
-        # 注意：已移除 main_shortcut 参数，模块不再自动添加全局残差
+        # 无 main_shortcut，无全局残差
 
         self.bg_fill = AdaptiveBackgroundFill(c1, pool_size, fill_strength, bg_thresh_ratio)
         self.attn = ChannelAwareEdgeEnhance_Attn(c1, pool_size, ch_sharp, ch_thresh, edge_sharp, edge_thresh)
@@ -108,12 +108,9 @@ class SoftFillEdgeEnhance(nn.Module):
             for _ in range(n)
         ])
 
-        # 投影层（保留 BN，与之前新版本一致）
+        # 投影层：仅使用线性 1×1 卷积（或恒等映射），无 BN，无激活
         if c1 != c2:
-            self.proj = nn.Sequential(
-                nn.Conv2d(c1, c2, 1, bias=False),
-                nn.BatchNorm2d(c2)
-            )
+            self.proj = nn.Conv2d(c1, c2, 1, bias=False)
         else:
             self.proj = nn.Identity()
 
@@ -125,5 +122,4 @@ class SoftFillEdgeEnhance(nn.Module):
         out = self.attn(out)
         out = self.bottlenecks(out)
         out = self.proj(out)
-        # 已移除 out = out + x
         return out
