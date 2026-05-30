@@ -47,7 +47,8 @@ class LogWaveletDenoise(nn.Module):
         pad_w = (2 - W % 2) % 2
         if pad_h or pad_w:
             x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
-        filters = self.dec_filters.repeat(C, 1, 1, 1)
+        # 确保滤波器与输入类型一致（兼容半精度模型）
+        filters = self.dec_filters.to(x.dtype).repeat(C, 1, 1, 1)
         coeffs = F.conv2d(x, filters, stride=2, groups=C)
         coeffs = coeffs.view(B, C, 4, coeffs.shape[-2], coeffs.shape[-1])
         return coeffs[:, :, 0], coeffs[:, :, 1], coeffs[:, :, 2], coeffs[:, :, 3]
@@ -55,7 +56,8 @@ class LogWaveletDenoise(nn.Module):
     def _idwt(self, LL, LH, HL, HH, orig_h, orig_w):
         B, C, H, W = LL.shape
         coeffs = torch.stack([LL, LH, HL, HH], dim=2).reshape(B, C * 4, H, W)
-        filters = self.rec_filters.repeat(C, 1, 1, 1)
+        # 重构滤波器同样类型对齐
+        filters = self.rec_filters.to(LL.dtype).repeat(C, 1, 1, 1)
         out = F.conv_transpose2d(coeffs, filters, stride=2, groups=C)
         return out[:, :, :orig_h, :orig_w]
 
@@ -86,7 +88,7 @@ class LogWaveletDenoise(nn.Module):
         for lvl in reversed(range(self.level)):
             LH, HL, HH, orig_h, orig_w = detail_coeffs[lvl]
 
-            # 显式转 float32，避免半精度冲突
+            # 阈值参数和噪声基值统一 float32
             scale_lh = F.softplus(self.thresh_scale_LH[lvl].float())
             scale_hl = F.softplus(self.thresh_scale_HL[lvl].float())
             scale_hh = F.softplus(self.thresh_scale_HH[lvl].float())
@@ -108,7 +110,7 @@ class LogWaveletDenoise(nn.Module):
 
     def forward(self, x):
         orig_dtype = x.dtype
-        # 全程强制 float32 运算
+        # 全程 float32 运算，完全不受外部 AMP 影响
         with torch.amp.autocast('cuda', enabled=False):
             x = x.float()
             x_clamped = torch.clamp(x, min=1e-6)
@@ -119,22 +121,19 @@ class LogWaveletDenoise(nn.Module):
                 with torch.no_grad():
                     _, _, _, HH = self._dwt(x_log)
                     noise_base = self._estimate_noise_base(HH).mean(dim=0)  # (C,)
-                    # 写入 buffer 时确保与 buffer 类型一致 (float32)
-                    self.noise_sigma.copy_(
-                        noise_base.unsqueeze(0).expand(self.level, -1).float()
-                    )
+                    self.noise_sigma.copy_(noise_base.unsqueeze(0).expand(self.level, -1).float())
                     self.noise_initialized.copy_(torch.tensor(True))
 
             rec_log = self._multilevel_denoise(x_log)
             rec_log = torch.clamp(rec_log, max=20.0)
             out = torch.exp(rec_log)
 
-            # 残差融合（类型统一为 float32）
+            # 残差融合
             if out.shape == x.shape:
-                out = 0.5 * out + 0.5 * x.float()
+                out = 0.5 * out + 0.5 * x
 
             if self.downsample:
-                # 下采样前转到权重类型（通常 half）
+                # 下采样分支：匹配卷积权重类型
                 out = out.to(self.down_conv.weight.dtype)
                 out = self.down_act(self.down_bn(self.down_conv(out)))
 
