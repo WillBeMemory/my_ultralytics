@@ -6,3 +6,4 @@ from ultralytics.nn.modules.AddModules.PRN_ import PRN
 from ultralytics.nn.modules.AddModules.GoldNeck_P234 import GoldNeck_P234
 from ultralytics.nn.modules.AddModules.EFCFusion import EFCFusion
 from ultralytics.nn.modules.AddModules.C3k2_Sparse import C3k2_Sparse
+from ultralytics.nn.modules.AddModules.StarC3k2 import StarC3k2
