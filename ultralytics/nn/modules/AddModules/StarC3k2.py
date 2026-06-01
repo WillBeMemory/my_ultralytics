@@ -1,25 +1,45 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from ultralytics.nn.modules.block import Conv
 
 
 class StarBlock(nn.Module):
-    """StarBlock: 双分支变换后逐元素相乘 + 残差连接"""
-    def __init__(self, c, shortcut=True, g=1, e=0.5):
+    """稳定版 StarBlock：双分支变换后逐元素相乘 + 残差连接，含数值稳定机制"""
+    def __init__(self, c, shortcut=True, g=1, e=0.5, temperature_init=0.1):
         super().__init__()
         c_ = int(c * e)
         self.shortcut = shortcut
+
         self.conv1 = Conv(c, c_, 1, 1, g=g, act=False)
         self.conv2 = Conv(c, c_, 1, 1, g=g, act=False)
         self.fusion = Conv(c_, c, 1, 1, g=g, act=False)
+
+        # 可学习的温度系数，初始化为较小值，防止初期爆炸
+        self.temperature = nn.Parameter(torch.tensor(temperature_init))
+
+        # 可选：在乘法之后添加 BatchNorm 进一步稳定分布
+        self.star_bn = nn.BatchNorm2d(c_)
+
         self.act = nn.SiLU(inplace=True)
 
     def forward(self, x):
         identity = x
-        x1 = self.conv1(x)
+        x1 = self.conv1(x)          # (B, c_, H, W)
         x2 = self.conv2(x)
-        star = x1 * x2
+
+        # 数值稳定关键：对两个投影向量做 L2 归一化，限制值域在 [-1, 1] 附近
+        x1 = F.normalize(x1, p=2, dim=1, eps=1e-6)
+        x2 = F.normalize(x2, p=2, dim=1, eps=1e-6)
+
+        # 逐元素相乘，受温度系数控制
+        star = x1 * x2 * self.temperature
+
+        # 通过 BN 稳定分布
+        star = self.star_bn(star)
+
         out = self.fusion(star)
+
         if self.shortcut:
             out = self.act(out + identity)
         else:
@@ -29,69 +49,39 @@ class StarBlock(nn.Module):
 
 class StarC3k2(nn.Module):
     """
-    混合星操作精炼层，兼容 C3k2 参数接口。
-
-    在 C3k2 划分出的精炼通道上，再次对半划分：
-    - 一半经过 n 个 StarBlock 序列（原始逻辑）
-    - 另一半经过单个 StarBlock 增强后直接与原始直通分支合并
+    稳定版星操作特征精炼层，兼容 C3k2 参数接口。
 
     参数:
-        c1 (int): 输入通道数
-        c2 (int): 输出通道数
-        n (int): StarBlock 重复次数
-        c3k (bool): 占位参数，仅用于兼容 C3k2 接口
-        e (float): CSP 隐藏通道扩展比，默认为 0.5
-        attn (bool): 占位参数，仅用于兼容 C3k2 接口
-        g (int): 分组卷积的组数，默认为 1
-        shortcut (bool): StarBlock 内部是否使用残差连接
-        **kwargs: 忽略其他不支持的参数
+        c1, c2, n, c3k, e, attn, g, shortcut: 同 C3k2
+        temperature_init (float): StarBlock 初始温度系数，建议 0.05~0.1
     """
-    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, attn=False, g=1, shortcut=True, **kwargs):
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, attn=False, g=1,
+                 shortcut=True, temperature_init=0.1, **kwargs):
         super().__init__()
-        self.c = int(c2 * e)          # 分支通道数
-        self.c_half = self.c // 2     # 精炼分支再次划分的一半
+        self.c = int(c2 * e)
         self.n = n
 
-        # CSP 标准结构：cv1 投影到 2*c
         self.cv1 = Conv(c1, 2 * self.c, 1, 1, g=g)
-
-        # 增强分支：n 个 StarBlock 串联（作用于 a1）
         self.m = nn.ModuleList([
-            StarBlock(self.c_half, shortcut=shortcut, g=g, e=1.0) for _ in range(n)
+            StarBlock(self.c, shortcut=shortcut, g=g, e=1.0,
+                      temperature_init=temperature_init) for _ in range(n)
         ])
-
-        # 作用于另一半精炼通道的单次星操作增强块
-        self.star_enhance = StarBlock(self.c_half, shortcut=shortcut, g=g, e=1.0)
-
-        # cv2 融合：直通分支 + 原始精炼分支的一半 + 星操作增强后的另一半 + n 个 StarBlock 输出
-        # 总拼接通道数：b(c) + a1(c_half) + a2(c_half) + n * (c_half) = c + (2+n)*c_half
-        self.cv2 = Conv(self.c + (2 + n) * self.c_half, c2, 1, g=g, act=False)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1, g=g, act=False)
         self.act = nn.SiLU(inplace=True)
 
     def forward(self, x):
-        # 1. 通道分割
-        y = list(self.cv1(x).chunk(2, dim=1))   # [b, a]，b 直通，a 精炼
-        b, a = y[0], y[1]
-
-        # 2. 精炼分支再次一分为二：a1 走 StarBlock 序列，a2 走单次星操作增强
-        a1, a2 = a.chunk(2, dim=1)              # 各占 self.c_half 通道
-
-        # 3. a1 执行 StarBlock 序列（原始 C3k2 逻辑）
-        outputs = [b, a1]                       # 直通分支 + 原始精炼分支的一半
-        a1_out = a1
+        y = list(self.cv1(x).chunk(2, dim=1))   # [b, a]
+        a = y[1]
+        outputs = [y[0], a]
         for m in self.m:
-            a1_out = m(a1_out)
-            outputs.append(a1_out)              # 每个 StarBlock 的输出
-
-        # 4. a2 执行单次星操作增强
-        a2_out = self.star_enhance(a2)
-        outputs.append(a2_out)
-
-        # 5. 拼接并融合
+            a = m(a)
+            outputs.append(a)
         out = torch.cat(outputs, dim=1)
         out = self.act(self.cv2(out))
         return out
 
+
+# 测试（略）
 
 # ================== 简单测试 ==================
 if __name__ == "__main__":
