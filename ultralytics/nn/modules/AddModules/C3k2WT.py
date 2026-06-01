@@ -18,7 +18,10 @@ def create_haar_filters(channels, dtype=torch.float):
 
 
 class WTConv2d(nn.Module):
-    """轻量 Haar 小波深度卷积（稳健尺寸对齐）"""
+    """
+    多级 Haar 小波深度卷积（彻底修复尺寸对齐）
+    严格按照原始 WTConv 逻辑：下采样得到的低频与上一级重构后再次下采样得到的低频相加
+    """
     def __init__(self, in_channels, out_channels, kernel_size=5, wt_levels=2, bias=True, use_activation=True):
         super().__init__()
         assert in_channels == out_channels, "WTConv2d requires in_channels == out_channels"
@@ -31,7 +34,7 @@ class WTConv2d(nn.Module):
         self.register_buffer('rec_filters', rec_filters)
         self.pad = 0  # Haar 2x2 无需额外 padding
 
-        # 基础深度可分离卷积分支
+        # 基础深度可分离卷积
         self.base_conv = nn.Conv2d(in_channels, in_channels, kernel_size,
                                    padding=kernel_size // 2, groups=in_channels, bias=bias)
         self.base_bn = nn.BatchNorm2d(in_channels) if use_activation else nn.Identity()
@@ -70,10 +73,13 @@ class WTConv2d(nn.Module):
         B, C, H, W = x.shape
         orig_h, orig_w = H, W
 
-        # 多级分解并保存处理后的全部子带
-        levels = []
+        # 保存各级处理后的 LL 和 H，以及原始输入尺寸
+        ll_list = []
+        h_list = []
+        shapes = []
         current = x
         for lvl in range(self.wt_levels):
+            shapes.append(current.shape[2:])
             coeffs = self._dwt(current)
             flat = coeffs.reshape(B, C * 4, coeffs.shape[-2], coeffs.shape[-1])
             conv_out = self.wavelet_convs[lvl](flat)
@@ -81,49 +87,58 @@ class WTConv2d(nn.Module):
             conv_out = self.wavelet_acts[lvl](conv_out)
             conv_out = conv_out * self.wavelet_scales[lvl]
             processed = conv_out.view(B, C, 4, coeffs.shape[-2], coeffs.shape[-1])
-            levels.append(processed)
-            current = processed[:, :, 0]          # LL 进入下一级
+            ll_list.append(processed[:, :, 0])          # LL
+            h_list.append(processed[:, :, 1:4])          # (LH, HL, HH)
+            current = processed[:, :, 0]
 
-        # 逐级重构（强制尺寸对齐）
-        current = None
+        # 重构
+        next_ll = 0
         for lvl in reversed(range(self.wt_levels)):
-            if lvl == self.wt_levels - 1:          # 最深级：直接使用处理后的 LL
-                ll = levels[lvl][:, :, 0]
-            else:
-                # 上一级重构图像再分解得到低频（尺寸可能与高频差1）
-                ll = self._dwt(current)[:, :, 0]
+            curr_ll = ll_list[lvl]          # 当前级 LL
+            curr_h = h_list[lvl]            # 当前级高频 (B,C,3,H_l,W_l)
+            curr_shape = shapes[lvl]        # 当前级输入尺寸 (H_in, W_in)
 
-            lh = levels[lvl][:, :, 1]
-            hl = levels[lvl][:, :, 2]
-            hh = levels[lvl][:, :, 3]
+            # 非最深级：将 next_ll 下采样到当前级 LL 尺寸，并与 curr_ll 相加
+            if lvl < self.wt_levels - 1:
+                # 先将 next_ll 调整到偶数尺寸（避免 DWT 错位）
+                nh, nw = next_ll.shape[2], next_ll.shape[3]
+                pad_h = (2 - nh % 2) % 2
+                pad_w = (2 - nw % 2) % 2
+                if pad_h or pad_w:
+                    next_ll_padded = F.pad(next_ll, (0, pad_w, 0, pad_h), mode='reflect')
+                else:
+                    next_ll_padded = next_ll
+                next_ll_dwt = self._dwt(next_ll_padded)[:, :, 0]  # 低频
+                # 如果尺寸仍有 1px 偏差，插值到 curr_ll 尺寸
+                if next_ll_dwt.shape[-2:] != curr_ll.shape[-2:]:
+                    next_ll_dwt = F.interpolate(next_ll_dwt, size=curr_ll.shape[-2:], mode='nearest')
+                curr_ll = curr_ll + next_ll_dwt
+            # 最深级：next_ll 为 0，直接使用 curr_ll
 
-            # 🔧 关键修复：将高频插值到低频尺寸，确保完全一致
-            if ll.shape[-2:] != lh.shape[-2:]:
-                lh = F.interpolate(lh, size=ll.shape[-2:], mode='nearest')
-                hl = F.interpolate(hl, size=ll.shape[-2:], mode='nearest')
-                hh = F.interpolate(hh, size=ll.shape[-2:], mode='nearest')
+            lh, hl, hh = curr_h[:, :, 0], curr_h[:, :, 1], curr_h[:, :, 2]
+            # 确保高频与 LL 尺寸一致（应该已经一致，但仍做保险）
+            if curr_ll.shape[-2:] != lh.shape[-2:]:
+                lh = F.interpolate(lh, size=curr_ll.shape[-2:], mode='nearest')
+                hl = F.interpolate(hl, size=curr_ll.shape[-2:], mode='nearest')
+                hh = F.interpolate(hh, size=curr_ll.shape[-2:], mode='nearest')
 
-            coeffs = torch.stack([ll, lh, hl, hh], dim=2)
+            coeffs = torch.stack([curr_ll, lh, hl, hh], dim=2)
+            rec = self._idwt(coeffs, curr_shape[0], curr_shape[1])
+            next_ll = rec
 
-            # 目标尺寸：低频尺寸 × 2，最终级恢复到原始尺寸
-            target_h = ll.shape[-2] * 2
-            target_w = ll.shape[-1] * 2
-            if lvl == 0:
-                target_h, target_w = orig_h, orig_w
+        # 小波支路最终输出，裁剪到原始尺寸
+        wave_out = next_ll[:, :, :orig_h, :orig_w]
 
-            current = self._idwt(coeffs, target_h, target_w)
-
-        # 基础深度卷积分支
+        # 基础支路
         base = self.base_conv(x)
         base = self.base_bn(base)
         base = self.base_act(base)
         base = base * self.base_scale
 
-        return base + current
+        return base + wave_out
 
 
 class StarBlock(nn.Module):
-    """星操作块：两个 1×1 投影 → 逐元素相乘 → 融合，带残差连接"""
     def __init__(self, channels, e=0.5):
         super().__init__()
         c_ = int(channels * e)
@@ -145,7 +160,6 @@ class StarBlock(nn.Module):
 
 
 class WTBlock(nn.Module):
-    """WTConv2d + 可选 StarBlock 的特征精炼块"""
     def __init__(self, c, kernel_size=5, wt_levels=2, use_star=True, star_e=0.5, shortcut=True):
         super().__init__()
         self.shortcut = shortcut
@@ -165,54 +179,39 @@ class WTBlock(nn.Module):
 
 
 class C3k2WT(nn.Module):
-    """
-    融合小波卷积的 C3k2 模块，接口完全兼容 C3k2。
-    YAML 示例（与原版 C3k2 参数顺序一致）：
-    [-1, 2, C3k2WT, [128, 1, False, 0.25]]
-    """
     def __init__(self, c1, c2, n=1, c3k=False, e=0.5, attn=False, g=1, shortcut=True,
                  kernel_size=5, wt_levels=2, use_star=True, star_e=0.5, **kwargs):
         super().__init__()
-        self.c = int(c2 * e)          # 分支通道数
+        self.c = int(c2 * e)
         self.n = n
-
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
-
         self.m = nn.ModuleList([
             WTBlock(self.c, kernel_size=kernel_size, wt_levels=wt_levels,
                     use_star=use_star, star_e=star_e, shortcut=shortcut)
             for _ in range(n)
         ])
-
         self.cv2 = Conv((2 + n) * self.c, c2, 1, act=False)
         self.act = nn.SiLU(inplace=True)
 
     def forward(self, x):
-        y = list(self.cv1(x).chunk(2, dim=1))   # [b, a]
-        a = y[1]   # 增强分支
-
-        outputs = [y[0], a]
+        y = list(self.cv1(x).chunk(2, dim=1))
+        outputs = [y[0], y[1]]
+        a = y[1]
         for m in self.m:
             a = m(a)
             outputs.append(a)
-
-        out = torch.cat(outputs, dim=1)
-        out = self.act(self.cv2(out))
-        return out
+        return self.act(self.cv2(torch.cat(outputs, dim=1)))
 
 
-# ================== 简单测试 ==================
+# 测试
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
-
-    # 测试奇数尺寸输入（43x43）
     x = torch.randn(1, 64, 43, 43).to(device)
-    model = C3k2WT(64, 128, n=1, c3k=False, e=0.5, attn=False, g=1, shortcut=True).to(device)
+    model = C3k2WT(64, 128, n=1, c3k=False, e=0.5, wt_levels=2, shortcut=True).to(device)
     model.train()
     y = model(x)
     print(f"Input: {x.shape} → Output: {y.shape} (expected [1,128,43,43])")
-
     loss = y.mean()
     loss.backward()
     print("Gradients OK")
