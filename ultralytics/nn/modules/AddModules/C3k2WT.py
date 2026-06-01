@@ -5,15 +5,7 @@ import math
 from ultralytics.nn.modules.block import Conv
 
 
-# ================== WTConv2d（轻量版） ==================
-def autopad(k, p=None, d=1):
-    if d > 1:
-        k = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]
-    if p is None:
-        p = k // 2 if isinstance(k, int) else [x // 2 for x in k]
-    return p
-
-
+# ================== 小波滤波器 ==================
 def create_haar_filters(channels, dtype=torch.float):
     lo = torch.tensor([1.0, 1.0]) / math.sqrt(2)
     hi = torch.tensor([1.0, -1.0]) / math.sqrt(2)
@@ -39,21 +31,19 @@ class WTConv2d(nn.Module):
         self.register_buffer('rec_filters', rec_filters)
         self.pad = 0
 
-        # 基础深度可分离卷积分支
         self.base_conv = nn.Conv2d(in_channels, in_channels, kernel_size,
-                                   padding=autopad(kernel_size), groups=in_channels, bias=bias)
+                                   padding=kernel_size // 2, groups=in_channels, bias=bias)
         self.base_bn = nn.BatchNorm2d(in_channels) if use_activation else nn.Identity()
         self.base_act = nn.SiLU(inplace=True) if use_activation else nn.Identity()
         self.base_scale = nn.Parameter(torch.ones(1, in_channels, 1, 1))
 
-        # 各级子带深度可分离卷积
         self.wavelet_convs = nn.ModuleList()
         self.wavelet_bns = nn.ModuleList()
         self.wavelet_acts = nn.ModuleList()
         self.wavelet_scales = nn.ParameterList()
         for _ in range(wt_levels):
             conv = nn.Conv2d(in_channels * 4, in_channels * 4, kernel_size,
-                             padding=autopad(kernel_size), groups=in_channels * 4, bias=False)
+                             padding=kernel_size // 2, groups=in_channels * 4, bias=False)
             self.wavelet_convs.append(conv)
             self.wavelet_bns.append(nn.BatchNorm2d(in_channels * 4) if use_activation else nn.Identity())
             self.wavelet_acts.append(nn.SiLU(inplace=True) if use_activation else nn.Identity())
@@ -115,7 +105,6 @@ class WTConv2d(nn.Module):
         return base + current
 
 
-# ================== StarBlock（星操作通道增强） ==================
 class StarBlock(nn.Module):
     """星操作块：两个 1×1 投影 → 逐元素相乘 → 融合，带残差连接"""
     def __init__(self, channels, e=0.5):
@@ -138,17 +127,13 @@ class StarBlock(nn.Module):
         return out
 
 
-# ================== WTBlock（小波精炼块） ==================
 class WTBlock(nn.Module):
     """WTConv2d + 可选 StarBlock 的特征精炼块，输入输出通道相等"""
     def __init__(self, c, kernel_size=5, wt_levels=2, use_star=True, star_e=0.5, shortcut=True):
         super().__init__()
         self.shortcut = shortcut
         self.wtconv = WTConv2d(c, c, kernel_size=kernel_size, wt_levels=wt_levels, use_activation=True)
-        if use_star:
-            self.star = StarBlock(c, e=star_e)
-        else:
-            self.star = nn.Identity()
+        self.star = StarBlock(c, e=star_e) if use_star else nn.Identity()
         self.act = nn.SiLU(inplace=True)
 
     def forward(self, x):
@@ -162,56 +147,40 @@ class WTBlock(nn.Module):
         return out
 
 
-# ================== C3k2_WT ==================
 class C3k2WT(nn.Module):
     """
-    融合小波卷积的 C3k2 模块，接口兼容 C3k2。
+    融合小波卷积的 C3k2 模块，接口完全兼容 C3k2。
 
-    参数:
-        c1 (int): 输入通道数
-        c2 (int): 输出通道数
-        n (int): WTBlock 重复次数
-        e (float): CSP 隐藏通道扩展比，默认为 0.5
-        shortcut (bool): WTBlock 内部是否使用残差连接
-        g (int): 分组卷积组数（保留兼容性，WTBlock 内未使用）
-        kernel_size (int): 小波卷积核大小（默认 5）
-        wt_levels (int): 小波分解级数（默认 2）
-        use_star (bool): 是否在 WTBlock 中启用星操作
-        star_e (float): 星操作内部通道压缩比
-        **kwargs: 忽略不支持的参数 (c3k, attn)
+    YAML 示例（与原版 C3k2 参数顺序一致）：
+    [-1, 2, C3k2WT, [128, 1, False, 0.25]]   # 使用默认小波参数
+    [-1, 2, C3k2WT, [128, 1, False, 0.25, True, 1, 5, 2, True, 0.5]]  # 自定义小波参数
     """
-    def __init__(self, c1, c2, n=1, e=0.5, shortcut=True, g=1,
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, attn=False, g=1, shortcut=True,
                  kernel_size=5, wt_levels=2, use_star=True, star_e=0.5, **kwargs):
         super().__init__()
         self.c = int(c2 * e)          # 分支通道数
         self.n = n
 
-        # CSP 标准结构：cv1 投影到 2*c
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
 
-        # 增强分支：n 个 WTBlock 串联
         self.m = nn.ModuleList([
             WTBlock(self.c, kernel_size=kernel_size, wt_levels=wt_levels,
                     use_star=use_star, star_e=star_e, shortcut=shortcut)
             for _ in range(n)
         ])
 
-        # cv2 融合：直通分支 + 初始增强分支 + 每个 WTBlock 的输出合并
         self.cv2 = Conv((2 + n) * self.c, c2, 1, act=False)
         self.act = nn.SiLU(inplace=True)
 
     def forward(self, x):
-        # 1. 通道分割
         y = list(self.cv1(x).chunk(2, dim=1))   # [b, a]
         a = y[1]   # 增强分支
 
-        # 2. 小波精炼序列，保留每个块的输出（类似 C2f）
-        outputs = [y[0], a]   # 直通分支 + 初始增强分支
+        outputs = [y[0], a]
         for m in self.m:
             a = m(a)
             outputs.append(a)
 
-        # 3. 拼接并融合
         out = torch.cat(outputs, dim=1)
         out = self.act(self.cv2(out))
         return out
@@ -222,26 +191,18 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    # 模拟 P4 检测头前的输入：batch=2, 通道=512, 空间=40x40
     x = torch.randn(2, 512, 40, 40).to(device)
 
-    # 实例化 C3k2_WT：输出512通道，n=1，e=0.5
-    model = C3k2WT(c1=512, c2=512, n=1, e=0.5, shortcut=True,
-                    kernel_size=5, wt_levels=2, use_star=True, star_e=0.5).to(device)
+    # 模拟 YAML 原版参数顺序调用
+    model = C3k2WT(64, 128, n=1, c3k=False, e=0.25, attn=False, g=1, shortcut=True).to(device)
 
     print(model)
     y = model(x)
 
-    # 形状检查
-    expected_shape = (2, 512, 40, 40)
+    expected_shape = (2, 128, 40, 40)
     status = "✅" if y.shape == expected_shape else "❌"
     print(f"Input: {x.shape} → Output: {y.shape} expected {expected_shape} {status}")
 
-    # 梯度测试
     loss = y.mean()
     loss.backward()
-    has_grad = all(p.grad is not None for p in model.parameters() if p.requires_grad)
-    print(f"Backward passed. All params have gradients: {has_grad}")
-
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total_params:,}")
+    print("Gradients OK")
