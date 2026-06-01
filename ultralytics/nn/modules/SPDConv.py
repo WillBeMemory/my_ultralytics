@@ -101,7 +101,7 @@ if __name__ == "__main__":
     print("  Gradients OK")
 
     # 测试2：groups=8，廉价操作为标准 3×3（dw_groups=1）
-    model2 = SPDConv(c1=64, c2=128,groups=8, k=3, s=2, ghost_ratio=4, dw_groups=1).to(device)
+    model2 = SPDConv(c1=64, c2=128,groups=4, k=3, s=2, ghost_ratio=4, dw_groups=1).to(device)
     model2.train()
     x2 = torch.randn(2, 64, 32, 32).to(device)
     y2 = model2(x2)
