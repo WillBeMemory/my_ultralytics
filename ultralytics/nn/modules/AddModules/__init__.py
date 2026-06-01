@@ -8,3 +8,4 @@ from ultralytics.nn.modules.AddModules.EFCFusion import EFCFusion
 from ultralytics.nn.modules.AddModules.C3k2_Sparse import C3k2_Sparse
 from ultralytics.nn.modules.AddModules.StarC3k2 import StarC3k2
 from ultralytics.nn.modules.AddModules.ASFF import ASFF
+from ultralytics.nn.modules.AddModules.SPDWTConv import SPDWTConv
