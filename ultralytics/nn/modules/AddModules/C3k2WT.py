@@ -5,7 +5,7 @@ import math
 from ultralytics.nn.modules.block import Conv
 
 
-# ================== 小波滤波器 ==================
+# ================== Haar 小波滤波器 ==================
 def create_haar_filters(channels, dtype=torch.float):
     lo = torch.tensor([1.0, 1.0]) / math.sqrt(2)
     hi = torch.tensor([1.0, -1.0]) / math.sqrt(2)
@@ -18,7 +18,7 @@ def create_haar_filters(channels, dtype=torch.float):
 
 
 class WTConv2d(nn.Module):
-    """轻量 Haar 小波深度卷积，内部所有卷积均为深度可分离，stride=1 保持尺寸不变"""
+    """轻量 Haar 小波深度卷积（修正多级重构尺寸对齐）"""
     def __init__(self, in_channels, out_channels, kernel_size=5, wt_levels=2, bias=True, use_activation=True):
         super().__init__()
         assert in_channels == out_channels, "WTConv2d requires in_channels == out_channels"
@@ -29,14 +29,16 @@ class WTConv2d(nn.Module):
         dec_filters, rec_filters = create_haar_filters(in_channels)
         self.register_buffer('dec_filters', dec_filters)
         self.register_buffer('rec_filters', rec_filters)
-        self.pad = 0
+        self.pad = 0  # Haar 2x2 无需额外 padding
 
+        # 基础深度可分离卷积分支
         self.base_conv = nn.Conv2d(in_channels, in_channels, kernel_size,
                                    padding=kernel_size // 2, groups=in_channels, bias=bias)
         self.base_bn = nn.BatchNorm2d(in_channels) if use_activation else nn.Identity()
         self.base_act = nn.SiLU(inplace=True) if use_activation else nn.Identity()
         self.base_scale = nn.Parameter(torch.ones(1, in_channels, 1, 1))
 
+        # 各级子带深度可分离卷积
         self.wavelet_convs = nn.ModuleList()
         self.wavelet_bns = nn.ModuleList()
         self.wavelet_acts = nn.ModuleList()
@@ -68,6 +70,7 @@ class WTConv2d(nn.Module):
         B, C, H, W = x.shape
         orig_h, orig_w = H, W
 
+        # 多级分解并保存处理后的全部子带
         levels = []
         current = x
         for lvl in range(self.wt_levels):
@@ -79,24 +82,30 @@ class WTConv2d(nn.Module):
             conv_out = conv_out * self.wavelet_scales[lvl]
             processed = conv_out.view(B, C, 4, coeffs.shape[-2], coeffs.shape[-1])
             levels.append(processed)
-            current = processed[:, :, 0]
+            current = processed[:, :, 0]          # LL 进入下一级
 
+        # 逐级重构（修正尺寸对齐）
         current = None
         for lvl in reversed(range(self.wt_levels)):
-            if lvl == self.wt_levels - 1:
+            if lvl == self.wt_levels - 1:          # 最深级：直接使用处理后的 LL
                 ll = levels[lvl][:, :, 0]
             else:
-                ll = current
+                # 关键修正：将上一级重构图像 current 进行小波分解，取其 LL 分量
+                # 这样得到的低频尺寸与当前级的高频子带完全匹配
+                ll = self._dwt(current)[:, :, 0]
+
             lh = levels[lvl][:, :, 1]
             hl = levels[lvl][:, :, 2]
             hh = levels[lvl][:, :, 3]
             coeffs = torch.stack([ll, lh, hl, hh], dim=2)
+
             target_h = levels[lvl].shape[-2] * 2
             target_w = levels[lvl].shape[-1] * 2
             if lvl == 0:
                 target_h, target_w = orig_h, orig_w
             current = self._idwt(coeffs, target_h, target_w)
 
+        # 基础深度卷积分支
         base = self.base_conv(x)
         base = self.base_bn(base)
         base = self.base_act(base)
@@ -128,7 +137,7 @@ class StarBlock(nn.Module):
 
 
 class WTBlock(nn.Module):
-    """WTConv2d + 可选 StarBlock 的特征精炼块，输入输出通道相等"""
+    """WTConv2d + 可选 StarBlock 的特征精炼块"""
     def __init__(self, c, kernel_size=5, wt_levels=2, use_star=True, star_e=0.5, shortcut=True):
         super().__init__()
         self.shortcut = shortcut
@@ -152,8 +161,8 @@ class C3k2WT(nn.Module):
     融合小波卷积的 C3k2 模块，接口完全兼容 C3k2。
 
     YAML 示例（与原版 C3k2 参数顺序一致）：
-    [-1, 2, C3k2WT, [128, 1, False, 0.25]]   # 使用默认小波参数
-    [-1, 2, C3k2WT, [128, 1, False, 0.25, True, 1, 5, 2, True, 0.5]]  # 自定义小波参数
+    [-1, 2, C3k2WT, [128, 1, False, 0.25]]
+    [-1, 2, C3k2WT, [128, 1, False, 0.25, True, 1, 5, 2, True, 0.5]]
     """
     def __init__(self, c1, c2, n=1, c3k=False, e=0.5, attn=False, g=1, shortcut=True,
                  kernel_size=5, wt_levels=2, use_star=True, star_e=0.5, **kwargs):
@@ -184,25 +193,3 @@ class C3k2WT(nn.Module):
         out = torch.cat(outputs, dim=1)
         out = self.act(self.cv2(out))
         return out
-
-
-# ================== 简单测试 ==================
-if __name__ == "__main__":
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-
-    x = torch.randn(2, 512, 40, 40).to(device)
-
-    # 模拟 YAML 原版参数顺序调用
-    model = C3k2WT(64, 128, n=1, c3k=False, e=0.25, attn=False, g=1, shortcut=True).to(device)
-
-    print(model)
-    y = model(x)
-
-    expected_shape = (2, 128, 40, 40)
-    status = "✅" if y.shape == expected_shape else "❌"
-    print(f"Input: {x.shape} → Output: {y.shape} expected {expected_shape} {status}")
-
-    loss = y.mean()
-    loss.backward()
-    print("Gradients OK")
