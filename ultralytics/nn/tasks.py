@@ -68,6 +68,7 @@ from ultralytics.nn.modules.AddModules.C3k2_Sparse import C3k2_Sparse
 from ultralytics.nn.modules.AddModules.StarC3k2 import StarC3k2
 from ultralytics.nn.modules.AddModules.ASFF import ASFF
 from ultralytics.nn.modules.AddModules.SPDWTConv import SPDWTConv
+from ultralytics.nn.modules.AddModules.C3k2WT import C3k2WT
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1687,6 +1688,7 @@ def parse_model(d, ch, verbose=True):
             C3k2_Sparse,
             StarC3k2,
             SPDWTConv,
+            C3k2WT,
 
             Classify,
             Conv,
@@ -1767,6 +1769,7 @@ def parse_model(d, ch, verbose=True):
             SoftFillEdgeEnhance,
             C3k2_Sparse,
             StarC3k2,
+            C3k2WT,
 
             BottleneckCSP,
             C1,
