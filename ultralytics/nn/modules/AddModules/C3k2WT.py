@@ -18,7 +18,7 @@ def create_haar_filters(channels, dtype=torch.float):
 
 
 class WTConv2d(nn.Module):
-    """轻量 Haar 小波深度卷积（修正多级重构尺寸对齐）"""
+    """轻量 Haar 小波深度卷积（稳健尺寸对齐）"""
     def __init__(self, in_channels, out_channels, kernel_size=5, wt_levels=2, bias=True, use_activation=True):
         super().__init__()
         assert in_channels == out_channels, "WTConv2d requires in_channels == out_channels"
@@ -84,23 +84,33 @@ class WTConv2d(nn.Module):
             levels.append(processed)
             current = processed[:, :, 0]          # LL 进入下一级
 
-        # 逐级重构（修正尺寸对齐）
+        # 逐级重构（强制尺寸对齐）
         current = None
         for lvl in reversed(range(self.wt_levels)):
             if lvl == self.wt_levels - 1:          # 最深级：直接使用处理后的 LL
                 ll = levels[lvl][:, :, 0]
             else:
-                ll = current                        # 非最深级：上一级重构图像直接作为低频
+                # 上一级重构图像再分解得到低频（尺寸可能与高频差1）
+                ll = self._dwt(current)[:, :, 0]
 
             lh = levels[lvl][:, :, 1]
             hl = levels[lvl][:, :, 2]
             hh = levels[lvl][:, :, 3]
+
+            # 🔧 关键修复：将高频插值到低频尺寸，确保完全一致
+            if ll.shape[-2:] != lh.shape[-2:]:
+                lh = F.interpolate(lh, size=ll.shape[-2:], mode='nearest')
+                hl = F.interpolate(hl, size=ll.shape[-2:], mode='nearest')
+                hh = F.interpolate(hh, size=ll.shape[-2:], mode='nearest')
+
             coeffs = torch.stack([ll, lh, hl, hh], dim=2)
 
-            target_h = levels[lvl].shape[-2] * 2
-            target_w = levels[lvl].shape[-1] * 2
+            # 目标尺寸：低频尺寸 × 2，最终级恢复到原始尺寸
+            target_h = ll.shape[-2] * 2
+            target_w = ll.shape[-1] * 2
             if lvl == 0:
                 target_h, target_w = orig_h, orig_w
+
             current = self._idwt(coeffs, target_h, target_w)
 
         # 基础深度卷积分支
@@ -196,13 +206,12 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    # 模拟 P4 检测头前的输入：batch=1, 通道=64, 空间=40x40
-    x = torch.randn(1, 64, 40, 40).to(device)
-
+    # 测试奇数尺寸输入（43x43）
+    x = torch.randn(1, 64, 43, 43).to(device)
     model = C3k2WT(64, 128, n=1, c3k=False, e=0.5, attn=False, g=1, shortcut=True).to(device)
     model.train()
     y = model(x)
-    print(f"Input: {x.shape} → Output: {y.shape} (expected [1,128,40,40])")
+    print(f"Input: {x.shape} → Output: {y.shape} (expected [1,128,43,43])")
 
     loss = y.mean()
     loss.backward()
