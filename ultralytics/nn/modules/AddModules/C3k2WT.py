@@ -90,9 +90,7 @@ class WTConv2d(nn.Module):
             if lvl == self.wt_levels - 1:          # 最深级：直接使用处理后的 LL
                 ll = levels[lvl][:, :, 0]
             else:
-                # 关键修正：将上一级重构图像 current 进行小波分解，取其 LL 分量
-                # 这样得到的低频尺寸与当前级的高频子带完全匹配
-                ll = self._dwt(current)[:, :, 0]
+                ll = current                        # 非最深级：上一级重构图像直接作为低频
 
             lh = levels[lvl][:, :, 1]
             hl = levels[lvl][:, :, 2]
@@ -159,10 +157,8 @@ class WTBlock(nn.Module):
 class C3k2WT(nn.Module):
     """
     融合小波卷积的 C3k2 模块，接口完全兼容 C3k2。
-
     YAML 示例（与原版 C3k2 参数顺序一致）：
     [-1, 2, C3k2WT, [128, 1, False, 0.25]]
-    [-1, 2, C3k2WT, [128, 1, False, 0.25, True, 1, 5, 2, True, 0.5]]
     """
     def __init__(self, c1, c2, n=1, c3k=False, e=0.5, attn=False, g=1, shortcut=True,
                  kernel_size=5, wt_levels=2, use_star=True, star_e=0.5, **kwargs):
@@ -193,3 +189,21 @@ class C3k2WT(nn.Module):
         out = torch.cat(outputs, dim=1)
         out = self.act(self.cv2(out))
         return out
+
+
+# ================== 简单测试 ==================
+if __name__ == "__main__":
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+
+    # 模拟 P4 检测头前的输入：batch=1, 通道=64, 空间=40x40
+    x = torch.randn(1, 64, 40, 40).to(device)
+
+    model = C3k2WT(64, 128, n=1, c3k=False, e=0.5, attn=False, g=1, shortcut=True).to(device)
+    model.train()
+    y = model(x)
+    print(f"Input: {x.shape} → Output: {y.shape} (expected [1,128,40,40])")
+
+    loss = y.mean()
+    loss.backward()
+    print("Gradients OK")
