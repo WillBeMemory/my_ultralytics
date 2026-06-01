@@ -10,3 +10,4 @@ from ultralytics.nn.modules.AddModules.StarC3k2 import StarC3k2
 from ultralytics.nn.modules.AddModules.ASFF import ASFF
 from ultralytics.nn.modules.AddModules.SPDWTConv import SPDWTConv
 from ultralytics.nn.modules.AddModules.C3k2WT import C3k2WT
+from ultralytics.nn.modules.AddModules.SoftFillEdgeEnhance_PSA import SoftFillEdgeEnhance_PSA
