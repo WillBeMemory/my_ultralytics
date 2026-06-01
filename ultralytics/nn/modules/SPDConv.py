@@ -46,7 +46,7 @@ class SPDConv(nn.Module):
     - 分组数小，碎片化低，计算量接近普通 3×3 stride-2 卷积
     - 同时保留通道间的局部交互和无损下采样
     """
-    def __init__(self, c1, c2, k=1, s=2, groups=8, ghost_ratio=4, dw_groups=None, act=True):
+    def __init__(self, c1, c2, k=1, s=2, groups=16, ghost_ratio=4, dw_groups=None, act=True):
         super().__init__()
         self.s = s
         self.act = nn.SiLU(inplace=True) if act else nn.Identity()
