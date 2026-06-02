@@ -2,6 +2,7 @@
 
 """Deformable Convolution modules for C3k2."""
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -126,8 +127,9 @@ class DeformConv2d(nn.Module):
         self.modulation = modulation
 
         self.weight = nn.Parameter(
-            torch.randn(out_channels, in_channels // groups, kernel_size, kernel_size)
+            torch.empty(out_channels, in_channels // groups, kernel_size, kernel_size)
         )
+        self.reset_parameters()
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_channels))
         else:
@@ -149,6 +151,11 @@ class DeformConv2d(nn.Module):
         )
         nn.init.zeros_(self.offset_conv.weight)
         nn.init.zeros_(self.offset_conv.bias)
+        # Bias-init mask channels so initial sigmoid ≈ 0.88 (near identity modulation)
+        # Without this, sigmoid(0) = 0.5 would attenuate features by 50% per layer
+        if modulation:
+            mask_bias_start = groups * 2 * kernel_size * kernel_size
+            nn.init.constant_(self.offset_conv.bias[mask_bias_start:], 2.0)
 
         self.fallback_conv = nn.Conv2d(
             in_channels,
@@ -162,6 +169,10 @@ class DeformConv2d(nn.Module):
         )
         if bias:
             self.fallback_conv.bias.data.copy_(self.bias.data)
+
+    def reset_parameters(self):
+        """Kaiming init for weight (matching nn.Conv2d behavior)."""
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with deformable convolution.
