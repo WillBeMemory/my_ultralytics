@@ -36,9 +36,10 @@ def _deform_conv2d_pure(input, offset, weight, bias=None, stride=1, padding=0, d
     # Reshape offset: (B, 2*kH*kW, H_out, W_out) -> (B, kH*kW, 2, H_out, W_out)
     offset = offset.reshape(B, kH * kW, 2, H_out, W_out)
 
-    # Regular kernel sampling positions (relative to kernel center)
-    ky = torch.arange(kH, device=input.device, dtype=torch.float32) * dilation - (dilation * (kH - 1) / 2.0)
-    kx = torch.arange(kW, device=input.device, dtype=torch.float32) * dilation - (dilation * (kW - 1) / 2.0)
+    # Regular kernel sampling positions: [0, d, 2d, ..., (k-1)d] (NOT centered)
+    # The padded input coordinates align directly: output[i] samples input[i..i+k-1]
+    ky = torch.arange(kH, device=input.device, dtype=torch.float32) * dilation
+    kx = torch.arange(kW, device=input.device, dtype=torch.float32) * dilation
     ky_grid, kx_grid = torch.meshgrid(ky, kx, indexing='ij')
     kernel_y = ky_grid.reshape(1, kH * kW, 1, 1, 1)    # (1, kH*kW, 1, 1, 1)
     kernel_x = kx_grid.reshape(1, kH * kW, 1, 1, 1)    # (1, kH*kW, 1, 1, 1)
