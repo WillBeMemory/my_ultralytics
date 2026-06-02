@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ================== 新版 Bottleneck（残差后无激活） ==================
+# ================== 原有子模块 ==================
 class Bottleneck(nn.Module):
     def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
         super().__init__()
@@ -20,11 +20,10 @@ class Bottleneck(nn.Module):
         out = self.act(self.bn1(self.cv1(x)))
         out = self.bn2(self.cv2(out))
         if self.add:
-            out = out + identity      # 新版：残差相加后不激活
+            out = out + identity      # 残差后无激活（与您之前一致）
         return out
 
 
-# ================== 背景软填充 ==================
 class AdaptiveBackgroundFill(nn.Module):
     def __init__(self, ch, pool_size=3, fill_strength=0.8, bg_thresh_ratio=0.5):
         super().__init__()
@@ -48,7 +47,6 @@ class AdaptiveBackgroundFill(nn.Module):
         return out
 
 
-# ================== 通道感知边缘增强 ==================
 class ChannelAwareEdgeEnhance_Attn(nn.Module):
     def __init__(self, ch, pool_size=3, ch_sharp=5.0, ch_thresh=0.5, edge_sharp=5.0, edge_thresh=0.5):
         super().__init__()
@@ -89,16 +87,16 @@ class ChannelAwareEdgeEnhance_Attn(nn.Module):
         return out
 
 
-# ================== SoftFillEdgeEnhance（仅移除投影 BN） ==================
+# ================== 改进后的 SoftFillEdgeEnhance（末尾追加深度可分离卷积） ==================
 class SoftFillEdgeEnhance(nn.Module):
     def __init__(self, c1, c2, n=1, pool_size=3, bottleneck_e=0.5,
                  fill_strength=0.8, bg_thresh_ratio=0.5,
                  ch_sharp=5.0, ch_thresh=0.5,
                  edge_sharp=5.0, edge_thresh=0.5,
-                 bottleneck_shortcut=True):
+                 bottleneck_shortcut=True,
+                 use_dwconv=True):               # 新增：是否追加深度可分离卷积
         super().__init__()
         assert pool_size % 2 == 1, "pool_size must be odd"
-        # 无 main_shortcut，无全局残差
 
         self.bg_fill = AdaptiveBackgroundFill(c1, pool_size, fill_strength, bg_thresh_ratio)
         self.attn = ChannelAwareEdgeEnhance_Attn(c1, pool_size, ch_sharp, ch_thresh, edge_sharp, edge_thresh)
@@ -108,11 +106,26 @@ class SoftFillEdgeEnhance(nn.Module):
             for _ in range(n)
         ])
 
-        # 投影层：仅使用线性 1×1 卷积（或恒等映射），无 BN，无激活
+        # 投影层（无 BN，无激活）
         if c1 != c2:
             self.proj = nn.Conv2d(c1, c2, 1, bias=False)
         else:
             self.proj = nn.Identity()
+
+        # 末尾深度可分离卷积（输入输出通道均为 c2）
+        if use_dwconv:
+            self.dwconv = nn.Sequential(
+                # Depthwise 3x3
+                nn.Conv2d(c2, c2, 3, padding=1, groups=c2, bias=False),
+                nn.BatchNorm2d(c2),
+                nn.SiLU(inplace=True),
+                # Pointwise 1x1
+                nn.Conv2d(c2, c2, 1, bias=False),
+                nn.BatchNorm2d(c2),
+                nn.SiLU(inplace=True)
+            )
+        else:
+            self.dwconv = nn.Identity()
 
     def forward(self, x):
         target_dtype = self.bottlenecks[0].cv1.weight.dtype if len(self.bottlenecks) > 0 else x.dtype
@@ -122,4 +135,23 @@ class SoftFillEdgeEnhance(nn.Module):
         out = self.attn(out)
         out = self.bottlenecks(out)
         out = self.proj(out)
+        out = self.dwconv(out)   # 追加深度可分离精炼
         return out
+
+
+# ================== 简单测试 ==================
+if __name__ == "__main__":
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+
+    # 通道改变的情况
+    x = torch.randn(2, 128, 80, 80).to(device)
+    model = SoftFillEdgeEnhance(128, 256, n=1, pool_size=3, fill_strength=0.8, bg_thresh_ratio=0.5,
+                                ch_sharp=5.0, ch_thresh=0.5, edge_sharp=5.0, edge_thresh=0.5,
+                                bottleneck_shortcut=True, use_dwconv=True).to(device)
+    model.train()
+    y = model(x)
+    print(f"Input: {x.shape} → Output: {y.shape} (expected [2,256,80,80])")
+    loss = y.mean()
+    loss.backward()
+    print("Gradients OK")
