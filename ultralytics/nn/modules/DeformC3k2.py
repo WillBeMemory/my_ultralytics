@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torchvision.ops import deform_conv2d
 
 from ultralytics.nn.modules.block import PSABlock
+from ultralytics.nn.modules.conv import Conv
 
 
 class DeformConv2d(nn.Module):
@@ -99,6 +100,7 @@ class DeformConv2d(nn.Module):
         Returns:
             torch.Tensor: Output tensor [B, C_out, H_out, W_out].
         """
+        x_orig = x
         if self.padding > 0:
             x = F.pad(x, [self.padding] * 4)
 
@@ -108,7 +110,7 @@ class DeformConv2d(nn.Module):
         W_out = (x.size(3) - self.dilation * (self.kernel_size - 1) - 1) // self.stride + 1
 
         if offset.size(2) != H_out or offset.size(3) != W_out:
-            return self.fallback_conv(x)
+            return self.fallback_conv(x_orig)
 
         mask = None
         if self.modulation:
@@ -132,7 +134,7 @@ class DeformConv2d(nn.Module):
                 stride=self.stride, dilation=self.dilation, mask=mask,
             )
         except RuntimeError:
-            out = self.fallback_conv(x)
+            out = self.fallback_conv(x_orig)
 
         return out
 
@@ -292,7 +294,7 @@ class DeformC3k2(nn.Module):
         """Initialize DeformC3k2 module."""
         super().__init__()
         self.c = int(c2 * e)  # hidden channels
-        self.cv1 = nn.Conv2d(c1, 2 * self.c, 1, 1)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
 
         self.m = nn.ModuleList()
         for _ in range(n):
@@ -314,7 +316,7 @@ class DeformC3k2(nn.Module):
                     DeformBottleneck(self.c, self.c, shortcut, g, kernel_size=kernel_size)
                 )
 
-        self.cv2 = nn.Conv2d((2 + n) * self.c, c2, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through DeformC3k2.
@@ -370,7 +372,7 @@ class DeformC3k2Block(nn.Module):
         """
         super().__init__()
         self.c = int(c2 * e)
-        self.cv1 = nn.Conv2d(c1, 2 * self.c, 1, 1)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
 
         self.blocks = nn.ModuleList()
         for _ in range(n):
@@ -384,7 +386,7 @@ class DeformC3k2Block(nn.Module):
                 block.append(CoordAtt(self.c, self.c))
             self.blocks.append(block)
 
-        self.cv2 = nn.Conv2d((2 + n) * self.c, c2, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through DeformC3k2Block."""
