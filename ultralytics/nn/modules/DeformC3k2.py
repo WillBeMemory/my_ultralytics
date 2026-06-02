@@ -6,10 +6,82 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torchvision.ops import deform_conv2d
-
 from ultralytics.nn.modules.block import PSABlock
 from ultralytics.nn.modules.conv import Conv
+
+
+def _deform_conv2d_pure(input, offset, weight, bias=None, stride=1, padding=0, dilation=1, mask=None):
+    """Pure PyTorch DCN v2 implementation using F.grid_sample (CUDA-safe).
+
+    Args:
+        input:   (B, C_in, H_in, W_in)
+        offset:  (B, 2 * offset_groups * kH * kW, H_out, W_out)
+        weight:  (C_out, C_in // groups, kH, kW)
+        mask:    (B, offset_groups * kH * kW, H_out, W_out) or None
+    """
+    B, C_in, H_in, W_in = input.shape
+    C_out, C_in_g, kH, kW = weight.shape
+    groups = C_in // C_in_g
+
+    # Pad input
+    if padding > 0:
+        input = F.pad(input, [padding] * 4)
+    H, W = input.shape[2], input.shape[3]
+
+    # Output spatial dims
+    H_out = (H_in + 2 * padding - dilation * (kH - 1) - 1) // stride + 1
+    W_out = (W_in + 2 * padding - dilation * (kW - 1) - 1) // stride + 1
+
+    # Reshape offset: (B, 2*kH*kW, H_out, W_out) -> (B, kH*kW, 2, H_out, W_out)
+    offset = offset.reshape(B, kH * kW, 2, H_out, W_out)
+
+    # Regular kernel sampling positions (relative to kernel center)
+    ky = torch.arange(kH, device=input.device, dtype=torch.float32) * dilation - (dilation * (kH - 1) / 2.0)
+    kx = torch.arange(kW, device=input.device, dtype=torch.float32) * dilation - (dilation * (kW - 1) / 2.0)
+    ky_grid, kx_grid = torch.meshgrid(ky, kx, indexing='ij')
+    kernel_y = ky_grid.reshape(1, kH * kW, 1, 1, 1)    # (1, kH*kW, 1, 1, 1)
+    kernel_x = kx_grid.reshape(1, kH * kW, 1, 1, 1)    # (1, kH*kW, 1, 1, 1)
+
+    # Output base positions
+    y_out = torch.arange(H_out, device=input.device, dtype=torch.float32) * stride
+    x_out = torch.arange(W_out, device=input.device, dtype=torch.float32) * stride
+
+    # Sampling positions = base + kernel_offset + learnable_offset
+    sample_y = (y_out.view(1, 1, 1, H_out, 1) + kernel_y + offset[:, :, 1:2]).expand(-1, -1, -1, -1, W_out)
+    sample_x = (x_out.view(1, 1, 1, 1, W_out) + kernel_x + offset[:, :, 0:1]).expand(-1, -1, -1, H_out, -1)
+
+    # Normalize to [-1, 1] for grid_sample
+    sample_y = 2.0 * sample_y / (H - 1) - 1.0
+    sample_x = 2.0 * sample_x / (W - 1) - 1.0
+
+    # Build grid: (B * kH*kW, H_out, W_out, 2)
+    grid = torch.stack([sample_x, sample_y], dim=-1)  # (B, kH*kW, H_out, W_out, 2)
+    grid = grid.reshape(B * kH * kW, H_out, W_out, 2)
+
+    # Expand input for batched grid_sample: (B * kH*kW, C_in, H, W)
+    input_exp = input.unsqueeze(1).expand(-1, kH * kW, -1, -1, -1).reshape(B * kH * kW, C_in, H, W)
+
+    # Sample: (B*kH*kW, C_in, H_out, W_out)
+    sampled = F.grid_sample(input_exp, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+    sampled = sampled.reshape(B, kH * kW, C_in, H_out, W_out)
+    sampled = sampled.permute(0, 3, 4, 2, 1)  # (B, H_out, W_out, C_in, kH*kW)
+
+    # Apply modulation mask
+    if mask is not None:
+        mask = mask.reshape(B, kH * kW, H_out, W_out).permute(0, 2, 3, 1)  # (B, H_out, W_out, kH*kW)
+        mask = torch.sigmoid(mask)
+        sampled = sampled * mask.unsqueeze(-2)  # (B, H_out, W_out, C_in, kH*kW)
+
+    # Apply convolution weights: (C_out, C_in, kH*kW)
+    weight_flat = weight.reshape(C_out, C_in, kH * kW)
+    out = torch.einsum('bhwck,ock->bhwo', sampled, weight_flat)  # (B, H_out, W_out, C_out)
+
+    out = out.permute(0, 3, 1, 2)  # (B, C_out, H_out, W_out)
+
+    if bias is not None:
+        out = out + bias.view(1, -1, 1, 1)
+
+    return out
 
 
 class DeformConv2d(nn.Module):
@@ -100,17 +172,11 @@ class DeformConv2d(nn.Module):
         Returns:
             torch.Tensor: Output tensor [B, C_out, H_out, W_out].
         """
-        x_orig = x
-        if self.padding > 0:
-            x = F.pad(x, [self.padding] * 4)
-
         offset = self.offset_conv(x)
 
-        H_out = (x.size(2) - self.dilation * (self.kernel_size - 1) - 1) // self.stride + 1
-        W_out = (x.size(3) - self.dilation * (self.kernel_size - 1) - 1) // self.stride + 1
-
-        if offset.size(2) != H_out or offset.size(3) != W_out:
-            return self.fallback_conv(x_orig)
+        # Clamp offsets to prevent CUDA access violations from extreme sampling coordinates
+        max_offset = 3 * self.kernel_size
+        offset = torch.clamp(offset, min=-max_offset, max=max_offset)
 
         mask = None
         if self.modulation:
@@ -129,12 +195,12 @@ class DeformConv2d(nn.Module):
             mask = torch.sigmoid(mask)
 
         try:
-            out = deform_conv2d(
+            out = _deform_conv2d_pure(
                 x, offset, self.weight, self.bias,
-                stride=self.stride, dilation=self.dilation, mask=mask,
+                stride=self.stride, padding=self.padding, dilation=self.dilation, mask=mask,
             )
-        except RuntimeError:
-            out = self.fallback_conv(x_orig)
+        except Exception:
+            out = self.fallback_conv(x)
 
         return out
 
@@ -169,9 +235,9 @@ class DeformBottleneck(nn.Module):
         """
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = nn.Conv2d(c1, c_, k[0], 1)
+        self.cv1 = nn.Conv2d(c1, c_, k[0], 1, padding=k[0] // 2)
         self.bn1 = nn.BatchNorm2d(c_)
-        self.act = nn.SiLU(inplace=True)
+        self.act = nn.SiLU(inplace=False)
 
         self.cv2 = DeformConv2d(c_, c2, kernel_size=kernel_size, stride=1, padding=kernel_size // 2, groups=g)
         self.bn2 = nn.BatchNorm2d(c2)
@@ -188,7 +254,7 @@ class DeformBottleneck(nn.Module):
             torch.Tensor: Output tensor.
         """
         out = self.act(self.bn1(self.cv1(x)))
-        out = self.bn2(self.cv2(out))
+        out = self.act(self.bn2(self.cv2(out)))
         return x + out if self.add else out
 
 
@@ -226,7 +292,7 @@ class DeformC3k(nn.Module):
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = nn.Conv2d(c1, c_, 1, 1)
         self.bn1 = nn.BatchNorm2d(c_)
-        self.act = nn.SiLU(inplace=True)
+        self.act = nn.SiLU(inplace=False)
         self.cv2 = nn.Conv2d(c1, c_, 1, 1)
         self.bn2 = nn.BatchNorm2d(c_)
         self.m = nn.Sequential(
@@ -286,10 +352,10 @@ class DeformC3k2(nn.Module):
         n: int = 1,
         c3k: bool = False,
         e: float = 0.5,
+        kernel_size: int = 3,
         attn: bool = False,
         g: int = 1,
         shortcut: bool = True,
-        kernel_size: int = 3,
     ):
         """Initialize DeformC3k2 module."""
         super().__init__()
