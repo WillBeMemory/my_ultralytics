@@ -126,6 +126,7 @@ class DeformConv2d(nn.Module):
         self.dilation = dilation
         self.groups = groups
         self.modulation = modulation
+        self.warmup_steps = 10000  # first N training steps: equivalent to standard Conv2d
 
         self.weight = nn.Parameter(
             torch.empty(out_channels, in_channels // groups, kernel_size, kernel_size)
@@ -189,8 +190,15 @@ class DeformConv2d(nn.Module):
             torch.Tensor: Output tensor [B, C_out, H_out, W_out].
         """
         # 快速路径：如果 groups>1 或 kernel_size≠3，直接走标准卷积
-        # 避免纯实现的 groups 支持问题
         if self.groups > 1 or self.kernel_size != 3:
+            return self.fallback_conv(x)
+
+        # Warmup: first warmup_steps equivalent to standard Conv2d
+        # (offset_conv output detached → 0 grad → DCN offset stays 0)
+        if not hasattr(self, '_step'):
+            self.register_buffer('_step', torch.tensor(0, dtype=torch.long))
+        self._step += 1
+        if self._step <= self.warmup_steps:
             return self.fallback_conv(x)
 
         offset = self.offset_conv(x)
