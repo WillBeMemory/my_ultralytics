@@ -172,6 +172,11 @@ class DeformConv2d(nn.Module):
         Returns:
             torch.Tensor: Output tensor [B, C_out, H_out, W_out].
         """
+        # 快速路径：如果 groups>1 或 kernel_size≠3，直接走标准卷积
+        # 避免纯实现的 groups 支持问题
+        if self.groups > 1 or self.kernel_size != 3:
+            return self.fallback_conv(x)
+
         offset = self.offset_conv(x)
 
         # Clamp offsets to prevent CUDA access violations from extreme sampling coordinates
