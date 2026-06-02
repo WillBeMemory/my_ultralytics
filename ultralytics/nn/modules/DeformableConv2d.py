@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -57,7 +58,7 @@ def _deform_conv2d_pure(input, offset, weight, bias=None, stride=1, padding=0, d
     sampled = sampled.reshape(B, kH * kW, C_in, H_out, W_out)
     sampled = sampled.permute(0, 3, 4, 2, 1)  # (B, H_out, W_out, C_in, kH*kW)
 
-    # Apply modulation mask
+    # Apply modulation mask (sigmoid applied here, NOT in caller)
     if mask is not None:
         mask = mask.reshape(B, kH * kW, H_out, W_out).permute(0, 2, 3, 1)
         mask = torch.sigmoid(mask)
@@ -88,16 +89,17 @@ class DeformableConv2d(nn.Module):
         self.groups = groups
         self.modulation = modulation
 
-        # 权重
+        # Weight with Kaiming init (matching nn.Conv2d)
         self.weight = nn.Parameter(
-            torch.randn(out_channels, in_channels // groups, kernel_size, kernel_size)
+            torch.empty(out_channels, in_channels // groups, kernel_size, kernel_size)
         )
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_channels))
         else:
             self.register_parameter('bias', None)
+        self.reset_parameters()
 
-        # 偏移量生成卷积
+        # Offset generation convolution
         offset_base = (2 + (1 if modulation else 0)) * kernel_size * kernel_size
         offset_channels = groups * offset_base
         self.offset_conv = nn.Conv2d(
@@ -106,14 +108,26 @@ class DeformableConv2d(nn.Module):
         )
         nn.init.zeros_(self.offset_conv.weight)
         nn.init.zeros_(self.offset_conv.bias)
+        # Bias-init mask channels so initial sigmoid ≈ 0.88 (near identity modulation)
+        if modulation:
+            mask_bias_start = groups * 2 * kernel_size * kernel_size
+            nn.init.constant_(self.offset_conv.bias[mask_bias_start:], 2.0)
 
-        # 回退用的标准卷积
+        # Fallback standard convolution
         self.fallback_conv = nn.Conv2d(
             in_channels, out_channels, kernel_size, stride, padding,
             dilation=dilation, groups=groups, bias=bias is not None
         )
         if bias:
             self.fallback_conv.bias.data.copy_(self.bias.data)
+
+    def reset_parameters(self):
+        """Kaiming init for weight and bias (matching nn.Conv2d behavior)."""
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x):
         offset = self.offset_conv(x)
@@ -124,6 +138,7 @@ class DeformableConv2d(nn.Module):
 
         mask = None
         if self.modulation:
+
             offset_ch_per_group = 2 * self.kernel_size * self.kernel_size
             mask_ch_per_group = self.kernel_size * self.kernel_size
             offset_list, mask_list = [], []
@@ -135,12 +150,11 @@ class DeformableConv2d(nn.Module):
                 mask_list.append(mask_part)
             offset = torch.cat(offset_list, dim=1)
             mask = torch.cat(mask_list, dim=1)
-            mask = torch.sigmoid(mask)
+            # Note: sigmoid is applied inside _deform_conv2d_pure, NOT here
 
-        # Pure PyTorch DCN (groups=1) or fallback (groups>1)
+        # Pure PyTorch DCN (groups=1 only; groups>1 falls back to standard conv)
         if self.groups == 1:
             try:
-                # Apply DCN per group if groups>1, else single group
                 out = _deform_conv2d_pure(
                     x, offset, self.weight, self.bias,
                     stride=self.stride, padding=self.padding,
@@ -149,7 +163,6 @@ class DeformableConv2d(nn.Module):
             except Exception:
                 out = self.fallback_conv(x)
         else:
-            # groups > 1 not supported in pure DCN; use fallback
             out = self.fallback_conv(x)
 
         return out

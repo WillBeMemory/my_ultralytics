@@ -130,11 +130,11 @@ class DeformConv2d(nn.Module):
         self.weight = nn.Parameter(
             torch.empty(out_channels, in_channels // groups, kernel_size, kernel_size)
         )
-        self.reset_parameters()
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_channels))
         else:
             self.register_parameter('bias', None)
+        self.reset_parameters()
 
         offset_channels = 2 * kernel_size * kernel_size
         if modulation:
@@ -172,8 +172,12 @@ class DeformConv2d(nn.Module):
             self.fallback_conv.bias.data.copy_(self.bias.data)
 
     def reset_parameters(self):
-        """Kaiming init for weight (matching nn.Conv2d behavior)."""
+        """Kaiming init for weight and bias (matching nn.Conv2d behavior)."""
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with deformable convolution.
