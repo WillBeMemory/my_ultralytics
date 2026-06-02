@@ -6,9 +6,18 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import deform_conv2d as _tv_deform_conv2d
 
 from ultralytics.nn.modules.block import PSABlock
 from ultralytics.nn.modules.conv import Conv
+
+try:
+    from ultralytics.nn.modules.CoordinateAttention import CoordAtt
+except ModuleNotFoundError:
+    try:
+        from ultralytics.nn.modules.coordatt import CoordAtt
+    except ModuleNotFoundError:
+        CoordAtt = None
 
 
 def _deform_conv2d_pure(input, offset, weight, bias=None, stride=1, padding=0, dilation=1, mask=None):
@@ -189,21 +198,33 @@ class DeformConv2d(nn.Module):
         Returns:
             torch.Tensor: Output tensor [B, C_out, H_out, W_out].
         """
-        # 快速路径：如果 groups>1 或 kernel_size≠3，直接走标准卷积
+        # Fast path: fallback for groups>1 or k!=3
         if self.groups > 1 or self.kernel_size != 3:
             return self.fallback_conv(x)
 
-        # Warmup: first warmup_steps equivalent to standard Conv2d
-        # (offset_conv output detached → 0 grad → DCN offset stays 0)
-        if not hasattr(self, '_step'):
-            self.register_buffer('_step', torch.tensor(0, dtype=torch.long))
-        self._step += 1
-        if self._step <= self.warmup_steps:
-            return self.fallback_conv(x)
+        # AMP-safe: grid_sample backward is imprecise in float16
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            out = self._dcn_forward(x)
+        return out
+
+    def _dcn_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Core DCN forward in full precision (AMP-safe)."""
+        dtype_in = x.dtype
+        need_cast = dtype_in != torch.float32
+        if need_cast:
+            x = x.float()
 
         offset = self.offset_conv(x)
 
-        # Clamp offsets to prevent CUDA access violations from extreme sampling coordinates
+        # Gradual warmup: ramp offset from 0→1 over warmup_steps
+        # α=0: DCN == standard Conv2d; α=1: full DCN
+        if not hasattr(self, '_step'):
+            self.register_buffer('_step', torch.tensor(0, dtype=torch.long))
+        self._step += 1
+        alpha = min(1.0, self._step.float() / self.warmup_steps)
+        offset = offset * alpha
+
+        # Clamp offsets for safety
         max_offset = 3 * self.kernel_size
         offset = torch.clamp(offset, min=-max_offset, max=max_offset)
 
@@ -222,13 +243,25 @@ class DeformConv2d(nn.Module):
             offset = torch.cat(offset_list, dim=1)
             mask = torch.cat(mask_list, dim=1)
 
+        # Use reliable pure PyTorch DCN (avoids torchvision segfault on backward)
+        # Set self._use_tv_dcn = True to opt-in to torchvision CUDA kernel (faster, may crash)
+        use_tv = getattr(self, '_use_tv_dcn', False)
         try:
-            out = _deform_conv2d_pure(
-                x, offset, self.weight, self.bias,
-                stride=self.stride, padding=self.padding, dilation=self.dilation, mask=mask,
-            )
+            if use_tv:
+                out = _tv_deform_conv2d(
+                    x, offset, self.weight, self.bias,
+                    stride=self.stride, padding=self.padding, dilation=self.dilation, mask=mask,
+                )
+            else:
+                out = _deform_conv2d_pure(
+                    x, offset, self.weight, self.bias,
+                    stride=self.stride, padding=self.padding, dilation=self.dilation, mask=mask,
+                )
         except Exception:
-            out = self.fallback_conv(x)
+            out = self.fallback_conv(x.to(torch.float32) if need_cast else x)
+
+        if need_cast:
+            out = out.to(dtype_in)
 
         return out
 
@@ -475,8 +508,7 @@ class DeformC3k2Block(nn.Module):
                 nn.BatchNorm2d(self.c),
                 nn.SiLU(inplace=True),
             )
-            if use_coord_attn:
-                from ultralytics.nn.modules.coordatt import CoordAtt
+            if use_coord_attn and CoordAtt is not None:
                 block.append(CoordAtt(self.c, self.c))
             self.blocks.append(block)
 

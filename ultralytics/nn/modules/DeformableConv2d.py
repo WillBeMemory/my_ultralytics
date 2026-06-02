@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import deform_conv2d as _tv_deform_conv2d
 
 
 def _deform_conv2d_pure(input, offset, weight, bias=None, stride=1, padding=0, dilation=1, mask=None):
@@ -130,6 +131,16 @@ class DeformableConv2d(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x):
+        # AMP-safe: force full precision for DCN computation
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            return self._dcn_forward(x)
+
+    def _dcn_forward(self, x):
+        dtype_in = x.dtype
+        need_cast = dtype_in != torch.float32
+        if need_cast:
+            x = x.float()
+
         offset = self.offset_conv(x)
 
         # Clamp offsets for safety
@@ -152,18 +163,32 @@ class DeformableConv2d(nn.Module):
             mask = torch.cat(mask_list, dim=1)
             # Note: sigmoid is applied inside _deform_conv2d_pure, NOT here
 
-        # Pure PyTorch DCN (groups=1 only; groups>1 falls back to standard conv)
+        # DCN forward: default to reliable pure PyTorch DCN
+        # Set self._use_tv_dcn = True to opt-in to torchvision CUDA kernel (may segfault on backward)
         if self.groups == 1:
+            use_tv = getattr(self, '_use_tv_dcn', False)
             try:
-                out = _deform_conv2d_pure(
-                    x, offset, self.weight, self.bias,
-                    stride=self.stride, padding=self.padding,
-                    dilation=self.dilation, mask=mask,
-                )
+                if use_tv:
+                    out = _tv_deform_conv2d(
+                        x, offset, self.weight, self.bias,
+                        stride=self.stride, padding=self.padding,
+                        dilation=self.dilation, mask=mask,
+                    )
+                else:
+                    out = _deform_conv2d_pure(
+                        x, offset, self.weight, self.bias,
+                        stride=self.stride, padding=self.padding,
+                        dilation=self.dilation, mask=mask,
+                    )
             except Exception:
-                out = self.fallback_conv(x)
+                out = self.fallback_conv(x if not need_cast else x.to(torch.float32))
         else:
-            out = self.fallback_conv(x)
+            out = self.fallback_conv(x if not need_cast else x.to(torch.float32))
+
+        if need_cast:
+            out = out.to(dtype_in)
+
+        return out
 
         return out
 
