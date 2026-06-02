@@ -1,0 +1,62 @@
+# YOLO11 with DeformC3k2 + Attention for HRSID SAR Ship Detection
+# 专为高分辨率SAR图像舰船检测设计的YOLO11模型
+# 结合了可变形卷积 + CBAM注意力 + 小目标增强
+
+# Parameters
+nc: 1  # HRSID 只有舰船这一类
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 1024]
+
+# Backbone with Deformable Convolution and CBAM-like attention
+backbone:
+  # [from, repeats, module, args]
+  # Stage 1: P1/2
+  - [-1, 1, Conv, [64, 3, 2]]  # 0
+  - [-1, 1, DeformBottleneck, [64, True, 1, 3]]  # 1 - 可变形残差块
+
+  # Stage 2: P2/4
+  - [-1, 1, Conv, [128, 3, 2]]  # 2
+  - [-1, 2, DeformC3k2, [256, False, 0.5, 5]]  # 3 - 可变形C3k2, kernel_size=5
+
+  # Stage 3: P3/8
+  - [-1, 1, Conv, [256, 3, 2]]  # 4
+  - [-1, 2, DeformC3k2, [256, True, 0.5, 3]]  # 5 - 可变形C3k2 + Attention
+
+  # Stage 4: P4/16
+  - [-1, 1, Conv, [256, 3, 2]]  # 6
+  - [-1, 2, DeformC3k2, [512, False, 0.5, 5]]  # 7 - 可变形C3k2, kernel_size=5
+
+  # Stage 5: P5/32
+  - [-1, 1, Conv, [512, 3, 2]]  # 8
+  - [-1, 2, DeformC3k2, [512, True, 0.5, 3]]  # 9 - 可变形C3k2 + Attention
+
+  # SPPF with enhanced receptive field
+  - [-1, 1, SPPF, [512, 5]]  # 10
+
+  # C2PSA for enhanced feature processing
+  - [-1, 2, C2PSA, [512]]  # 11
+
+# Neck: PAFPN with deformable convolutions
+head:
+  # Top-down pathway with deformable modules
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 7], 1, Concat, [1]]  # cat backbone P4
+  - [-1, 2, DeformC3k2, [512, False, 0.5, 3]]  # 14
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 5], 1, Concat, [1]]  # cat backbone P3
+  - [-1, 2, DeformC3k2, [256, False, 0.5, 5]]  # 17 (P3/8-small target enhanced)
+
+  # Bottom-up pathway
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 14], 1, Concat, [1]]  # cat head P4
+  - [-1, 2, DeformC3k2, [512, False, 0.5, 3]]  # 20 (P4/16)
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 11], 1, Concat, [1]]  # cat head P5
+  - [-1, 2, DeformC3k2, [512, True, 0.5, 5]]  # 23 (P5/32)
+
+  # Detection head
+  - [[17, 20, 23], 1, Detect, [nc]]  # Detect(P3, P4, P5)

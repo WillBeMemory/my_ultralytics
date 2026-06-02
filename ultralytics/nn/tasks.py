@@ -46,6 +46,7 @@ from ultralytics.nn.modules.HIPAV2 import HIPAV2
 from ultralytics.nn.modules.WaveletStem import WaveletStem
 from ultralytics.nn.modules.DSWT_GhostConv import DSWT_GhostConv
 from ultralytics.nn.modules.DynamicC3k2 import DynamicC3k2
+from ultralytics.nn.modules.DeformC3k2 import DeformC3k2, DeformBottleneck, DeformConv2d, DeformC3k, DeformC3k2Block
 from ultralytics.nn.modules.BiFPN import BiFPN
 from ultralytics.nn.modules.SplitList import SplitList
 from ultralytics.nn.modules.CCFPN import CCFPN
@@ -1676,6 +1677,11 @@ def parse_model(d, ch, verbose=True):
             WaveletStem,
             DSWT_GhostConv,
             DynamicC3k2,
+            DeformC3k2,
+            DeformBottleneck,
+            DeformConv2d,
+            DeformC3k,
+            DeformC3k2Block,
             SplitList,
             WaveletCSP,
             WaveletRefine,
@@ -1763,6 +1769,10 @@ def parse_model(d, ch, verbose=True):
             HIPAV2,
             DSWT_GhostConv,
             DynamicC3k2,
+            DeformC3k2,
+            DeformBottleneck,
+            DeformC3k,
+            DeformC3k2Block,
             WaveletCSP,
             WaveletRefine,
             IWConv,
