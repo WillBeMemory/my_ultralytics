@@ -48,11 +48,11 @@ class WTConv2d(nn.Module):
         self.wavelet_scales = nn.ParameterList()
         for _ in range(wt_levels):
             conv = nn.Conv2d(in_channels * 4, in_channels * 4, kernel_size,
-                             padding=kernel_size // 2, groups=in_channels * 4, bias=False)
+                             padding=kernel_size // 2, groups=in_channels, bias=False)
             self.wavelet_convs.append(conv)
             self.wavelet_bns.append(nn.BatchNorm2d(in_channels * 4) if use_activation else nn.Identity())
             self.wavelet_acts.append(nn.SiLU(inplace=True) if use_activation else nn.Identity())
-            self.wavelet_scales.append(nn.Parameter(torch.ones(1, in_channels * 4, 1, 1) * 0.1))
+            self.wavelet_scales.append(nn.Parameter(torch.ones(1, in_channels * 4, 1, 1) * 0.5))
 
     def _dwt(self, x):
         B, C, H, W = x.shape
