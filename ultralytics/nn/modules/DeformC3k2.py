@@ -197,7 +197,6 @@ class DeformConv2d(nn.Module):
                 mask_list.append(mask_part)
             offset = torch.cat(offset_list, dim=1)
             mask = torch.cat(mask_list, dim=1)
-            mask = torch.sigmoid(mask)
 
         try:
             out = _deform_conv2d_pure(
