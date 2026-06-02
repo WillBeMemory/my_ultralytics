@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,6 +33,7 @@ class AdaptiveBackgroundFill(nn.Module):
         self.pool_size = pool_size
         self.fill_strength = fill_strength
         self.bg_thresh_ratio = bg_thresh_ratio
+        self.register_buffer('eps', torch.tensor(1e-6))
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -40,8 +42,7 @@ class AdaptiveBackgroundFill(nn.Module):
         max_s = F.max_pool2d(x, self.pool_size, stride=1, padding=pad)
         min_s = -F.max_pool2d(-x, self.pool_size, stride=1, padding=pad)
         local_contrast = max_s - min_s
-        eps = torch.tensor(1e-6, dtype=x.dtype, device=x.device)
-        mean_contrast = local_contrast.mean(dim=[2, 3], keepdim=True) + eps
+        mean_contrast = local_contrast.mean(dim=[2, 3], keepdim=True) + self.eps
         bg_mask = (local_contrast < self.bg_thresh_ratio * mean_contrast).to(dtype=x.dtype)
         out = x * (1 - self.fill_strength * bg_mask) + baseline * self.fill_strength * bg_mask
         return out
@@ -53,18 +54,27 @@ class ChannelAwareEdgeEnhance_Attn(nn.Module):
         assert pool_size % 2 == 1, "pool_size must be odd"
         self.ch = ch
         self.pool_size = pool_size
-        self.register_buffer('ch_sharp', torch.tensor(ch_sharp))
-        self.register_buffer('ch_thresh', torch.tensor(ch_thresh))
-        self.register_buffer('edge_sharp', torch.tensor(edge_sharp))
-        self.register_buffer('edge_thresh', torch.tensor(edge_thresh))
+        # Learnable sharpness (init = given value, trainable)
+        self.log_ch_sharp = nn.Parameter(torch.tensor(math.log(max(ch_sharp, 1e-3))))
+        self.log_edge_sharp = nn.Parameter(torch.tensor(math.log(max(edge_sharp, 1e-3))))
+        self.ch_thresh = nn.Parameter(torch.tensor(ch_thresh))
+        self.edge_thresh = nn.Parameter(torch.tensor(edge_thresh))
+        # Warmup steps (sharpness starts low to avoid early binarization)
+        self.register_buffer('_step', torch.tensor(0, dtype=torch.long))
+        self.warmup_steps = 2000
+        self.register_buffer('one', torch.tensor(1.0))
 
     def forward(self, x):
         dtype = x.dtype
         device = x.device
-        ch_sharp = self.ch_sharp.to(dtype)
-        ch_thresh = self.ch_thresh.to(dtype)
-        edge_sharp = self.edge_sharp.to(dtype)
-        edge_thresh = self.edge_thresh.to(dtype)
+
+        # Warmup: sharpness starts low, ramps up (prevents early binarization)
+        self._step += 1
+        warmup_alpha = min(1.0, self._step.float() / self.warmup_steps)
+        ch_sharp = torch.exp(self.log_ch_sharp) * warmup_alpha
+        ch_thresh = self.ch_thresh
+        edge_sharp = torch.exp(self.log_edge_sharp) * warmup_alpha
+        edge_thresh = self.edge_thresh
 
         B, C, H, W = x.shape
         pad = self.pool_size // 2
@@ -81,9 +91,8 @@ class ChannelAwareEdgeEnhance_Attn(nn.Module):
         edge = max_s - min_s
         edge_weight = torch.sigmoid(edge_sharp * (edge - edge_thresh))
 
-        one = torch.tensor(1.0, dtype=dtype, device=device)
         out = x * ch_weight
-        out = out * (one + edge_weight)
+        out = out * (self.one.to(dtype) + edge_weight)
         return out
 
 
