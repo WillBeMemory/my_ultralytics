@@ -56,6 +56,7 @@ from ultralytics.nn.modules.BiFPN import BiFPN
 from ultralytics.nn.modules.SplitList import SplitList
 from ultralytics.nn.modules.CCFPN import CCFPN
 from ultralytics.nn.modules.WaveletCSP import WaveletCSP
+from ultralytics.nn.modules.AddModules.C3k2_L2Sparse import C3k2_L2Sparse, L2MaskSparseConv
 from ultralytics.nn.modules.WaveletRefine import WaveletRefine
 from ultralytics.nn.modules.SlimDetect import SlimDetect
 from ultralytics.nn.modules.IWConv import IWConv
@@ -1687,6 +1688,7 @@ def parse_model(d, ch, verbose=True):
             PolaFormerBlock,
             C3k2_Pola,
             FDConvC3k2,
+            C3k2_L2Sparse,
             C3k2_InfSA,
             DeformC3k2,
             DeformBottleneck,
@@ -1786,6 +1788,7 @@ def parse_model(d, ch, verbose=True):
             PolaFormerBlock,
             C3k2_Pola,
             FDConvC3k2,
+            C3k2_L2Sparse,
             C3k2_InfSA,
             DeformC3k2,
             DeformBottleneck,
