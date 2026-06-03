@@ -182,11 +182,12 @@ class LinearInfSA(nn.Module):
         attn_norm = attn.norm(dim=-1, keepdim=True)
         attn_hat = attn / (attn_norm + 1e-6)  # (B, H, N)
 
-        # 4. Aggregate values: O = Σ_j attn_j · V_j
-        # Katz-style discount: γ / (1 - γ·Σattn), with denom clamping
+        # 4. Aggregate values: Katz-style discount with N-scaling
+        # Frobenius-normed vector: sum(attn) ≈ sqrt(N), so scale by 1/N
+        attn_hat = attn_hat / math.sqrt(N)
         attn_sum = attn_hat.sum(dim=-1, keepdim=True)
         denom = 1.0 - self.gamma * attn_sum
-        denom = torch.clamp(denom, min=0.1)                               # prevent div-by-zero
+        denom = torch.clamp(denom, min=0.1)
         attn_hat = self.gamma * attn_hat / (denom + 1e-6)
 
         out = (attn_hat.unsqueeze(-1) * v).sum(dim=2)  # (B, H, D)
