@@ -95,9 +95,8 @@ class InfSA(nn.Module):
         # spectral radius < 1 guaranteed
 
         # 2. Neumann series: Y = Σ_{t=0}^{T-1} γ^t Â^t V
-        # Efficient computation via iterative accumulation
-        out = v.clone()  # t=0 term: γ^0 Â^0 V = V
-        A_power_v = v.clone()
+        out = v                               # t=0 term: γ^0 Â^0 V = V
+        A_power_v = v
         for t in range(1, self.num_terms):
             A_power_v = self.gamma * torch.matmul(A_hat, A_power_v)
             out = out + A_power_v
@@ -184,8 +183,11 @@ class LinearInfSA(nn.Module):
         attn_hat = attn / (attn_norm + 1e-6)  # (B, H, N)
 
         # 4. Aggregate values: O = Σ_j attn_j · V_j
-        # Apply gamma discount for multi-hop effect
-        attn_hat = self.gamma * attn_hat / (1.0 - self.gamma * attn_hat.sum(dim=-1, keepdim=True) + 1e-6)
+        # Katz-style discount: γ / (1 - γ·Σattn), with denom clamping
+        attn_sum = attn_hat.sum(dim=-1, keepdim=True)
+        denom = 1.0 - self.gamma * attn_sum
+        denom = torch.clamp(denom, min=0.1)                               # prevent div-by-zero
+        attn_hat = self.gamma * attn_hat / (denom + 1e-6)
 
         out = (attn_hat.unsqueeze(-1) * v).sum(dim=2)  # (B, H, D)
         # Expand back to all tokens
@@ -204,11 +206,18 @@ class LinearInfSA(nn.Module):
 class InfSABlock(nn.Module):
     """Transformer block with InfSA attention (C2PSA-style for YOLO).
 
+    Defaults to LinearInfSA (O(N)) for practical use. Full InfSA (O(N²))
+    requires N < 500 tokens or will explode memory.
+
+    LinearInfSA note: this is a global-context aggregation mechanism,
+    not per-token attention. Every token receives the same aggregated
+    representation (blended with 30% local value for diversity).
+
     Args:
         dim (int): Feature dimension.
         num_heads (int): Number of attention heads.
         mlp_ratio (float): MLP hidden dimension ratio.
-        linear (bool): Use LinearInfSA instead of full InfSA.
+        linear (bool): Use LinearInfSA instead of full InfSA (default True).
         gamma (float): Discount factor for Neumann series.
         num_terms (int): Neumann series terms (full InfSA only).
     """
@@ -218,7 +227,7 @@ class InfSABlock(nn.Module):
         dim: int,
         num_heads: int = 8,
         mlp_ratio: float = 2.0,
-        linear: bool = False,
+        linear: bool = True,
         gamma: float = 0.5,
         num_terms: int = 3,
         drop: float = 0.0,
@@ -257,19 +266,21 @@ class InfSABlock(nn.Module):
 
 
 class C3k2_InfSA(nn.Module):
-    """C3k2 + InfSABlock: CSP with spectral self-attention.
+    """C3k2 + InfSABlock: CSP with spectral global aggregation.
 
-    Each block: Bottleneck (local) + InfSABlock (spectral global attention).
+    Each block: Bottleneck (local features) + InfSABlock (global context).
+    
 
     Args:
         c1 (int): Input channels.
         c2 (int): Output channels.
         n (int): Number of blocks.
+        c3k (bool): YAML convention (ignored).
         e (float): Expansion ratio.
         shortcut (bool): Residual in Bottleneck.
         g (int): Groups for Bottleneck conv.
         num_heads (int): Attention heads.
-        linear_infsa (bool): Use LinearInfSA for O(N) complexity.
+        linear_infsa (bool): Use LinearInfSA (O(N), default True).
         gamma (float): Discount factor.
     """
 
