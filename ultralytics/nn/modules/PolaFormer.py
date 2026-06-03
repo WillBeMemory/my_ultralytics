@@ -125,15 +125,19 @@ class PolaAttention(nn.Module):
         sim = sim_same + sim_opp                        # (B, N, H, D)
 
         # 8. Power-function rescaling to reduce entropy
-        # λ = softplus(log_λ) + 1 → λ ≥ 1
+        # λ = softplus(log_λ) + 1 → λ ∈ [1, 10]
         lam = F.softplus(self.log_lambda) + 1.0         # (H,)
+        lam = torch.clamp(lam, min=1.0, max=10.0)       # prevent blow-up
         lam = lam.view(1, 1, H, 1)                      # (1, 1, H, 1)
 
-        # Normalize sim to [0, 1] range before power
-        sim_min = sim.amin(dim=1, keepdim=True)          # (B, 1, H, D)
-        sim_max = sim.amax(dim=1, keepdim=True)          # (B, 1, H, D)
-        sim_norm = (sim - sim_min) / (sim_max - sim_min + 1e-6)
-        sim_rescaled = sim_norm ** lam                   # Power rescaling
+        # Normalize sim to [0, 1] in float32 for stable ** operation
+        sim_f32 = sim.float()
+        sim_min = sim_f32.amin(dim=1, keepdim=True)
+        sim_max = sim_f32.amax(dim=1, keepdim=True)
+        sim_range = sim_max - sim_min
+        sim_range = torch.clamp(sim_range, min=1e-4)    # prevent div-by-zero
+        sim_norm = ((sim_f32 - sim_min) / sim_range).clamp(min=0, max=1)
+        sim_rescaled = sim_norm ** lam                   # float32 power, stable
 
         # 9. Linear attention: K·V first (O(Nd²))
         # k: (B, N, H, D), v: (B, N, H, D)
