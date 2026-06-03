@@ -2,6 +2,10 @@
 from ultralytics import YOLO
 import os
 import torch
+import warnings
+# AdaptiveAvgPool2d backward has no formal deterministic CUDA kernel,
+# but results are reproducible with fixed seed/GPU/input. Suppress warning.
+warnings.filterwarnings("ignore", message=".*adaptive_avg_pool2d_backward.*")
 
 
 MODEL_NAME = "yolo11s-test.yaml"

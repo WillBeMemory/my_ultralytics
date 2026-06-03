@@ -46,6 +46,7 @@ from ultralytics.nn.modules.HIPAV2 import HIPAV2
 from ultralytics.nn.modules.WaveletStem import WaveletStem
 from ultralytics.nn.modules.DSWT_GhostConv import DSWT_GhostConv
 from ultralytics.nn.modules.DynamicC3k2 import DynamicC3k2
+from ultralytics.nn.modules.ContMixBlock import ContMixBlock
 from ultralytics.nn.modules.ContMixC3k2 import ContMixC3k2
 from ultralytics.nn.modules.PolaFormer import PolaFormerBlock, PolaAttention, C3k2_Pola
 from ultralytics.nn.modules.FDConv import FDConv, FDConvBottleneck, FDConvC3k2
@@ -1700,6 +1701,7 @@ def parse_model(d, ch, verbose=True):
             InterpDownsample,
             ChannelGateSepConv,
             ChannelAwareEdgeEnhance,
+            ContMixBlock,
             SoftFillEdgeEnhance,
             GenericEdgeEnhance,
             LogWaveletDenoise,
@@ -1794,6 +1796,7 @@ def parse_model(d, ch, verbose=True):
             IWConv,
             ChannelGateSepConv,
             ChannelAwareEdgeEnhance,
+            ContMixBlock,
             SoftFillEdgeEnhance,
             GenericEdgeEnhance,
             C3k2_Sparse,
