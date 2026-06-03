@@ -64,6 +64,7 @@ from ultralytics.nn.modules.InterpDownsample import InterpDownsample
 from ultralytics.nn.modules.ChannelGateSepConv import ChannelGateSepConv
 from ultralytics.nn.modules.AddModules.ChannelAwareEdgeEnhance import ChannelAwareEdgeEnhance
 from ultralytics.nn.modules.AddModules.SoftFillEdgeEnhance import SoftFillEdgeEnhance
+from ultralytics.nn.modules.AddModules.GenericEdgeEnhance import GenericEdgeEnhance
 from ultralytics.nn.modules.AddModules.LogWaveletDenoise import LogWaveletDenoise
 from ultralytics.nn.modules.AddModules.EFC_FPN import EFC_FPN
 from ultralytics.nn.modules.AddModules.PRN_ import PRN
@@ -1700,6 +1701,7 @@ def parse_model(d, ch, verbose=True):
             ChannelGateSepConv,
             ChannelAwareEdgeEnhance,
             SoftFillEdgeEnhance,
+            GenericEdgeEnhance,
             LogWaveletDenoise,
             C3k2_Sparse,
             StarC3k2,
@@ -1793,6 +1795,7 @@ def parse_model(d, ch, verbose=True):
             ChannelGateSepConv,
             ChannelAwareEdgeEnhance,
             SoftFillEdgeEnhance,
+            GenericEdgeEnhance,
             C3k2_Sparse,
             StarC3k2,
             C3k2WT,

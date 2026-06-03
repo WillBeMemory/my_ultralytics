@@ -264,25 +264,23 @@ class C3k2_Pola(nn.Module):
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
 
         # Each block: Bottleneck (float16 under AMP) + PolaFormerBlock (float32)
-        self.m = nn.ModuleList()
-        for _ in range(n):
-            self.m.append(nn.ModuleList([
+        self.m = nn.ModuleList(
+            nn.Sequential(
                 Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0),
                 PolaFormerBlock(self.c, num_heads=num_heads),
-            ]))
+            )
+            for _ in range(n)
+        )
 
         self.cv2 = Conv((2 + n) * self.c, c2, 1, act=False)
         self.act = nn.SiLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype_in = x.dtype
         y = list(self.cv1(x).chunk(2, dim=1))
         outputs = [y[0], y[1]]
         a = y[1]
-        for bn, attn in self.m:
-            a = bn(a)              # Bottleneck: runs in AMP float16
-            a = attn(a.float())    # PolaFormerBlock: float32 (stable for large N)
-            a = a.to(dtype_in)     # → back to float16 for next Bottleneck
+        for m_block in self.m:
+            a = m_block(a)
             outputs.append(a)
         return self.act(self.cv2(torch.cat(outputs, dim=1)))
 

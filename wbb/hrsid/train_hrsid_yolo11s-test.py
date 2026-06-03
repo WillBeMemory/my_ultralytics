@@ -81,7 +81,6 @@ def train_model():
             weight_decay=0.0005,  # 权重衰减
             cos_lr=True,  # 余弦退火
             warmup_epochs=3.0,
-            clip_grad=5.0,  # 梯度裁剪防止 NaN
 
             patience=0,  # 早停耐心值
             save=True,
