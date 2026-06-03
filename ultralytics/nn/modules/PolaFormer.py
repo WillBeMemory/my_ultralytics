@@ -256,6 +256,7 @@ class C3k2_Pola(nn.Module):
         c1: int,
         c2: int,
         n: int = 1,
+        c3k: bool = False,        # YAML convention (ignored)
         e: float = 0.5,
         shortcut: bool = True,
         g: int = 1,

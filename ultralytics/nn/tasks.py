@@ -49,6 +49,7 @@ from ultralytics.nn.modules.DynamicC3k2 import DynamicC3k2
 from ultralytics.nn.modules.ContMixC3k2 import ContMixC3k2
 from ultralytics.nn.modules.PolaFormer import PolaFormerBlock, PolaAttention, C3k2_Pola
 from ultralytics.nn.modules.FDConv import FDConv, FDConvBottleneck, FDConvC3k2
+from ultralytics.nn.modules.InfSA import InfSA, LinearInfSA, InfSABlock, C3k2_InfSA
 from ultralytics.nn.modules.DeformC3k2 import DeformC3k2, DeformBottleneck, DeformConv2d, DeformC3k, DeformC3k2Block
 from ultralytics.nn.modules.BiFPN import BiFPN
 from ultralytics.nn.modules.SplitList import SplitList
@@ -1684,6 +1685,7 @@ def parse_model(d, ch, verbose=True):
             PolaFormerBlock,
             C3k2_Pola,
             FDConvC3k2,
+            C3k2_InfSA,
             DeformC3k2,
             DeformBottleneck,
             DeformConv2d,
@@ -1780,6 +1782,7 @@ def parse_model(d, ch, verbose=True):
             PolaFormerBlock,
             C3k2_Pola,
             FDConvC3k2,
+            C3k2_InfSA,
             DeformC3k2,
             DeformBottleneck,
             DeformC3k,

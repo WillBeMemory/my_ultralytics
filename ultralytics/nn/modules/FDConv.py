@@ -239,6 +239,7 @@ class FDConvC3k2(nn.Module):
         c1: int,
         c2: int,
         n: int = 1,
+        c3k: bool = False,        # YAML convention (ignored, FDConv replaces Bottleneck)
         e: float = 0.5,
         shortcut: bool = True,
         g: int = 1,
