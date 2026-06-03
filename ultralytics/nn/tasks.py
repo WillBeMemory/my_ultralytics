@@ -57,6 +57,7 @@ from ultralytics.nn.modules.SplitList import SplitList
 from ultralytics.nn.modules.CCFPN import CCFPN
 from ultralytics.nn.modules.WaveletCSP import WaveletCSP
 from ultralytics.nn.modules.AddModules.C3k2_L2Sparse import C3k2_L2Sparse, L2MaskSparseConv
+from ultralytics.nn.modules.DyUpsample import DySample
 from ultralytics.nn.modules.WaveletRefine import WaveletRefine
 from ultralytics.nn.modules.SlimDetect import SlimDetect
 from ultralytics.nn.modules.IWConv import IWConv
