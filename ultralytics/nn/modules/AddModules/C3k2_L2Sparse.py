@@ -63,6 +63,10 @@ class L2MaskSparseConv(nn.Module):
         Returns:
             Enhanced tensor [B, C, H, W].
         """
+        # spconv requires CUDA; skip sparse conv on CPU (e.g. model init stride check)
+        if not x.is_cuda:
+            return x
+
         import spconv.pytorch as spconv
 
         B, C, H, W = x.shape
