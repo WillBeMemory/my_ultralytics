@@ -210,22 +210,18 @@ class PolaFormerBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with dtype safety for AMP."""
-        dtype_in = x.dtype
+        """Forward pass — caller (C3k2_Pola) manages dtype."""
         is_cnn = len(x.shape) == 4
-        with torch.amp.autocast(device_type=x.device.type, enabled=False):
-            x = x.float()
-            if is_cnn:
-                B, C, H, W = x.shape
-                x = x.flatten(2).transpose(1, 2)
+        if is_cnn:
+            B, C, H, W = x.shape
+            x = x.flatten(2).transpose(1, 2)
 
-            x = x + self.attn(self.norm1(x))
-            x = x + self.mlp(self.norm2(x))
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
 
-            if is_cnn:
-                x = x.transpose(1, 2).reshape(B, C, H, W)
+        if is_cnn:
+            x = x.transpose(1, 2).reshape(B, C, H, W)
 
-            x = x.to(dtype_in)
         return x
 
 
@@ -281,13 +277,15 @@ class C3k2_Pola(nn.Module):
         self.act = nn.SiLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # FP32-safe: cast to float32 before attention blocks, let AMP handle Conv ops
+        dtype_in = x.dtype
         y = list(self.cv1(x).chunk(2, dim=1))
-        outputs = [y[0], y[1]]
-        a = y[1]
+        outputs = [y[0].float(), y[1].float()]
+        a = y[1].float()
         for m_block in self.m:
             a = m_block(a)
             outputs.append(a)
-        return self.act(self.cv2(torch.cat(outputs, dim=1)))
+        return self.act(self.cv2(torch.cat(outputs, dim=1))).to(dtype_in)
 
 
 # ================== Test ==================
