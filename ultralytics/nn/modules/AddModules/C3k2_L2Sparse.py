@@ -1,25 +1,28 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-"""C3k2 with L2-Norm Top-K mask and sparse convolution enhancement."""
+"""C3k2 with L2-Norm Top-K mask and true sparse convolution (spconv) enhancement."""
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ultralytics.nn.modules.block import Bottleneck, C3k, PSABlock
 from ultralytics.nn.modules.conv import Conv
 
 
 class L2MaskSparseConv(nn.Module):
-    """L2-Norm Top-K sparse convolution enhancement block.
+    """L2-Norm Top-K true sparse convolution enhancement block.
 
-    Generates a binary mask by selecting the top-K spatial positions
-    with the highest L2 norm, then applies a depthwise convolution
-    exclusively on the masked regions for lightweight feature refinement.
+    1. Selects Top-K spatial positions by L2 norm.
+    2. Dilates the mask to 3x3 neighborhood around each selected position,
+       so the sparse convolution can capture spatial context.
+    3. Applies real sparse convolution (spconv.SubMConv2d) that physically
+       skips computation at non-selected positions.
 
     Args:
         channels (int): Number of input/output channels.
-        keep_ratio (float): Ratio of spatial positions to keep (0.0 ~ 1.0).
-        min_keeps (int): Minimum number of positions to keep.
+        keep_ratio (float): Ratio of spatial positions to keep before dilation.
+        min_keeps (int): Minimum number of positions to keep before dilation.
         kernel_size (int): Kernel size for sparse convolution (3 or 5).
         alpha_init (float): Initial value for the learnable fusion weight.
     """
@@ -40,13 +43,16 @@ class L2MaskSparseConv(nn.Module):
         # Learnable fusion weight (starts small for stable training)
         self.alpha = nn.Parameter(torch.tensor(alpha_init))
 
-        # Depthwise sparse conv: lightweight, parameters = channels * k²
-        self.sparse_conv = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size, padding=kernel_size // 2,
-                       groups=channels, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.SiLU(inplace=True),
+        # True sparse convolution via spconv.SubMConv2d
+        #   - Only computes at active sites (Top-K + dilated neighbors)
+        #   - Physically skips zero regions (real sparsity, not mask gating)
+        import spconv.pytorch as spconv
+        self.sparse_conv = spconv.SubMConv2d(
+            channels, channels, kernel_size,
+            padding=kernel_size // 2, bias=False,
         )
+        self.bn = nn.BatchNorm1d(channels)  # spconv output is [N, C]
+        self.act = nn.SiLU(inplace=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -57,40 +63,68 @@ class L2MaskSparseConv(nn.Module):
         Returns:
             Enhanced tensor [B, C, H, W].
         """
+        import spconv.pytorch as spconv
+
         B, C, H, W = x.shape
         N = H * W
 
         # 1. Compute L2 norm per spatial position → importance map
         l2 = torch.norm(x, p=2, dim=1)  # [B, H, W]
 
-        # 2. Top-K selection → binary mask
+        # 2. Top-K selection → seed positions
         k = max(self.min_keeps, int(N * self.keep_ratio))
         k = min(k, N)
         _, topk_idx = torch.topk(l2.flatten(1), k=k, dim=-1)  # [B, K]
-        mask = torch.zeros(B, N, device=x.device, dtype=x.dtype)
-        mask = mask.scatter_(1, topk_idx, 1.0)
-        mask = mask.view(B, 1, H, W)  # [B, 1, H, W]
 
-        # 3. Apply sparse convolution on masked regions
-        #    Mask out non-important regions → convolve → re-mask
-        masked_input = x * mask.detach()
-        enhanced = self.sparse_conv(masked_input)
-        enhanced = enhanced * mask.detach()  # only masked regions contribute
+        # 3. Create spatial mask from Top-K seeds → dilate to 3x3 neighborhood
+        mask_flat = torch.zeros(B, N, device=x.device, dtype=torch.float32)
+        mask_flat.scatter_(1, topk_idx, 1.0)
+        mask_2d = mask_flat.view(B, 1, H, W)  # [B, 1, H, W]
 
-        # 4. Residual fusion with learnable weight
+        # Dilation: expand each seed to its 3x3 neighborhood
+        dilated = F.max_pool2d(mask_2d, kernel_size=3, stride=1, padding=1)  # [B, 1, H, W]
+
+        # 4. Get all active positions from dilated mask
+        #    torch.nonzero returns [num_active, 3] = [batch_idx, y, x]
+        positions = torch.nonzero(dilated.squeeze(1), as_tuple=False)  # [total_active, 3]
+        total_active = positions.shape[0]
+
+        # 5. Build spconv indices [total_active, 3] and extract features [total_active, C]
+        batch_indices = positions[:, 0].long()
+        y_indices = positions[:, 1].long()
+        x_indices = positions[:, 2].long()
+        indices = torch.stack([batch_indices, y_indices, x_indices], dim=1).int()
+        features = x[batch_indices, :, y_indices, x_indices]  # [total_active, C]
+
+        # 6. Build SparseConvTensor and apply true sparse convolution
+        sparse_in = spconv.SparseConvTensor(
+            features=features,
+            indices=indices,
+            spatial_shape=[H, W],
+            batch_size=B,
+        )
+        sparse_out = self.sparse_conv(sparse_in)
+        sparse_out = sparse_out.replace_feature(self.act(self.bn(sparse_out.features)))
+
+        # 7. Convert to dense: non-selected positions are automatically zero
+        enhanced = sparse_out.dense()  # [B, C, H, W]
+
+        # 8. Residual fusion with learnable weight
         return x + self.alpha * enhanced
 
 
 class C3k2_L2Sparse(nn.Module):
-    """C3k2 with L2-Norm Top-K sparse convolution enhancement.
+    """C3k2 with L2-Norm Top-K true sparse convolution (spconv) enhancement.
 
     Architecture (inherits C3k2 structure):
-        x ──→ cv1 ──→ chunk(2) ──┬── y[0] ─────────────────────→ outputs
-                                  └── y[1] ──→ Bottleneck ──→ L2SparseConv ──→ outputs
-                                              (× n blocks, each followed by L2SparseConv)
+        x ──→ cv1 ──→ chunk(2) ──┬── y[0] ──────────────────→ outputs
+                                  └── y[1] ──→ Bottleneck ──→ L2MaskSparseConv ──→ outputs
+                                              (× n blocks)
 
-    The L2MaskSparseConv is applied after each Bottleneck block for
-    additional feature refinement on important spatial regions.
+    Each Bottleneck output is enhanced by L2MaskSparseConv, which:
+      1. Selects top-K spatial positions by L2 norm
+      2. Applies real spconv.SubMConv2d (physically skips non-selected sites)
+      3. Fuses back via learnable alpha * sparse_output + identity
 
     Args:
         c1 (int): Input channels.
@@ -142,7 +176,7 @@ class C3k2_L2Sparse(nn.Module):
             else:
                 self.m.append(Bottleneck(self.c, self.c, shortcut, g))
 
-        # --- L2 Sparse Conv enhancement (after each bottleneck) ---
+        # --- True sparse conv enhancement (after each bottleneck) ---
         self.sparse_convs = nn.ModuleList(
             L2MaskSparseConv(
                 self.c,
@@ -171,7 +205,7 @@ class C3k2_L2Sparse(nn.Module):
         a = y[1]
         for m_block, sparse_conv in zip(self.m, self.sparse_convs):
             a = m_block(a)            # standard C3k2 bottleneck
-            a = sparse_conv(a)        # L2-TopK sparse conv enhancement
+            a = sparse_conv(a)        # L2-TopK true sparse conv enhancement
             outputs.append(a)
 
         return self.cv2(torch.cat(outputs, dim=1))
@@ -181,6 +215,10 @@ class C3k2_L2Sparse(nn.Module):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    if device.type != "cuda":
+        print("WARNING: spconv requires CUDA. Tests will be skipped on CPU.")
+        exit(0)
 
     x = torch.randn(2, 128, 40, 40).to(device)
 
@@ -234,7 +272,7 @@ if __name__ == "__main__":
         xi = torch.randn(2, 128, H, W).to(device)
         model = C3k2_L2Sparse(128, 256, n=2, keep_ratio=0.25).to(device)
         yi = model(xi)
-        print(f"   {H}×{W}: {list(xi.shape)} → {list(yi.shape)}")
+        print(f"   {H}x{W}: {list(xi.shape)} -> {list(yi.shape)}")
 
     print("\n" + "=" * 60)
     print("All tests passed!")
