@@ -71,12 +71,9 @@ class PolaAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Polarity-aware linear attention forward pass.
-
-        Args:
-            x: Input tensor (B, N, C) where N=H*W.
-
-        Returns:
-            Output tensor (B, N, C).
+        
+        Note: caller (PolaFormerBlock) is responsible for dtype management.
+        This function operates in whatever dtype it receives.
         """
         B, N, C = x.shape
         H = self.num_heads
@@ -163,9 +160,10 @@ class PolaAttention(nn.Module):
         q_phi_t = q_phi.permute(0, 2, 1, 3)             # (B, H, N, D)
         out = torch.matmul(q_phi_t, kv)                  # (B, H, N, D)
 
-        # Normalize by (K_sum for each Q)
+        # Normalize by (K_sum for each Q), clamp min to avoid div-by-zero
         q_k = (q_phi_t * k_sum.unsqueeze(-2)).sum(dim=-1)  # (B, H, N)
-        out = out / (q_k.unsqueeze(-1) + 1e-6)           # (B, H, N, D)
+        q_k = torch.clamp(q_k, min=1e-3)                    # prevent tiny denominator
+        out = out / q_k.unsqueeze(-1)                       # (B, H, N, D)
 
         # Restore shape
         out = out.permute(0, 2, 1, 3).reshape(B, N, C)
@@ -212,29 +210,22 @@ class PolaFormerBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x: Input tensor (B, C, H, W) for CNN compatibility,
-               or (B, N, C) for Transformer compatibility.
-
-        Returns:
-            Output tensor with same shape as input.
-        """
+        """Forward pass with dtype safety for AMP."""
+        dtype_in = x.dtype
         is_cnn = len(x.shape) == 4
-        if is_cnn:
-            B, C, H, W = x.shape
-            x = x.flatten(2).transpose(1, 2)  # (B, N, C)
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            if is_cnn:
+                B, C, H, W = x.shape
+                x = x.flatten(2).transpose(1, 2)
 
-        # Attention
-        x = x + self.attn(self.norm1(x))
+            x = x + self.attn(self.norm1(x))
+            x = x + self.mlp(self.norm2(x))
 
-        # Feed-forward
-        x = x + self.mlp(self.norm2(x))
+            if is_cnn:
+                x = x.transpose(1, 2).reshape(B, C, H, W)
 
-        if is_cnn:
-            x = x.transpose(1, 2).reshape(B, C, H, W)
-
+            x = x.to(dtype_in)
         return x
 
 
