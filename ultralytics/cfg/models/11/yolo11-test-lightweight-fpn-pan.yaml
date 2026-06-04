@@ -1,0 +1,41 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLO11 with Lightweight FPN-PAN (all internal refine modules use depthwise separable convolution)
+# Parameters
+nc: 80 # number of classes
+scales: # model compound scaling constants
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+# YOLO11 backbone (unchanged from test config)
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, LogWaveletDenoise, [64,3,2]] # 0-P1/2
+  - [-1, 1, Conv, [128,3,2]] # 1-P2/4
+  - [-1, 2, C3k2, [128, True]]
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 2, C3k2, [256, True]]
+  - [-1, 1, Conv, [512,3,2]] # 5-P4/16
+  - [-1, 2, SoftFillEdgeEnhance, [512]]
+  - [-1, 1, nn.Identity, []]
+  - [-1, 1, nn.Identity, []]
+  - [-1, 1, SPPF, [512, 5]] # 9
+  - [-1, 2, C2PSA, [512]] # 10
+
+# YOLO11 head: Lightweight FPN-PAN replaces traditional FPN-PAN
+head:
+  # Lightweight FPN-PAN takes backbone features P2, P3, P4 and returns refined P2, P3, P4
+  # args: [ [c2, c3, c4], [o2, o3, o4], use_refine, expand_ch ]
+  - [[2, 4, 10], 1, LightweightFPN_PAN, [ [128, 256, 512], [128, 256, 512], True ]] # 11
+  
+  # Split the LightweightFPN_PAN output list into separate layers
+  - [11, 1, SplitList, [128, 0]]  # 12, P2_out
+  - [11, 1, SplitList, [256, 1]]  # 13, P3_out
+  - [11, 1, SplitList, [512, 2]]  # 14, P4_out
+  
+  # Detect head
+  - [[12, 13, 14], 1, Detect, [nc]]
