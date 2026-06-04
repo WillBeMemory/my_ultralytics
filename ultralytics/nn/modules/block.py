@@ -41,6 +41,7 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "ContrastiveHead",
+    "DWC3k2",
     "GhostBottleneck",
     "HGBlock",
     "HGStem",
@@ -1125,6 +1126,31 @@ class C3k(C3):
         c_ = int(c2 * e)  # hidden channels
         # self.m = nn.Sequential(*(RepBottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
+
+
+class DWC3k2(nn.Module):
+    """Depthwise separable convolution replacement for C3k2 in neck."""
+
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, attn=False, g=1, shortcut=True):
+        """Initialize DWC3k2 module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of DW+PW blocks (default 1, C3k2's n is ignored).
+            c3k (bool): Ignored, kept for API compatibility.
+            e (float): Ignored, kept for API compatibility.
+            attn (bool): Ignored, kept for API compatibility.
+            g (int): Ignored, kept for API compatibility.
+            shortcut (bool): Ignored, kept for API compatibility.
+        """
+        super().__init__()
+        self.dw = DWConv(c1, c1, 3, 1)  # depthwise 3x3
+        self.pw = Conv(c1, c2, 1, 1)     # pointwise 1x1
+
+    def forward(self, x):
+        """Apply depthwise separable convolution."""
+        return self.pw(self.dw(x))
 
 
 class RepVGGDW(torch.nn.Module):

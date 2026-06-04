@@ -11,7 +11,9 @@ except ImportError:
 try:
     import spconv.pytorch as spconv
 except ImportError:
-    raise ImportError("请先安装 spconv，例如: pip install spconv-cu124")
+    import warnings
+    warnings.warn("spconv not installed, C3k2_Sparse will not be available.")
+    spconv = None
 
 
 class SpConvBlock(nn.Module):

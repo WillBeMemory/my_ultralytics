@@ -118,6 +118,7 @@ from ultralytics.nn.modules import (
     Detect,
     DWConv,
     DWConvTranspose2d,
+    DWC3k2,
     Focus,
     GhostBottleneck,
     GhostConv,
@@ -1731,6 +1732,7 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
+            DWC3k2,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -1823,6 +1825,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
+            DWC3k2,
 
         }
     )
