@@ -70,7 +70,7 @@ def train_model():
     try:
         results = model.train(
             data=DATASET_PATH,
-            epochs=300,
+            epochs=250,
             imgsz=640,
             batch=16,
             workers=0,  # Windows 下设为 0 避免多进程问题
