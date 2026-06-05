@@ -72,11 +72,11 @@ def train_model():
             data=DATASET_PATH,
             epochs=300,
             imgsz=640,
-            batch=8,
+            batch=16,
             workers=0,  # Windows 下设为 0 避免多进程问题
             device=device,
             optimizer="SGD",  # 改用 SGD
-            lr0=0.001,  # 初始学习率 0.01
+            lr0=0.01,  # 初始学习率 0.01
             lrf=0.01,  # 最终学习率 = 0.01 * 0.01 = 0.0001
             # momentum=0.937,  # SGD 动量
             # weight_decay=0.0005,  # 权重衰减
