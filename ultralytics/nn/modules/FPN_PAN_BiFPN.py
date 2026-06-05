@@ -163,7 +163,7 @@ class FPN_PAN_BiFPN(nn.Module):
     - FPN-PAN：与 YOLO11 默认结构完全一致（Conv + C3k2 + Upsample + Concat）
     - BiFPN：P2/P3/P4 两两加权融合（BiFPN_Add），可堆叠多层
     """
-    def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=True):
+    def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False):
         super().__init__()
         c2, c3, c4 = channels
         if out_channels is None:
