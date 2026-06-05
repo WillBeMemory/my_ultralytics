@@ -66,7 +66,7 @@ from ultralytics.nn.modules.AddModules.GenericEdgeEnhance import GenericEdgeEnha
 from ultralytics.nn.modules.AddModules.C3k2_L2Sparse import C3k2_L2Sparse, L2MaskSparseConv
 from ultralytics.nn.modules.CARAFE import CARAFE
 from ultralytics.nn.modules.BiFPN import BiFPN
-from ultralytics.nn.modules.FPN_PAN_BiFPN import LightweightFPN_PAN, FPN_PAN_BiFPN
+from ultralytics.nn.modules.FPN_PAN_BiFPN import FPN_PAN, FPN_PAN_BiFPN
 from ultralytics.nn.modules.SplitList import SplitList
 from ultralytics.nn.modules.CCFPN import CCFPN
 from ultralytics.nn.modules.WaveletCSP import WaveletCSP
