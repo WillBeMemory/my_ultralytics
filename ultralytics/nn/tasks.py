@@ -119,7 +119,7 @@ from ultralytics.nn.modules import (
     DWConv,
     DWConvTranspose2d,
     DWC3k2,
-    LightweightFPN_PAN,
+    # LightweightFPN_PAN,
     FPN_PAN_BiFPN,
     Focus,
     GhostBottleneck,
@@ -1902,7 +1902,7 @@ def parse_model(d, ch, verbose=True):
 
         elif m in (
             BiFPN,
-            LightweightFPN_PAN,
+            # LightweightFPN_PAN,
             FPN_PAN_BiFPN,
             CCFPN,
             EFC_FPN,
