@@ -71,10 +71,10 @@ class FPN_PAN(nn.Module):
             self._init_layers(p2, p3, p4)
 
         # ========== FPN (Top-Down) ==========
-        p4_up = F.interpolate(p4, size=p3.shape[-2:], mode='nearest')
+        p4_up = F.interpolate(p4, size=p3.shape[-2:], mode='bilinear', align_corners=False)
         p3_fpn = self.fpn_p3(torch.cat([p3, p4_up], dim=1))
 
-        p3_up = F.interpolate(p3_fpn, size=p2.shape[-2:], mode='nearest')
+        p3_up = F.interpolate(p3_fpn, size=p2.shape[-2:], mode='bilinear', align_corners=False)
         p2_fpn = self.fpn_p2(torch.cat([p2, p3_up], dim=1))
 
         # ========== PAN (Bottom-Up) ==========
@@ -134,12 +134,12 @@ class BiFPNLayer(nn.Module):
 
         # ========== Top-Down ==========
         # P4 → P3 融合
-        p4_up = F.interpolate(self.td_p4_to_p3(p4_in), size=p3_in.shape[-2:], mode='nearest')
+        p4_up = F.interpolate(self.td_p4_to_p3(p4_in), size=p3_in.shape[-2:], mode='bilinear', align_corners=False)
         p3_td = self.td_p3_fuse([p3_in, p4_up])
         p3_td = self.td_p3_refine(p3_td)
 
         # P3 → P2 融合
-        p3_up = F.interpolate(self.td_p3_to_p2(p3_td), size=p2_in.shape[-2:], mode='nearest')
+        p3_up = F.interpolate(self.td_p3_to_p2(p3_td), size=p2_in.shape[-2:], mode='bilinear', align_corners=False)
         p2_td = self.td_p2_fuse([p2_in, p3_up])
         p2_td = self.td_p2_refine(p2_td)
 
@@ -163,7 +163,7 @@ class FPN_PAN_BiFPN(nn.Module):
     - FPN-PAN：与 YOLO11 默认结构完全一致（Conv + C3k2 + Upsample + Concat）
     - BiFPN：P2/P3/P4 两两加权融合（BiFPN_Add），可堆叠多层
     """
-    def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=True):
+    def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False):
         super().__init__()
         c2, c3, c4 = channels
         if out_channels is None:
@@ -189,10 +189,14 @@ class FPN_PAN_BiFPN(nn.Module):
         # FPN-PAN
         p2_out, p3_out, p4_out = self.fpn_pan([p2, p3, p4])
 
-        # BiFPN 精炼
+        # BiFPN 精炼（残差连接：BiFPN 学增量，FPN-PAN 基线始终保留）
         if self.bifpn_layers:
+            p2_b, p3_b, p4_b = p2_out, p3_out, p4_out
             for layer in self.bifpn_layers:
-                p2_out, p3_out, p4_out = layer(p2_out, p3_out, p4_out)
+                p2_b, p3_b, p4_b = layer(p2_b, p3_b, p4_b)
+            p2_out = p2_out + p2_b
+            p3_out = p3_out + p3_b
+            p4_out = p4_out + p4_b
 
         return [p2_out, p3_out, p4_out]
 
