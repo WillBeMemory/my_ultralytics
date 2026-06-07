@@ -109,10 +109,16 @@ class DFLoss(nn.Module):
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses for bounding boxes."""
 
-    def __init__(self, reg_max: int = 16):
+    def __init__(self, reg_max: int = 16, iou_type: str = "ciou"):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.iou_type = iou_type
+        if iou_type == "wiou":
+            self.register_buffer("iou_running_mean", torch.tensor(1.0))
+            self.wiou_delta = 1.0
+            self.wiou_alpha = 1.9
+            self.wiou_momentum = 0.99
 
     def forward(
         self,
@@ -128,8 +134,45 @@ class BboxLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+
+        if self.iou_type == "ciou":
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        elif self.iou_type == "wiou":
+            # WIoU v3: Wise-IoU with dynamic non-monotonic focusing mechanism
+            # https://arxiv.org/abs/2301.10051
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False)
+            loss_iou_base = 1.0 - iou  # [N_fg]
+
+            # WIoU v1: distance attention R_WIoU
+            pred = pred_bboxes[fg_mask]    # [N_fg, 4] xyxy
+            target = target_bboxes[fg_mask]  # [N_fg, 4] xyxy
+            pred_ctr_x = (pred[..., 0] + pred[..., 2]) / 2
+            pred_ctr_y = (pred[..., 1] + pred[..., 3]) / 2
+            target_ctr_x = (target[..., 0] + target[..., 2]) / 2
+            target_ctr_y = (target[..., 1] + target[..., 3]) / 2
+            cw = torch.max(pred[..., 2], target[..., 2]) - torch.min(pred[..., 0], target[..., 0])
+            ch = torch.max(pred[..., 3], target[..., 3]) - torch.min(pred[..., 1], target[..., 1])
+            with torch.no_grad():
+                r_wiou = torch.exp(
+                    (pred_ctr_x - target_ctr_x) ** 2 / (cw ** 2 + 1e-7) +
+                    (pred_ctr_y - target_ctr_y) ** 2 / (ch ** 2 + 1e-7)
+                )
+
+            # WIoU v3: update running mean of IoU loss
+            if self.training:
+                with torch.no_grad():
+                    self.iou_running_mean = (
+                        self.wiou_momentum * self.iou_running_mean +
+                        (1 - self.wiou_momentum) * loss_iou_base.detach().mean()
+                    )
+
+            # WIoU v3: non-monotonic focusing coefficient
+            with torch.no_grad():
+                beta = loss_iou_base.detach() / (self.iou_running_mean + 1e-7)
+                r_focus = beta / (self.wiou_delta * self.wiou_alpha ** (beta - self.wiou_delta))
+
+            loss_iou = (r_focus * r_wiou * loss_iou_base * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
@@ -357,7 +400,7 @@ class v8DetectionLoss:
             stride=self.stride.tolist(),
             topk2=tal_topk2,
         )
-        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.bbox_loss = BboxLoss(m.reg_max, iou_type="wiou").to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
