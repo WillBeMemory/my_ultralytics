@@ -117,7 +117,7 @@ class BiFPNLayer(nn.Module):
         # ========== Bottom-Up：P2→P3, P3→P4 ==========
         # P2_td → Conv(s=2, 128→256) → BiFPN_Add(P3_td, P2_down) → DWConv refine
         self.bu_p2_to_p3 = Conv(c2, c3, 3, 2)
-        self.bu_p3_fuse = BiFPN_Add(3)
+        self.bu_p3_fuse = BiFPN_Add(2)
         self.bu_p3_refine = DepthwiseSeparableConv(c3) if self.use_refine else nn.Identity()
 
         # P3_out → Conv(s=2, 256→512) → BiFPN_Add(P4, P3_down) → DWConv refine
@@ -146,7 +146,7 @@ class BiFPNLayer(nn.Module):
         # ========== Bottom-Up ==========
         # P2 → P3 融合
         p2_down = self.bu_p2_to_p3(p2_td)
-        p3_out = self.bu_p3_fuse([p3_in, p3_td, p2_down])
+        p3_out = self.bu_p3_fuse([p3_td, p2_down])
         p3_out = self.bu_p3_refine(p3_out)
 
         # P3 → P4 融合
