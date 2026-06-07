@@ -4,10 +4,20 @@ import math
 
 
 class WIoULoss(nn.Module):
+    """Wise-IoU Loss with dynamic non-monotonic focusing mechanism.
+    
+    Reference: https://arxiv.org/abs/2301.10051
+    Official implementation: https://github.com/Instinct323/Wise-IoU
+    """
+    momentum = 0.01
+    alpha = 1.7
+    delta = 2.7
+
     def __init__(self, monotonous=False, eps=1e-7):
         super(WIoULoss, self).__init__()
         self.monotonous = monotonous
         self.eps = eps
+        self.register_buffer('iou_running_mean', torch.tensor(1.0))
 
     def forward(self, pred_boxes, target_boxes):
         # 将中心点+宽高格式(xywh)转换为左上角+右下角格式(x1y1x2y2)
@@ -34,34 +44,42 @@ class WIoULoss(nn.Module):
 
         # IoU
         iou = inter_area / union_area
+        loss_iou = 1 - iou
 
-        # 计算中心点距离
-        center_dist = ((pred_boxes[:, :2] - target_boxes[:, :2]) ** 2).sum(dim=1)
-
-        # 计算最小外接框的对角线长度
+        # 计算最小外接框的对角线长度平方
         enclose_x1 = torch.min(b1_x1, b2_x1)
         enclose_y1 = torch.min(b1_y1, b2_y1)
         enclose_x2 = torch.max(b1_x2, b2_x2)
         enclose_y2 = torch.max(b1_y2, b2_y2)
-        enclose_diag = ((enclose_x2 - enclose_x1) ** 2 + (enclose_y2 - enclose_y1) ** 2) + self.eps
+        cw = enclose_x2 - enclose_x1
+        ch = enclose_y2 - enclose_y1
+        l2_box = cw ** 2 + ch ** 2 + self.eps
 
-        # WIoU v1: 距离注意力
-        wiou_term = torch.exp(center_dist / enclose_diag)
-        loss_iou = 1 - iou
+        # 中心点距离平方
+        center_dist = ((pred_boxes[:, :2] - target_boxes[:, :2]) ** 2).sum(dim=1)
+
+        # WIoU v1: 距离注意力 R_WIoU
+        r_wiou = torch.exp(center_dist / l2_box.detach())
+        loss_wiou_v1 = r_wiou * loss_iou
+
+        # 更新运行均值
+        if self.training:
+            with torch.no_grad():
+                self.iou_running_mean.mul_(1 - self.momentum)
+                self.iou_running_mean.add_(self.momentum * loss_iou.detach().mean())
 
         # WIoU v3: 动态非单调聚焦
         if not self.monotonous:
-            # 计算离群度 beta
             with torch.no_grad():
-                loss_iou_mean = loss_iou.mean().detach()
-                beta = loss_iou / (loss_iou_mean + self.eps)
-                # 聚焦系数 r = beta / (delta * alpha^(beta - delta))
-                delta = torch.mean(beta)  # 简单实现，可根据论文调整
-                alpha = 1.5  # 论文中推荐值
-                r = beta / (delta * alpha ** (beta - delta))
-                r = torch.clamp(r, max=3.0)  # 限制最大值避免梯度爆炸
-            loss = r * wiou_term * loss_iou
+                # beta = L_IoU / L_IoU_mean (离群度)
+                beta = loss_iou.detach() / (self.iou_running_mean + self.eps)
+                # r = beta / (delta * alpha^(beta - delta))
+                r_focus = beta / (self.delta * self.alpha ** (beta - self.delta))
+            loss = r_focus * loss_wiou_v1
         else:
-            loss = wiou_term * loss_iou
+            # WIoU v2: 单调聚焦
+            with torch.no_grad():
+                beta = loss_iou.detach() / (self.iou_running_mean + self.eps)
+            loss = beta.sqrt() * loss_wiou_v1
 
         return loss.mean()

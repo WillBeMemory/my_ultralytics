@@ -115,8 +115,10 @@ class BboxLoss(nn.Module):
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
         self.iou_type = iou_type
         if iou_type == "wiou":
-            self.wiou_delta = 3.0
-            self.wiou_alpha = 1.9
+            self.register_buffer("iou_running_mean", torch.tensor(1.0))
+            self.wiou_delta = 2.0  # 降低 delta，使聚焦于更合理的样本
+            self.wiou_alpha = 1.5  # 降低 alpha，使曲线更平缓
+            self.wiou_momentum = 0.1  # 提高动量，让 running mean 更新更快
 
     def forward(
         self,
@@ -156,13 +158,19 @@ class BboxLoss(nn.Module):
                 c2 = cw ** 2 + ch ** 2
                 r_wiou = torch.exp(rho2 / (c2 + 1e-7))
 
+            # WIoU v3: update running mean of IoU loss (momentum convention matches official)
+            if self.training:
+                with torch.no_grad():
+                    self.iou_running_mean.mul_(1 - self.wiou_momentum)
+                    self.iou_running_mean.add_(self.wiou_momentum * loss_iou.detach().mean())
+
             # WIoU v3: non-monotonic focusing coefficient
-            # beta = L_IoU * R_WIoU (outlier degree)
+            # beta = L_IoU / L_IoU_mean (outlier degree)
             with torch.no_grad():
-                beta = loss_iou.detach() * r_wiou
+                beta = loss_iou.detach() / (self.iou_running_mean + 1e-7)
                 r_focus = beta / (self.wiou_delta * self.wiou_alpha ** (beta - self.wiou_delta))
 
-            loss_iou = (r_focus * loss_iou * weight).sum() / target_scores_sum
+            loss_iou = (r_focus * r_wiou * loss_iou * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
@@ -390,7 +398,7 @@ class v8DetectionLoss:
             stride=self.stride.tolist(),
             topk2=tal_topk2,
         )
-        self.bbox_loss = BboxLoss(m.reg_max, iou_type="wiou").to(device)
+        self.bbox_loss = BboxLoss(m.reg_max, iou_type="ciou").to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
