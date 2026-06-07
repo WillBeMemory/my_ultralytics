@@ -71,10 +71,10 @@ class FPN_PAN(nn.Module):
             self._init_layers(p2, p3, p4)
 
         # ========== FPN (Top-Down) ==========
-        p4_up = F.interpolate(p4, size=p3.shape[-2:], mode='bilinear', align_corners=False)
+        p4_up = F.interpolate(p4, size=p3.shape[-2:], mode='nearest')
         p3_fpn = self.fpn_p3(torch.cat([p3, p4_up], dim=1))
 
-        p3_up = F.interpolate(p3_fpn, size=p2.shape[-2:], mode='bilinear', align_corners=False)
+        p3_up = F.interpolate(p3_fpn, size=p2.shape[-2:], mode='nearest')
         p2_fpn = self.fpn_p2(torch.cat([p2, p3_up], dim=1))
 
         # ========== PAN (Bottom-Up) ==========
@@ -117,7 +117,7 @@ class BiFPNLayer(nn.Module):
         # ========== Bottom-Up：P2→P3, P3→P4 ==========
         # P2_td → Conv(s=2, 128→256) → BiFPN_Add(P3_td, P2_down) → DWConv refine
         self.bu_p2_to_p3 = Conv(c2, c3, 3, 2)
-        self.bu_p3_fuse = BiFPN_Add(2)
+        self.bu_p3_fuse = BiFPN_Add(3)
         self.bu_p3_refine = DepthwiseSeparableConv(c3) if self.use_refine else nn.Identity()
 
         # P3_out → Conv(s=2, 256→512) → BiFPN_Add(P4, P3_down) → DWConv refine
@@ -134,19 +134,19 @@ class BiFPNLayer(nn.Module):
 
         # ========== Top-Down ==========
         # P4 → P3 融合
-        p4_up = F.interpolate(self.td_p4_to_p3(p4_in), size=p3_in.shape[-2:], mode='bilinear', align_corners=False)
+        p4_up = F.interpolate(self.td_p4_to_p3(p4_in), size=p3_in.shape[-2:], mode='nearest')
         p3_td = self.td_p3_fuse([p3_in, p4_up])
         p3_td = self.td_p3_refine(p3_td)
 
         # P3 → P2 融合
-        p3_up = F.interpolate(self.td_p3_to_p2(p3_td), size=p2_in.shape[-2:], mode='bilinear', align_corners=False)
+        p3_up = F.interpolate(self.td_p3_to_p2(p3_td), size=p2_in.shape[-2:], mode='nearest')
         p2_td = self.td_p2_fuse([p2_in, p3_up])
         p2_td = self.td_p2_refine(p2_td)
 
         # ========== Bottom-Up ==========
         # P2 → P3 融合
         p2_down = self.bu_p2_to_p3(p2_td)
-        p3_out = self.bu_p3_fuse([p3_td, p2_down])
+        p3_out = self.bu_p3_fuse([p3_in, p3_td, p2_down])
         p3_out = self.bu_p3_refine(p3_out)
 
         # P3 → P4 融合
