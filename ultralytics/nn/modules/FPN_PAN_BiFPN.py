@@ -162,6 +162,7 @@ class FPN_PAN_BiFPN(nn.Module):
     FPN-PAN-BiFPN 组合模块
     - FPN-PAN：与 YOLO11 默认结构完全一致（Conv + C3k2 + Upsample + Concat）
     - BiFPN：P2/P3/P4 两两加权融合（BiFPN_Add），可堆叠多层
+    - P2 语义门控：P3/P4 高层语义生成空间掩膜，抑制 P2 背景噪声
     """
     def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False):
         super().__init__()
@@ -174,6 +175,10 @@ class FPN_PAN_BiFPN(nn.Module):
 
         # FPN-PAN（标准 YOLO11 结构）
         self.fpn_pan = FPN_PAN(channels, out_channels)
+
+        # P2 语义门控：P3/P4 高层语义 → 空间掩膜 → 抑制 P2 背景噪声
+        self.p2_gate_conv3 = Conv(o3, 1, 1, act=False)  # P3 → 1通道
+        self.p2_gate_conv4 = Conv(o4, 1, 1, act=False)  # P4 → 1通道
 
         # BiFPN 层
         if num_bifpn_layers > 0:
@@ -188,6 +193,14 @@ class FPN_PAN_BiFPN(nn.Module):
 
         # FPN-PAN
         p2_out, p3_out, p4_out = self.fpn_pan([p2, p3, p4])
+
+        # P2 语义门控：P3/P4 高层语义 → 空间掩膜 → 抑制 P2 背景噪声
+        m3 = self.p2_gate_conv3(p3_out)                           # (B, 1, 80, 80)
+        m4 = self.p2_gate_conv4(p4_out)                           # (B, 1, 40, 40)
+        m3_up = F.interpolate(m3, size=p2_out.shape[-2:], mode='nearest')
+        m4_up = F.interpolate(m4, size=p2_out.shape[-2:], mode='nearest')
+        gate = torch.sigmoid(m3_up + m4_up)                       # (B, 1, 160, 160)
+        p2_out = p2_out * gate
 
         # BiFPN 精炼
         if self.bifpn_layers:
