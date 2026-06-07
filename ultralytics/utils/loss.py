@@ -115,10 +115,8 @@ class BboxLoss(nn.Module):
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
         self.iou_type = iou_type
         if iou_type == "wiou":
-            self.register_buffer("iou_running_mean", torch.tensor(1.0))
-            self.wiou_delta = 1.0
+            self.wiou_delta = 3.0
             self.wiou_alpha = 1.9
-            self.wiou_momentum = 0.99
 
     def forward(
         self,
@@ -142,7 +140,7 @@ class BboxLoss(nn.Module):
             # WIoU v3: Wise-IoU with dynamic non-monotonic focusing mechanism
             # https://arxiv.org/abs/2301.10051
             iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False)
-            loss_iou_base = 1.0 - iou  # [N_fg]
+            loss_iou = 1.0 - iou  # [N_fg]
 
             # WIoU v1: distance attention R_WIoU
             pred = pred_bboxes[fg_mask]    # [N_fg, 4] xyxy
@@ -154,25 +152,17 @@ class BboxLoss(nn.Module):
             cw = torch.max(pred[..., 2], target[..., 2]) - torch.min(pred[..., 0], target[..., 0])
             ch = torch.max(pred[..., 3], target[..., 3]) - torch.min(pred[..., 1], target[..., 1])
             with torch.no_grad():
-                r_wiou = torch.exp(
-                    (pred_ctr_x - target_ctr_x) ** 2 / (cw ** 2 + 1e-7) +
-                    (pred_ctr_y - target_ctr_y) ** 2 / (ch ** 2 + 1e-7)
-                )
-
-            # WIoU v3: update running mean of IoU loss
-            if self.training:
-                with torch.no_grad():
-                    self.iou_running_mean = (
-                        self.wiou_momentum * self.iou_running_mean +
-                        (1 - self.wiou_momentum) * loss_iou_base.detach().mean()
-                    )
+                rho2 = (pred_ctr_x - target_ctr_x) ** 2 + (pred_ctr_y - target_ctr_y) ** 2
+                c2 = cw ** 2 + ch ** 2
+                r_wiou = torch.exp(rho2 / (c2 + 1e-7))
 
             # WIoU v3: non-monotonic focusing coefficient
+            # beta = L_IoU * R_WIoU (outlier degree)
             with torch.no_grad():
-                beta = loss_iou_base.detach() / (self.iou_running_mean + 1e-7)
+                beta = loss_iou.detach() * r_wiou
                 r_focus = beta / (self.wiou_delta * self.wiou_alpha ** (beta - self.wiou_delta))
 
-            loss_iou = (r_focus * r_wiou * loss_iou_base * weight).sum() / target_scores_sum
+            loss_iou = (r_focus * loss_iou * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
