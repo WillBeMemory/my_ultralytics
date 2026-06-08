@@ -17,20 +17,64 @@ class BiFPN_Add(nn.Module):
         return sum(w_norm[i] * xs[i] for i in range(len(xs)))
 
 
-class DepthwiseSeparableConv(nn.Module):
-    """深度可分离卷积 — DW 3×3 + Pointwise 1×1，支持通道变换"""
-    def __init__(self, c1, c2=None, kernel_size=3, act=True):
+class Involution(nn.Module):
+    """
+    Involution：位置自适应核的空间注意力
+    论文：Involution: Inverting the Inherence of Convolution (CVPR 2021)
+
+    不同于标准卷积（所有位置共享核），Involution 每个位置有独特核
+    相当于隐式的空间注意力机制
+    """
+    def __init__(self, channels, kernel_size=3, stride=1):
+        super().__init__()
+        self.k = kernel_size
+        self.stride = stride
+        # 每个位置生成 k*k 个权重
+        self.conv = nn.Conv2d(channels, kernel_size ** 2, 1, bias=False)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        # 生成位置相关核: (B, k*k, H, W)
+        kernel = self.conv(x)
+        kernel = kernel.view(b, self.k, self.k, h, w)
+
+        # 使用 unfold 提取局部窗口
+        out = F.unfold(x, kernel_size=self.k, stride=self.stride, padding=self.k // 2)
+        out = out.view(b, c, self.k, self.k, h, w)
+
+        # 逐位置加权：out[:,:,i,j] = sum(out[:,:,i,j,l,m] * kernel[:,i,j,l,m])
+        out = (out * kernel.unsqueeze(1)).sum(dim=[2, 3])
+        return out
+
+
+class InvDWConv(nn.Module):
+    """
+    Involution + DepthwiseSeparableConv 混合精炼模块
+    - Involution: 位置自适应空间注意力（核随位置变化）
+    - DWConv: 通道混合增强表达能力
+
+    优势：
+    1. Involution 提供隐式空间注意力
+    2. DWConv 保持通道间信息交互
+    3. 轻量化：参数量可控
+    """
+    def __init__(self, c1, c2=None, kernel_size=3):
         super().__init__()
         c2 = c2 or c1
+        # Involution：空间精炼
+        self.inv = Involution(c1, kernel_size)
+        # DWConv：通道混合
         self.pw = nn.Conv2d(c1, c2, 1, bias=False)
         self.bn0 = nn.BatchNorm2d(c2)
         self.dw = nn.Conv2d(c2, c2, kernel_size, stride=1,
                             padding=kernel_size // 2, groups=c2, bias=False)
         self.bn1 = nn.BatchNorm2d(c2)
-        self.act = nn.SiLU(inplace=True) if act else nn.Identity()
+        self.act = nn.SiLU(inplace=True)
 
     def forward(self, x):
-        return self.act(self.bn1(self.dw(self.bn0(self.pw(x)))))
+        x = self.inv(x)                   # 空间精炼（位置自适应注意力）
+        x = self.act(self.bn1(self.dw(self.bn0(self.pw(x)))))  # 通道混合
+        return x
 
 
 class FPN_PAN(nn.Module):
@@ -38,7 +82,6 @@ class FPN_PAN(nn.Module):
     标准 FPN-PAN，与 YOLO11 默认 Neck 结构完全一致：
     - FPN (Top-Down):   Upsample → Concat → C3k2
     - PAN (Bottom-Up):  Conv(s=2) → Concat → C3k2
-    - C3k2 内部 n=1（YOLO11 默认，n 控制 Bottleneck 数量）
     """
     def __init__(self, channels, out_channels=None):
         super().__init__()
@@ -51,18 +94,18 @@ class FPN_PAN(nn.Module):
         o2, o3, o4 = self._out_channels
 
         # ========== FPN (Top-Down) ==========
-        # P4 → Upsample → Concat(P3) → DepthwiseSeparableConv → P3_fpn
-        self.fpn_p3 = DepthwiseSeparableConv(p3.shape[1] + p4.shape[1], o3)
-        # P3_fpn → Upsample → Concat(P2) → DepthwiseSeparableConv → P2_fpn
-        self.fpn_p2 = DepthwiseSeparableConv(p2.shape[1] + o3, o2)
+        # P4 → Upsample → Concat(P3) → C3k2 → P3_fpn
+        self.fpn_p3 = C3k2(p3.shape[1] + p4.shape[1], o3, n=1, g=1, e=1.0)
+        # P3_fpn → Upsample → Concat(P2) → C3k2 → P2_fpn
+        self.fpn_p2 = C3k2(p2.shape[1] + o3, o2, n=1, g=1, e=1.0)
 
         # ========== PAN (Bottom-Up) ==========
-        # P2_fpn → Conv(s=2) → Concat(P3_fpn) → DepthwiseSeparableConv → P3_pan
+        # P2_fpn → Conv(s=2) → Concat(P3_fpn) → C3k2 → P3_pan
         self.pan_p2_down = Conv(o2, o3, 3, 2)
-        self.pan_p3 = DepthwiseSeparableConv(o3 + o3, o3)
-        # P3_pan → Conv(s=2) → Concat(P4) → DepthwiseSeparableConv → P4_pan
+        self.pan_p3 = C3k2(o3 + o3, o3, n=1, g=1, e=1.0)
+        # P3_pan → Conv(s=2) → Concat(P4) → C3k2 → P4_pan
         self.pan_p3_down = Conv(o3, o4, 3, 2)
-        self.pan_p4 = DepthwiseSeparableConv(o4 + p4.shape[1], o4)
+        self.pan_p4 = C3k2(o4 + p4.shape[1], o4, n=1, g=1, e=1.0)
 
         self.to(p2.device)
         self._initialized = True
@@ -95,7 +138,7 @@ class BiFPNLayer(nn.Module):
     BiFPN 单层，P2/P3/P4 两两加权融合（Top-Down + Bottom-Up）
     - 使用 BiFPN_Add 做加权融合（而非 Concat）
     - 1x1 Conv 做通道投影保证维度一致
-    - DWConv 做融合后精炼
+    - InvDWConv 做融合后精炼（位置注意力 + 通道混合）
     """
     def __init__(self, channels=None, use_refine=True):
         super().__init__()
@@ -107,26 +150,26 @@ class BiFPNLayer(nn.Module):
         c2, c3, c4 = p2.shape[1], p3.shape[1], p4.shape[1]
 
         # ========== Top-Down：P4→P3, P3→P2 ==========
-        # P4 → 1x1 Conv(512→256) → Upsample → BiFPN_Add(P3, P4_up) → DWConv refine
+        # P4 → 1x1 Conv(512→256) → Upsample → BiFPN_Add(P3, P4_up) → InvDWConv refine
         self.td_p4_to_p3 = Conv(c4, c3, 1, act=False)
         self.td_p3_fuse = BiFPN_Add(2)
-        self.td_p3_refine = DepthwiseSeparableConv(c3) if self.use_refine else nn.Identity()
+        self.td_p3_refine = InvDWConv(c3) if self.use_refine else nn.Identity()
 
-        # P3_td → 1x1 Conv(256→128) → Upsample → BiFPN_Add(P2, P3_up) → DWConv refine
+        # P3_td → 1x1 Conv(256→128) → Upsample → BiFPN_Add(P2, P3_up) → InvDWConv refine
         self.td_p3_to_p2 = Conv(c3, c2, 1, act=False)
         self.td_p2_fuse = BiFPN_Add(2)
-        self.td_p2_refine = DepthwiseSeparableConv(c2) if self.use_refine else nn.Identity()
+        self.td_p2_refine = InvDWConv(c2) if self.use_refine else nn.Identity()
 
         # ========== Bottom-Up：P2→P3, P3→P4 ==========
-        # P2_td → Conv(s=2, 128→256) → BiFPN_Add(P3_td, P2_down) → DWConv refine
+        # P2_td → Conv(s=2, 128→256) → BiFPN_Add(P3_td, P2_down) → InvDWConv refine
         self.bu_p2_to_p3 = Conv(c2, c3, 3, 2)
         self.bu_p3_fuse = BiFPN_Add(2)
-        self.bu_p3_refine = DepthwiseSeparableConv(c3) if self.use_refine else nn.Identity()
+        self.bu_p3_refine = InvDWConv(c3) if self.use_refine else nn.Identity()
 
-        # P3_out → Conv(s=2, 256→512) → BiFPN_Add(P4, P3_down) → DWConv refine
+        # P3_out → Conv(s=2, 256→512) → BiFPN_Add(P4, P3_down) → InvDWConv refine
         self.bu_p3_to_p4 = Conv(c3, c4, 3, 2)
         self.bu_p4_fuse = BiFPN_Add(2)
-        self.bu_p4_refine = DepthwiseSeparableConv(c4) if self.use_refine else nn.Identity()
+        self.bu_p4_refine = InvDWConv(c4) if self.use_refine else nn.Identity()
 
         self.to(p2.device)
         self._initialized = True
@@ -216,6 +259,16 @@ if __name__ == "__main__":
     channels = [128, 256, 512]
     out_channels = [128, 256, 512]
 
+    print("\n=== Testing Involution ===")
+    inv = Involution(256, kernel_size=3).to(device)
+    out = inv(p3)
+    print(f"  Involution: {list(p3.shape)} → {list(out.shape)}")
+
+    print("\n=== Testing InvDWConv ===")
+    invdw = InvDWConv(256).to(device)
+    out = invdw(p3)
+    print(f"  InvDWConv: {list(p3.shape)} → {list(out.shape)}")
+
     print("\n=== Testing FPN_PAN (标准 YOLO11 结构) ===")
     fpn_pan = FPN_PAN(channels, out_channels).to(device)
     outs = fpn_pan([p2, p3, p4])
@@ -229,7 +282,7 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in fpn_pan.parameters())
     print(f"  FPN_PAN Params: {total_params:,}")
 
-    print("\n=== Testing BiFPNLayer (两两加权融合) ===")
+    print("\n=== Testing BiFPNLayer (InvDWConv 精炼) ===")
     bifpn_layer = BiFPNLayer(out_channels, use_refine=True).to(device)
     p2_out, p3_out, p4_out = bifpn_layer(p2, p3, p4)
     for name, out, exp in [
