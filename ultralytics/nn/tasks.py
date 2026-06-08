@@ -78,6 +78,7 @@ from ultralytics.nn.modules.AddModules.StarC3k2 import StarC3k2
 from ultralytics.nn.modules.AddModules.ASFF import ASFF
 from ultralytics.nn.modules.AddModules.SPDWTConv import SPDWTConv
 from ultralytics.nn.modules.AddModules.C3k2WT import C3k2WT
+from ultralytics.nn.modules.ASGF_Neck import ASGFNeck
 from ultralytics.nn.modules.AddModules.SoftFillEdgeEnhance_PSA import SoftFillEdgeEnhance_PSA
 
 from ultralytics.nn.autobackend import check_class_names
@@ -121,6 +122,7 @@ from ultralytics.nn.modules import (
     DWC3k2,
     # LightweightFPN_PAN,
     FPN_PAN_BiFPN,
+    ASGFNeck,
     Focus,
     GhostBottleneck,
     GhostConv,
@@ -1904,6 +1906,7 @@ def parse_model(d, ch, verbose=True):
             BiFPN,
             # LightweightFPN_PAN,
             FPN_PAN_BiFPN,
+            ASGFNeck,
             CCFPN,
             EFC_FPN,
             PRN,
