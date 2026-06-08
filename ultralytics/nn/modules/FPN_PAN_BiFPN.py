@@ -162,42 +162,45 @@ class BiFPNLayer(nn.Module):
 
 class FPN_PAN_BiFPN(nn.Module):
     """
-    FPN-PAN-BiFPN 组合模块
-    - FPN-PAN：与 YOLO11 默认结构完全一致（Conv + C3k2 + Upsample + Concat）
-    - BiFPN：P2/P3/P4 两两加权融合（BiFPN_Add），可堆叠多层
+    FPN-PAN-BiFPN 组合模块 - 可循环执行
+    - 完整单元：FPN-PAN + BiFPN
+    - num_cycles: 完整单元循环次数
+    - num_bifpn_layers: 每个完整单元中BiFPN层数
     """
-    def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=True):
+    def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=True, num_cycles=1):
         super().__init__()
         c2, c3, c4 = channels
         if out_channels is None:
             out_channels = [c2, c3, c4]
         o2, o3, o4 = out_channels
 
+        self.num_cycles = num_cycles
         self.num_bifpn_layers = num_bifpn_layers
 
-        # FPN-PAN（标准 YOLO11 结构）
-        self.fpn_pan = FPN_PAN(channels, out_channels)
-
-        # BiFPN 层
-        if num_bifpn_layers > 0:
-            self.bifpn_layers = nn.ModuleList([
-                BiFPNLayer(out_channels, use_refine) for _ in range(num_bifpn_layers)
-            ])
-        else:
-            self.bifpn_layers = None
+        # 每个循环一个完整单元 (FPN_PAN + BiFPN_layers)
+        self.cycles = nn.ModuleList()
+        for _ in range(num_cycles):
+            cycle = nn.ModuleDict({
+                'fpn_pan': FPN_PAN(channels, out_channels),
+                'bifpn_layers': nn.ModuleList([
+                    BiFPNLayer(out_channels, use_refine) for _ in range(num_bifpn_layers)
+                ]) if num_bifpn_layers > 0 else None
+            })
+            self.cycles.append(cycle)
 
     def forward(self, features):
         p2, p3, p4 = features
 
-        # FPN-PAN
-        p2_out, p3_out, p4_out = self.fpn_pan([p2, p3, p4])
+        # 循环执行完整单元
+        for cycle in self.cycles:
+            # FPN-PAN
+            p2, p3, p4 = cycle['fpn_pan']([p2, p3, p4])
+            # BiFPN
+            if cycle['bifpn_layers']:
+                for layer in cycle['bifpn_layers']:
+                    p2, p3, p4 = layer(p2, p3, p4)
 
-        # BiFPN 精炼
-        if self.bifpn_layers:
-            for layer in self.bifpn_layers:
-                p2_out, p3_out, p4_out = layer(p2_out, p3_out, p4_out)
-
-        return [p2_out, p3_out, p4_out]
+        return [p2, p3, p4]
 
 
 # ================== 测试 ==================
@@ -238,11 +241,12 @@ if __name__ == "__main__":
         print(f"  {name}: {list(out.shape)} expected {list(exp)} [{status}]")
     print(f"  BiFPNLayer Params: {sum(p.numel() for p in bifpn_layer.parameters()):,}")
 
-    print("\n=== Testing FPN_PAN_BiFPN (1 BiFPN layer) ===")
+    print("\n=== Testing FPN_PAN_BiFPN (1 cycle, 1 BiFPN layer) ===")
     fpn_pan_bifpn = FPN_PAN_BiFPN(
         channels, out_channels,
         num_bifpn_layers=1,
-        use_refine=True
+        use_refine=True,
+        num_cycles=1
     ).to(device)
     outs = fpn_pan_bifpn([p2, p3, p4])
     for i, (out, exp) in enumerate(zip(outs, [
@@ -255,13 +259,14 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in fpn_pan_bifpn.parameters())
     print(f"  FPN_PAN_BiFPN Params: {total_params:,}")
 
-    print("\n=== Testing FPN_PAN_BiFPN (3 BiFPN layers) ===")
-    fpn_pan_bifpn3 = FPN_PAN_BiFPN(
+    print("\n=== Testing FPN_PAN_BiFPN (2 cycles, 1 BiFPN layer) ===")
+    fpn_pan_bifpn2 = FPN_PAN_BiFPN(
         channels, out_channels,
-        num_bifpn_layers=3,
-        use_refine=True
+        num_bifpn_layers=1,
+        use_refine=True,
+        num_cycles=2
     ).to(device)
-    outs = fpn_pan_bifpn3([p2, p3, p4])
+    outs = fpn_pan_bifpn2([p2, p3, p4])
     for i, (out, exp) in enumerate(zip(outs, [
         (bs, 128, 160, 160),
         (bs, 256, 80, 80),
@@ -269,5 +274,5 @@ if __name__ == "__main__":
     ]), start=2):
         status = "OK" if out.shape == exp else "FAIL"
         print(f"  P{i}: {list(out.shape)} expected {list(exp)} [{status}]")
-    total_params = sum(p.numel() for p in fpn_pan_bifpn3.parameters())
-    print(f"  FPN_PAN_BiFPN (3 layers) Params: {total_params:,}")
+    total_params = sum(p.numel() for p in fpn_pan_bifpn2.parameters())
+    print(f"  FPN_PAN_BiFPN (2 cycles) Params: {total_params:,}")
