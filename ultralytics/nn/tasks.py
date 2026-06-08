@@ -1911,14 +1911,15 @@ def parse_model(d, ch, verbose=True):
             ASFF
         ):
             raw_channels = args[0]
+            extra_args = args[2:]
             scaled_channels = [make_divisible(min(ch, max_channels) * width, 8) for ch in raw_channels]
             # 如果有第二个列表（out_channels），同样进行缩放
             if len(args) >= 2:
                 raw_out_channels = args[1]
                 scaled_out_channels = [make_divisible(min(ch, max_channels) * width, 8) for ch in raw_out_channels]
-                args = [scaled_channels, scaled_out_channels]
+                args = [scaled_channels, scaled_out_channels, *extra_args]
             else:
-                args = [scaled_channels]
+                args = [scaled_channels, *extra_args]
             c2 = scaled_channels[0]
             # elif m is SplitList:
         #     # SplitList 参数 [index, raw_out_channels]

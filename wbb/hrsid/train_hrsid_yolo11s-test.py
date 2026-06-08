@@ -95,7 +95,7 @@ def train_model():
             # perspective=0.0005,  # 较小的透视变换
             # flipud=0.3,  # 较小的上下翻转概率
             # fliplr=0.5,  # 左右翻转概率
-            # mosaic=1.0,
+            mosaic=0,
             # mixup=0.1,
         )
 
