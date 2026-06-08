@@ -18,16 +18,19 @@ class BiFPN_Add(nn.Module):
 
 
 class DepthwiseSeparableConv(nn.Module):
-    """深度可分离卷积 — 仅 DW 3×3，通道混合由前置 mid_conv(1×1) 完成"""
-    def __init__(self, ch, kernel_size=3, act=True):
+    """深度可分离卷积 — DW 3×3 + Pointwise 1×1，支持通道变换"""
+    def __init__(self, c1, c2=None, kernel_size=3, act=True):
         super().__init__()
-        self.dw = nn.Conv2d(ch, ch, kernel_size, stride=1,
-                            padding=kernel_size // 2, groups=ch, bias=False)
-        self.bn = nn.BatchNorm2d(ch)
+        c2 = c2 or c1
+        self.pw = nn.Conv2d(c1, c2, 1, bias=False)
+        self.bn0 = nn.BatchNorm2d(c2)
+        self.dw = nn.Conv2d(c2, c2, kernel_size, stride=1,
+                            padding=kernel_size // 2, groups=c2, bias=False)
+        self.bn1 = nn.BatchNorm2d(c2)
         self.act = nn.SiLU(inplace=True) if act else nn.Identity()
 
     def forward(self, x):
-        return self.act(self.bn(self.dw(x)))
+        return self.act(self.bn1(self.dw(self.bn0(self.pw(x)))))
 
 
 class FPN_PAN(nn.Module):
@@ -48,18 +51,18 @@ class FPN_PAN(nn.Module):
         o2, o3, o4 = self._out_channels
 
         # ========== FPN (Top-Down) ==========
-        # P4 → Upsample → Concat(P3) → C3k2 → P3_fpn
-        self.fpn_p3 = C3k2(p3.shape[1] + p4.shape[1], o3, n=1, c3k=False)
-        # P3_fpn → Upsample → Concat(P2) → C3k2 → P2_fpn
-        self.fpn_p2 = C3k2(p2.shape[1] + o3, o2, n=1, c3k=False)
+        # P4 → Upsample → Concat(P3) → DepthwiseSeparableConv → P3_fpn
+        self.fpn_p3 = DepthwiseSeparableConv(p3.shape[1] + p4.shape[1], o3)
+        # P3_fpn → Upsample → Concat(P2) → DepthwiseSeparableConv → P2_fpn
+        self.fpn_p2 = DepthwiseSeparableConv(p2.shape[1] + o3, o2)
 
         # ========== PAN (Bottom-Up) ==========
-        # P2_fpn → Conv(s=2) → Concat(P3_fpn) → C3k2 → P3_pan
+        # P2_fpn → Conv(s=2) → Concat(P3_fpn) → DepthwiseSeparableConv → P3_pan
         self.pan_p2_down = Conv(o2, o3, 3, 2)
-        self.pan_p3 = C3k2(o3 + o3, o3, n=1, c3k=False)
-        # P3_pan → Conv(s=2) → Concat(P4) → C3k2 → P4_pan
+        self.pan_p3 = DepthwiseSeparableConv(o3 + o3, o3)
+        # P3_pan → Conv(s=2) → Concat(P4) → DepthwiseSeparableConv → P4_pan
         self.pan_p3_down = Conv(o3, o4, 3, 2)
-        self.pan_p4 = C3k2(o4 + p4.shape[1], o4, n=1, c3k=False)
+        self.pan_p4 = DepthwiseSeparableConv(o4 + p4.shape[1], o4)
 
         self.to(p2.device)
         self._initialized = True
@@ -163,7 +166,7 @@ class FPN_PAN_BiFPN(nn.Module):
     - FPN-PAN：与 YOLO11 默认结构完全一致（Conv + C3k2 + Upsample + Concat）
     - BiFPN：P2/P3/P4 两两加权融合（BiFPN_Add），可堆叠多层
     """
-    def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False):
+    def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=True):
         super().__init__()
         c2, c3, c4 = channels
         if out_channels is None:
