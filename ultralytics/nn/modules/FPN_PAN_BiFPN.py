@@ -144,12 +144,14 @@ class FullyConnectedBiFPNLayer(nn.Module):
         self.p4_p2_fuse = BiFPN_Add(2)
         self.p4_p2_refine = DepthwiseSeparableConv(c2) if self.use_refine else nn.Identity()
 
+        self._c2, self._c3, self._c4 = c2, c3, c4
         self.to(p2.device)
         self._initialized = True
 
     def forward(self, p2_in, p3_in, p4_in):
         if not self._initialized:
             self._init_layers(p2_in, p3_in, p4_in)
+        c2, c3, c4 = self._c2, self._c3, self._c4
 
         # ===== P2 ↔ P3 融合 =====
         # P2 → P3

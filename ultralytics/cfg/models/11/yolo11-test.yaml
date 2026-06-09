@@ -35,9 +35,8 @@ backbone:
 
 # YOLO11n head
 head:
-##     ASGF Neck 接收 P2~P4，输出 P2~P4
-##     参数: [channels, out_channels, num_asgf_layers, use_global]
-  - [ [ 2, 4, 10 ], 1, ASGFNeck, [ [ 256, 512, 512 ], [ 128, 256, 512 ], 1, True] ]
+##     BiFPN 接收 P2~P5，输出 P3~P5
+  - [ [ 2, 4, 10 ], 1, FPN_PAN_BiFPN, [ [ 128, 256, 512 ], [ 128, 256, 512 ], 1, False] ] # [channels, out_channels, num_bifpn_layers, use_refine]
 
   # 只需要三个 SplitList
   - [ 11, 1, SplitList, [ 128,  0 ] ]   # P2_out
