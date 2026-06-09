@@ -36,6 +36,7 @@ from ultralytics.nn.modules.AdaptiveResidualFusion import AdaptiveResidualFusion
 from ultralytics.nn.modules.spapf import SPAPF
 from ultralytics.nn.modules.DyHead import DyHead
 from ultralytics.nn.modules.SPPF_LSKA import SPPF_LSKA
+from ultralytics.nn.modules.SPPF_Dilated import SPPF_Dilated
 from ultralytics.nn.modules.DynamicMultiBranch import DynamicPartialIdentity,DynamicWaveletAttentionIdentity,DynamicWaveletIdentity
 from ultralytics.nn.modules.DepthwiseSeparableConv import DepthwiseSeparableConvWithWTConv2d
 from ultralytics.nn.modules.DyUpsample import DySample

@@ -28,7 +28,7 @@ backbone:
   - [-1, 1, nn.Identity, [ ] ]
 #  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
 #  - [-1, 2, C3k2, [1024, True]]
-  - [-1, 1, SPPF, [512, 5]] # 9
+  - [-1, 1, SPPF_Dilated, [512, 5]] # 9
   - [-1, 2, C2PSA, [512]] # 10
 #  - [-1, 1, HIPA, [1024, 4, 0.25,[1,0.75,0.5,0.25],8,True,8,'center',True,'l2',True,0.8,0.25 ]] # 10
 #  - [-1, 2, HIPA, [512]] # 10
@@ -36,7 +36,7 @@ backbone:
 # YOLO11n head
 head:
 ##     BiFPN 接收 P2~P5，输出 P3~P5
-  - [ [ 2, 4, 10 ], 1, FPN_PAN_BiFPN, [ [ 128, 256, 512 ], [ 128, 256, 512 ], 1, False] ] # [channels, out_channels, num_bifpn_layers, use_refine]
+  - [ [ 2, 4, 10 ], 1, FPN_PAN_BiFPN, [ [ 256, 512, 512 ], [ 128, 256, 512 ], 1, False] ] # [channels, out_channels, num_bifpn_layers, use_refine]
 
   # 只需要三个 SplitList
   - [ 11, 1, SplitList, [ 128,  0 ] ]   # P2_out
