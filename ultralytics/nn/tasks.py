@@ -28,6 +28,7 @@ from ultralytics.nn.modules.spapf import SPAPF
 from ultralytics.nn.modules.DyHead import DyHead
 from ultralytics.nn.modules.SPPF_LSKA import SPPF_LSKA
 from ultralytics.nn.modules.SPPF_Dilated import SPPF_Dilated
+from ultralytics.nn.modules.C2PSA_Dilated import C2PSA_Dilated
 from ultralytics.nn.modules.DynamicMultiBranch import DynamicPartialIdentity, DynamicWaveletAttentionIdentity,DynamicWaveletIdentity
 from ultralytics.nn.modules.DepthwiseSeparableConv import DepthwiseSeparableConvWithWTConv2d
 from ultralytics.nn.modules.MoE import MoEBlock,AttMoE,ConvMoE
@@ -1731,6 +1732,7 @@ def parse_model(d, ch, verbose=True):
             SPPF,
             C2fPSA,
             C2PSA,
+            C2PSA_Dilated,
             DWConv,
             Focus,
             BottleneckCSP,
