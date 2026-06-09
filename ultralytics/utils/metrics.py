@@ -147,6 +147,54 @@ def bbox_iou(
     return iou  # IoU
 
 
+def bbox_nwd(
+    box1: torch.Tensor,
+    box2: torch.Tensor,
+    xywh: bool = False,
+    C: float = 10.0,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """
+    Calculate Normalized Wasserstein Distance (NWD) between bounding boxes.
+
+    Models each bbox as a 2D Gaussian distribution N(μ, Σ) where:
+        μ = (cx, cy), Σ^(1/2) = diag(w/2, h/2)
+
+    The 2-Wasserstein distance: W²₂ = ||μ₁ - μ₂||² + ||Σ₁^(1/2) - Σ₂^(1/2)||²_F
+    NWD = exp(-√W²₂ / C)
+
+    Args:
+        box1, box2: (..., 4) tensors
+        xywh: if True, boxes in (x, y, w, h); if False, in (x1, y1, x2, y2)
+        C: normalization constant (smaller = more sensitive to small objects, SAR: ~8-12)
+        eps: small value to avoid division by zero
+
+    Returns:
+        (torch.Tensor): NWD similarity [0, 1], where 1 = identical boxes
+
+    Reference:
+        https://arxiv.org/abs/2110.13389
+    """
+    if xywh:
+        cx1, cy1, w1, h1 = box1.chunk(4, -1)
+        cx2, cy2, w2, h2 = box2.chunk(4, -1)
+    else:
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
+        cx1, cy1 = (b1_x1 + b1_x2) / 2, (b1_y1 + b1_y2) / 2
+        w1, h1 = b1_x2 - b1_x1 + eps, b1_y2 - b1_y1 + eps
+        cx2, cy2 = (b2_x1 + b2_x2) / 2, (b2_y1 + b2_y2) / 2
+        w2, h2 = b2_x2 - b2_x1 + eps, b2_y2 - b2_y1 + eps
+
+    # 2-Wasserstein distance
+    mu_dist2 = (cx1 - cx2).pow(2) + (cy1 - cy2).pow(2)
+    sigma_dist2 = (w1 / 2 - w2 / 2).pow(2) + (h1 / 2 - h2 / 2).pow(2)
+    W2 = torch.sqrt(mu_dist2 + sigma_dist2 + eps)
+
+    nwd = torch.exp(-W2 / C)
+    return nwd
+
+
 def mask_iou(mask1: torch.Tensor, mask2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     """Calculate masks IoU.
 

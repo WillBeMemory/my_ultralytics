@@ -14,7 +14,7 @@ from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
 
-from .metrics import bbox_iou, probiou
+from .metrics import bbox_iou, bbox_nwd, probiou
 from .tal import bbox2dist, rbox2dist
 
 
@@ -116,9 +116,12 @@ class BboxLoss(nn.Module):
         self.iou_type = iou_type
         if iou_type == "wiou":
             self.register_buffer("iou_running_mean", torch.tensor(1.0))
-            self.wiou_delta = 2.0  # 降低 delta，使聚焦于更合理的样本
-            self.wiou_alpha = 1.5  # 降低 alpha，使曲线更平缓
-            self.wiou_momentum = 0.1  # 提高动量，让 running mean 更新更快
+            self.wiou_delta = 2.0
+            self.wiou_alpha = 1.5
+            self.wiou_momentum = 0.1
+        # NWD settings
+        self.nwd_C = 10.0  # normalization constant (smaller = more sensitive)
+        self.nwd_ratio = 0.5  # weight for NWD: L_iou = (1-alpha)*L_ciou + alpha*L_nwd
 
     def forward(
         self,
@@ -138,6 +141,19 @@ class BboxLoss(nn.Module):
         if self.iou_type == "ciou":
             iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
             loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        elif self.iou_type == "ciou_nwd":
+            # CIoU + Normalized Wasserstein Distance (NWD) for small objects
+            # NWD models bboxes as 2D Gaussians, sensitive to small position/size errors
+            # https://arxiv.org/abs/2110.13389
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+            loss_ciou = ((1.0 - iou) * weight).sum() / target_scores_sum
+
+            pred_xyxy = pred_bboxes[fg_mask]
+            target_xyxy = target_bboxes[fg_mask]
+            nwd = bbox_nwd(pred_xyxy, target_xyxy, xywh=False, C=self.nwd_C)
+            loss_nwd = ((1.0 - nwd) * weight).sum() / target_scores_sum
+
+            loss_iou = (1.0 - self.nwd_ratio) * loss_ciou + self.nwd_ratio * loss_nwd
         elif self.iou_type == "wiou":
             # WIoU v3: Wise-IoU with dynamic non-monotonic focusing mechanism
             # https://arxiv.org/abs/2301.10051
@@ -398,7 +414,7 @@ class v8DetectionLoss:
             stride=self.stride.tolist(),
             topk2=tal_topk2,
         )
-        self.bbox_loss = BboxLoss(m.reg_max, iou_type="ciou").to(device)
+        self.bbox_loss = BboxLoss(m.reg_max, iou_type="ciou_nwd").to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
