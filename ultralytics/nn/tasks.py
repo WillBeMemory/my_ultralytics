@@ -119,6 +119,7 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
+    DecoupledDetect,
     DWConv,
     DWConvTranspose2d,
     DWC3k2,
@@ -1968,6 +1969,7 @@ def parse_model(d, ch, verbose=True):
                 # AnchorDetect,
                 SlimDetect,
 
+                DecoupledDetect,
                 Detect,
                 WorldDetect,
                 YOLOEDetect,

@@ -251,6 +251,73 @@ class Detect(nn.Module):
         self.cv2 = self.cv3 = None
 
 
+class DecoupledDetect(Detect):
+    """YOLOX-style Decoupled Detection Head.
+
+    Adds a shared 1×1 stem convolution before splitting into separate
+    classification and regression branches, reducing gradient conflict
+    between the two tasks.
+
+    Architecture per level:
+        Neck feature → 1×1 stem → ├─ cls: 3×3→3×3→1×1 → nc
+                                  └─ reg: 3×3→3×3→1×1 → 4×reg_max
+
+    Reference:
+        https://arxiv.org/abs/2107.08430 (YOLOX)
+    """
+
+    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize decoupled detection head with shared stem per feature level."""
+        # Skip Detect.__init__, set up manually
+        nn.Module.__init__(self)
+        self.nc = nc
+        self.nl = len(ch)
+        self.reg_max = reg_max
+        self.no = nc + self.reg_max * 4
+        self.stride = torch.zeros(self.nl)
+
+        # Shared 1×1 stem per level — creates a joint feature space for both tasks
+        stem_ch = max(ch[0] // 2, 64)
+        self.stems = nn.ModuleList(Conv(x, stem_ch, 1) for x in ch)
+
+        # Task-specific branches (YOLOX style)
+        reg_ch = max(16, stem_ch // 2, self.reg_max * 4)
+        cls_ch = max(stem_ch // 2, min(self.nc, 100))
+
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(Conv(stem_ch, reg_ch, 3), Conv(reg_ch, reg_ch, 3),
+                          nn.Conv2d(reg_ch, 4 * self.reg_max, 1))
+            for _ in ch
+        )
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(Conv(stem_ch, cls_ch, 3), Conv(cls_ch, cls_ch, 3),
+                          nn.Conv2d(cls_ch, self.nc, 1))
+            for _ in ch
+        )
+        self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
+
+        if end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+    def forward_head(
+        self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None
+    ) -> dict[str, torch.Tensor]:
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        if box_head is None or cls_head is None:
+            return dict()
+        # Apply shared stem before task-specific branches
+        stemmed = [self.stems[i](x[i]) for i in range(self.nl)]
+        bs = stemmed[0].shape[0]
+        boxes = torch.cat(
+            [box_head[i](stemmed[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1
+        )
+        scores = torch.cat(
+            [cls_head[i](stemmed[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1
+        )
+        return dict(boxes=boxes, scores=scores, feats=x)
+
+
 class Segment(Detect):
     """YOLO Segment head for segmentation models.
 
