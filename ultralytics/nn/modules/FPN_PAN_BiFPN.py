@@ -49,17 +49,17 @@ class FPN_PAN(nn.Module):
 
         # ========== FPN (Top-Down) ==========
         # P4 → Upsample → Concat(P3) → C3k2 → P3_fpn
-        self.fpn_p3 = C3k2(p3.shape[1] + p4.shape[1], o3, n=1, c3k=False)
+        self.fpn_p3 = C3k2(p3.shape[1] + p4.shape[1], o3, n=2, c3k=False)
         # P3_fpn → Upsample → Concat(P2) → C3k2 → P2_fpn
-        self.fpn_p2 = C3k2(p2.shape[1] + o3, o2, n=1, c3k=False)
+        self.fpn_p2 = C3k2(p2.shape[1] + o3, o2, n=2, c3k=False)
 
         # ========== PAN (Bottom-Up) ==========
         # P2_fpn → Conv(s=2) → Concat(P3_fpn) → C3k2 → P3_pan
         self.pan_p2_down = Conv(o2, o3, 3, 2)
-        self.pan_p3 = C3k2(o3 + o3, o3, n=1, c3k=False)
+        self.pan_p3 = C3k2(o3 + o3, o3, n=2, c3k=False)
         # P3_pan → Conv(s=2) → Concat(P4) → C3k2 → P4_pan
         self.pan_p3_down = Conv(o3, o4, 3, 2)
-        self.pan_p4 = C3k2(o4 + p4.shape[1], o4, n=1, c3k=False)
+        self.pan_p4 = C3k2(o4 + p4.shape[1], o4, n=2, c3k=False)
 
         self.to(p2.device)
         self._initialized = True
