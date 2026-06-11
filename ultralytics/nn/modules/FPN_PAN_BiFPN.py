@@ -18,6 +18,32 @@ class BiFPN_Add(nn.Module):
         return sum(w_norm[i] * xs[i] for i in range(len(xs)))
 
 
+class DWConvBottleneck(nn.Module):
+    """
+    Lightweight Bottleneck: 1×1 expand → DW 3×3 → 1×1 squeeze.
+    Replaces standard Bottleneck's 3×3 Conv with DWConv (99% FLOPs saved on 3×3).
+
+    Standard Bottleneck:  1×1(c→c) + 3×3(c→c×9)                = 10c² MACs/pixel
+    DWConvBottleneck:     1×1(c→c) + DW3×3(c×9) + 1×1(c→c)     = 2c² + 9c MACs/pixel
+    """
+    def __init__(self, c1, c2, shortcut=True, e=1.0):
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = nn.Conv2d(c_, c_, 3, 1, 1, groups=c_, bias=False)  # DW 3×3
+        self.bn  = nn.BatchNorm2d(c_)
+        self.act = nn.SiLU(inplace=True)
+        self.cv3 = Conv(c_, c2, 1, 1, act=False)  # 1×1 project
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        identity = x
+        out = self.cv1(x)
+        out = self.act(self.bn(self.cv2(out)))
+        out = self.cv3(out)
+        return out + identity if self.add else out
+
+
 class DepthwiseSeparableConv(nn.Module):
     """深度可分离卷积 — 仅 DW 3×3，通道混合由前置 mid_conv(1×1) 完成"""
     def __init__(self, ch, kernel_size=3, act=True):
@@ -34,7 +60,12 @@ class DepthwiseSeparableConv(nn.Module):
 class C2ECA(nn.Module):
     """
     Lightweight CSP Bottleneck with Efficient Channel Attention (ECA).
-    Replaces C3k2 in FPN_PAN_BiFPN Neck — lighter but with attention compensation.
+    Designed to replace C3k2 in FPN_PAN_BiFPN Neck.
+
+    C3k2(n=2) core retained:
+    - CSP split (cv1 → 2 halves)
+    - n=2 Bottlenecks (sequential)
+    - Remove: PSA, C3k (not needed for Neck fusion)
 
     Structure:
         input → cv1(1×1) → split [a, b]
@@ -42,25 +73,27 @@ class C2ECA(nn.Module):
           b: Bottleneck → ChannelShuffle → Bottleneck → ECA
         Concat [a, b] → cv2(1×1) → output
 
-    Compared to C3k2(n=2):
-    - Lighter: cv2 processes 2c instead of (2+n)*c channels (params halved in cv2)
-    - Enhanced: ECA attention compensates for reduced concat information
-    - Channel Shuffle between Bottlenecks promotes cross-group info exchange (zero params)
+    lightweight=True: Bottleneck uses DWConv for 3×3 branch (MobileNetV2 style)
+    → at P2(160²), ~16.8G → ~3.4G for 2×Bottleneck
 
     References:
     - ECA-Net: Efficient Channel Attention (CVPR 2020)
     - Channel Shuffle: ShuffleNetV2 (ECCV 2018)
+    - MobileNetV2: Inverted Residuals (CVPR 2018)
     """
 
-    def __init__(self, c1, c2, n=2, e=0.5, shortcut=True):
+    def __init__(self, c1, c2, n=2, e=0.5, shortcut=True, lightweight=False):
         super().__init__()
         self.c = int(c2 * e)
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv(2 * self.c, c2, 1)
 
-        # Sequential Bottlenecks
+        # Sequential Bottlenecks — lightweight replaces 3×3 conv with DWConv
         self.m = nn.ModuleList(
-            Bottleneck(self.c, self.c, shortcut, e=1.0) for _ in range(n)
+            DWConvBottleneck(self.c, self.c, shortcut)
+            if lightweight
+            else Bottleneck(self.c, self.c, shortcut, e=1.0)
+            for _ in range(n)
         )
 
         # ECA: adaptive 1D conv on channel attention
@@ -92,9 +125,9 @@ class C2ECA(nn.Module):
             if i < len(self.m) - 1:
                 b = self._channel_shuffle(b, groups=2)
         # ECA attention
-        w = self.avg_pool(b)                                          # (B, C, 1, 1)
-        w = self.eca_conv(w.squeeze(-1).transpose(-1, -2))           # (B, 1, C)
-        w = self.sigmoid(w.transpose(-1, -2).unsqueeze(-1))          # (B, C, 1, 1)
+        w = self.avg_pool(b)
+        w = self.eca_conv(w.squeeze(-1).transpose(-1, -2))
+        w = self.sigmoid(w.transpose(-1, -2).unsqueeze(-1))
         b = b * w
         return self.cv2(torch.cat([a, b], 1))
 
@@ -119,8 +152,8 @@ class FPN_PAN(nn.Module):
         # ========== FPN (Top-Down) ==========
         # P4 → Upsample → Concat(P3) → C2ECA → P3_fpn
         self.fpn_p3 = C2ECA(p3.shape[1] + p4.shape[1], o3, n=2)
-        # P3_fpn → Upsample → Concat(P2) → C2ECA → P2_fpn
-        self.fpn_p2 = C2ECA(p2.shape[1] + o3, o2, n=2)
+        # P3_fpn → Upsample → Concat(P2) → C2ECA → P2_fpn  (P2 160² → lightweight)
+        self.fpn_p2 = C2ECA(p2.shape[1] + o3, o2, n=2, lightweight=True)
 
         # ========== PAN (Bottom-Up) ==========
         # P2_fpn → Conv(s=2) → Concat(P3_fpn) → C2ECA → P3_pan
