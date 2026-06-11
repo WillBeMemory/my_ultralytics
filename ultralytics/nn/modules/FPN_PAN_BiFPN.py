@@ -1,7 +1,8 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ultralytics.nn.modules.block import Conv, C3k2
+from ultralytics.nn.modules.block import Conv, Bottleneck
 
 
 class BiFPN_Add(nn.Module):
@@ -30,6 +31,74 @@ class DepthwiseSeparableConv(nn.Module):
         return self.act(self.bn(self.dw(x)))
 
 
+class C2ECA(nn.Module):
+    """
+    Lightweight CSP Bottleneck with Efficient Channel Attention (ECA).
+    Replaces C3k2 in FPN_PAN_BiFPN Neck — lighter but with attention compensation.
+
+    Structure:
+        input → cv1(1×1) → split [a, b]
+          a: shortcut (direct pass)
+          b: Bottleneck → ChannelShuffle → Bottleneck → ECA
+        Concat [a, b] → cv2(1×1) → output
+
+    Compared to C3k2(n=2):
+    - Lighter: cv2 processes 2c instead of (2+n)*c channels (params halved in cv2)
+    - Enhanced: ECA attention compensates for reduced concat information
+    - Channel Shuffle between Bottlenecks promotes cross-group info exchange (zero params)
+
+    References:
+    - ECA-Net: Efficient Channel Attention (CVPR 2020)
+    - Channel Shuffle: ShuffleNetV2 (ECCV 2018)
+    """
+
+    def __init__(self, c1, c2, n=2, e=0.5, shortcut=True):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv(2 * self.c, c2, 1)
+
+        # Sequential Bottlenecks
+        self.m = nn.ModuleList(
+            Bottleneck(self.c, self.c, shortcut, e=1.0) for _ in range(n)
+        )
+
+        # ECA: adaptive 1D conv on channel attention
+        k_size = self._adaptive_kernel(self.c)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.eca_conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    @staticmethod
+    def _adaptive_kernel(channels, gamma=2, b=1):
+        """Adaptive kernel size for ECA (ECA-Net paper)."""
+        t = int(abs(math.log2(channels + b)) / gamma)
+        k = t if t % 2 else t + 1
+        return max(k, 3)
+
+    @staticmethod
+    def _channel_shuffle(x, groups=2):
+        """Channel shuffle (ShuffleNetV2), zero parameters."""
+        B, C, H, W = x.shape
+        x = x.view(B, groups, C // groups, H, W)
+        x = x.transpose(1, 2).contiguous()
+        x = x.view(B, C, H, W)
+        return x
+
+    def forward(self, x):
+        a, b = self.cv1(x).chunk(2, 1)
+        for i, m in enumerate(self.m):
+            b = m(b)
+            if i < len(self.m) - 1:
+                b = self._channel_shuffle(b, groups=2)
+        # ECA attention
+        w = self.avg_pool(b)                                          # (B, C, 1, 1)
+        w = self.eca_conv(w.squeeze(-1).transpose(-1, -2))           # (B, 1, C)
+        w = self.sigmoid(w.transpose(-1, -2).unsqueeze(-1))          # (B, C, 1, 1)
+        b = b * w
+        return self.cv2(torch.cat([a, b], 1))
+
+
 class FPN_PAN(nn.Module):
     """
     标准 FPN-PAN，与 YOLO11 默认 Neck 结构完全一致：
@@ -48,18 +117,18 @@ class FPN_PAN(nn.Module):
         o2, o3, o4 = self._out_channels
 
         # ========== FPN (Top-Down) ==========
-        # P4 → Upsample → Concat(P3) → C3k2 → P3_fpn
-        self.fpn_p3 = C3k2(p3.shape[1] + p4.shape[1], o3, n=1, c3k=False)
-        # P3_fpn → Upsample → Concat(P2) → C3k2 → P2_fpn
-        self.fpn_p2 = C3k2(p2.shape[1] + o3, o2, n=1, c3k=False)
+        # P4 → Upsample → Concat(P3) → C2ECA → P3_fpn
+        self.fpn_p3 = C2ECA(p3.shape[1] + p4.shape[1], o3, n=2)
+        # P3_fpn → Upsample → Concat(P2) → C2ECA → P2_fpn
+        self.fpn_p2 = C2ECA(p2.shape[1] + o3, o2, n=2)
 
         # ========== PAN (Bottom-Up) ==========
-        # P2_fpn → Conv(s=2) → Concat(P3_fpn) → C3k2 → P3_pan
+        # P2_fpn → Conv(s=2) → Concat(P3_fpn) → C2ECA → P3_pan
         self.pan_p2_down = Conv(o2, o3, 3, 2)
-        self.pan_p3 = C3k2(o3 + o3, o3, n=1, c3k=False)
-        # P3_pan → Conv(s=2) → Concat(P4) → C3k2 → P4_pan
+        self.pan_p3 = C2ECA(o3 + o3, o3, n=2)
+        # P3_pan → Conv(s=2) → Concat(P4) → C2ECA → P4_pan
         self.pan_p3_down = Conv(o3, o4, 3, 2)
-        self.pan_p4 = C3k2(o4 + p4.shape[1], o4, n=1, c3k=False)
+        self.pan_p4 = C2ECA(o4 + p4.shape[1], o4, n=2)
 
         self.to(p2.device)
         self._initialized = True
