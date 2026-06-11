@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ultralytics.nn.modules.block import Conv, C3k2
+from ultralytics.nn.modules.block import Conv, Bottleneck
 
 
 class BiFPN_Add(nn.Module):
@@ -30,11 +30,32 @@ class DepthwiseSeparableConv(nn.Module):
         return self.act(self.bn(self.dw(x)))
 
 
+class C2f_Simple(nn.Module):
+    """
+    Equivocal to C2f/C3k2(n=2, c3k=False) — identical forward logic and params.
+    Stripped dead code: no PSA, no C3k branch. Pure C2f with n Bottlenecks.
+    """
+
+    def __init__(self, c1, c2, n=2, shortcut=True, e=0.5, g=1):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        self.m = nn.ModuleList(
+            Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
+        )
+
+    def forward(self, x):
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+
 class FPN_PAN(nn.Module):
     """
-    FPN-PAN with C3k2(n=2).
-    - FPN (Top-Down):   Upsample → Concat → C3k2(n=2)
-    - PAN (Bottom-Up):  Conv(s=2) → Concat → C3k2(n=2)
+    FPN-PAN with C2f_Simple (n=2 Bottleneck, no PSA/C3k).
+    - FPN (Top-Down):   Upsample → Concat → C2f_Simple(n=2)
+    - PAN (Bottom-Up):  Conv(s=2) → Concat → C2f_Simple(n=2)
     """
     def __init__(self, channels, out_channels=None):
         super().__init__()
@@ -47,14 +68,14 @@ class FPN_PAN(nn.Module):
         o2, o3, o4 = self._out_channels
 
         # ========== FPN (Top-Down) ==========
-        self.fpn_p3 = C3k2(p3.shape[1] + p4.shape[1], o3, n=2, c3k=False)
-        self.fpn_p2 = C3k2(p2.shape[1] + o3, o2, n=2, c3k=False)
+        self.fpn_p3 = C2f_Simple(p3.shape[1] + p4.shape[1], o3, n=2)
+        self.fpn_p2 = C2f_Simple(p2.shape[1] + o3, o2, n=2)
 
         # ========== PAN (Bottom-Up) ==========
         self.pan_p2_down = Conv(o2, o3, 3, 2)
-        self.pan_p3 = C3k2(o3 + o3, o3, n=2, c3k=False)
+        self.pan_p3 = C2f_Simple(o3 + o3, o3, n=2)
         self.pan_p3_down = Conv(o3, o4, 3, 2)
-        self.pan_p4 = C3k2(o4 + p4.shape[1], o4, n=2, c3k=False)
+        self.pan_p4 = C2f_Simple(o4 + p4.shape[1], o4, n=2)
 
         self.to(p2.device)
         self._initialized = True
@@ -147,7 +168,7 @@ class BiFPNLayer(nn.Module):
 class FPN_PAN_BiFPN(nn.Module):
     """
     FPN-PAN-BiFPN 组合模块
-    - FPN-PAN：C3k2(n=2) 替代 C3k2，2-branch CSP 更轻量
+    - FPN-PAN：C2f_Simple(n=2) 替代 C3k2，去掉 PSA/C3k，2-branch CSP
     - BiFPN：P2/P3/P4 两两加权融合（BiFPN_Add），可堆叠多层
     """
     def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False):
