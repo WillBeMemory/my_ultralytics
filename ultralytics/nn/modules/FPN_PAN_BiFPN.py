@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,32 +17,6 @@ class BiFPN_Add(nn.Module):
         return sum(w_norm[i] * xs[i] for i in range(len(xs)))
 
 
-class DWConvBottleneck(nn.Module):
-    """
-    Lightweight Bottleneck: 1×1 expand → DW 3×3 → 1×1 squeeze.
-    Replaces standard Bottleneck's 3×3 Conv with DWConv (99% FLOPs saved on 3×3).
-
-    Standard Bottleneck:  1×1(c→c) + 3×3(c→c×9)                = 10c² MACs/pixel
-    DWConvBottleneck:     1×1(c→c) + DW3×3(c×9) + 1×1(c→c)     = 2c² + 9c MACs/pixel
-    """
-    def __init__(self, c1, c2, shortcut=True, e=1.0):
-        super().__init__()
-        c_ = int(c2 * e)
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = nn.Conv2d(c_, c_, 3, 1, 1, groups=c_, bias=False)  # DW 3×3
-        self.bn  = nn.BatchNorm2d(c_)
-        self.act = nn.SiLU(inplace=True)
-        self.cv3 = Conv(c_, c2, 1, 1, act=False)  # 1×1 project
-        self.add = shortcut and c1 == c2
-
-    def forward(self, x):
-        identity = x
-        out = self.cv1(x)
-        out = self.act(self.bn(self.cv2(out)))
-        out = self.cv3(out)
-        return out + identity if self.add else out
-
-
 class DepthwiseSeparableConv(nn.Module):
     """深度可分离卷积 — 仅 DW 3×3，通道混合由前置 mid_conv(1×1) 完成"""
     def __init__(self, ch, kernel_size=3, act=True):
@@ -57,87 +30,41 @@ class DepthwiseSeparableConv(nn.Module):
         return self.act(self.bn(self.dw(x)))
 
 
-class C2ECA(nn.Module):
+class C2Lite(nn.Module):
     """
-    Lightweight CSP Bottleneck with Efficient Channel Attention (ECA).
-    Designed to replace C3k2 in FPN_PAN_BiFPN Neck.
+    Simplified C3k2: 2-branch CSP with n Bottlenecks.
 
-    C3k2(n=2) core retained:
-    - CSP split (cv1 → 2 halves)
-    - n=2 Bottlenecks (sequential)
-    - Remove: PSA, C3k (not needed for Neck fusion)
+    Based on C3k2(n=2), stripped down:
+    - Removed: C3k option, PSA/attention, (2+n)-branch concat
+    - Kept:    CSP split, n=2 Bottleneck, shortcut
 
-    Structure:
-        input → cv1(1×1) → split [a, b]
-          a: shortcut (direct pass)
-          b: Bottleneck → ChannelShuffle → Bottleneck → ECA
-        Concat [a, b] → cv2(1×1) → output
+    Key difference from C3k2(n=2):
+        C3k2:  Concat [a, b, bn1_out, bn2_out] = 4c → cv2(4c→c2)   ← heavy
+        C2Lite: Concat [a, bn_final_out]       = 2c → cv2(2c→c2)   ← light
 
-    lightweight=True: Bottleneck uses DWConv for 3×3 branch (MobileNetV2 style)
-    → at P2(160²), ~16.8G → ~3.4G for 2×Bottleneck
-
-    References:
-    - ECA-Net: Efficient Channel Attention (CVPR 2020)
-    - Channel Shuffle: ShuffleNetV2 (ECCV 2018)
-    - MobileNetV2: Inverted Residuals (CVPR 2018)
+    This halves cv2 parameters and FLOPs while keeping n=2 Bottleneck depth.
     """
 
-    def __init__(self, c1, c2, n=2, e=0.5, shortcut=True, lightweight=False):
+    def __init__(self, c1, c2, n=2, e=0.5, shortcut=True):
         super().__init__()
         self.c = int(c2 * e)
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv(2 * self.c, c2, 1)
-
-        # Sequential Bottlenecks — lightweight replaces 3×3 conv with DWConv
-        self.m = nn.ModuleList(
-            DWConvBottleneck(self.c, self.c, shortcut)
-            if lightweight
-            else Bottleneck(self.c, self.c, shortcut, e=1.0)
-            for _ in range(n)
+        self.m = nn.Sequential(
+            *(Bottleneck(self.c, self.c, shortcut, e=1.0) for _ in range(n))
         )
-
-        # ECA: adaptive 1D conv on channel attention
-        k_size = self._adaptive_kernel(self.c)
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.eca_conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    @staticmethod
-    def _adaptive_kernel(channels, gamma=2, b=1):
-        """Adaptive kernel size for ECA (ECA-Net paper)."""
-        t = int(abs(math.log2(channels + b)) / gamma)
-        k = t if t % 2 else t + 1
-        return max(k, 3)
-
-    @staticmethod
-    def _channel_shuffle(x, groups=2):
-        """Channel shuffle (ShuffleNetV2), zero parameters."""
-        B, C, H, W = x.shape
-        x = x.view(B, groups, C // groups, H, W)
-        x = x.transpose(1, 2).contiguous()
-        x = x.view(B, C, H, W)
-        return x
 
     def forward(self, x):
         a, b = self.cv1(x).chunk(2, 1)
-        for i, m in enumerate(self.m):
-            b = m(b)
-            if i < len(self.m) - 1:
-                b = self._channel_shuffle(b, groups=2)
-        # ECA attention
-        w = self.avg_pool(b)
-        w = self.eca_conv(w.squeeze(-1).transpose(-1, -2))
-        w = self.sigmoid(w.transpose(-1, -2).unsqueeze(-1))
-        b = b * w
+        b = self.m(b)
         return self.cv2(torch.cat([a, b], 1))
 
 
 class FPN_PAN(nn.Module):
     """
-    标准 FPN-PAN，与 YOLO11 默认 Neck 结构完全一致：
-    - FPN (Top-Down):   Upsample → Concat → C3k2
-    - PAN (Bottom-Up):  Conv(s=2) → Concat → C3k2
-    - C3k2 内部 n=1（YOLO11 默认，n 控制 Bottleneck 数量）
+    FPN-PAN with C2Lite (simplified C3k2).
+    - FPN (Top-Down):   Upsample → Concat → C2Lite(n=2)
+    - PAN (Bottom-Up):  Conv(s=2) → Concat → C2Lite(n=2)
     """
     def __init__(self, channels, out_channels=None):
         super().__init__()
@@ -150,18 +77,14 @@ class FPN_PAN(nn.Module):
         o2, o3, o4 = self._out_channels
 
         # ========== FPN (Top-Down) ==========
-        # P4 → Upsample → Concat(P3) → C2ECA → P3_fpn
-        self.fpn_p3 = C2ECA(p3.shape[1] + p4.shape[1], o3, n=2)
-        # P3_fpn → Upsample → Concat(P2) → C2ECA → P2_fpn  (P2 160² → lightweight)
-        self.fpn_p2 = C2ECA(p2.shape[1] + o3, o2, n=2, lightweight=True)
+        self.fpn_p3 = C2Lite(p3.shape[1] + p4.shape[1], o3, n=2)
+        self.fpn_p2 = C2Lite(p2.shape[1] + o3, o2, n=2)
 
         # ========== PAN (Bottom-Up) ==========
-        # P2_fpn → Conv(s=2) → Concat(P3_fpn) → C2ECA → P3_pan
         self.pan_p2_down = Conv(o2, o3, 3, 2)
-        self.pan_p3 = C2ECA(o3 + o3, o3, n=2)
-        # P3_pan → Conv(s=2) → Concat(P4) → C2ECA → P4_pan
+        self.pan_p3 = C2Lite(o3 + o3, o3, n=2)
         self.pan_p3_down = Conv(o3, o4, 3, 2)
-        self.pan_p4 = C2ECA(o4 + p4.shape[1], o4, n=2)
+        self.pan_p4 = C2Lite(o4 + p4.shape[1], o4, n=2)
 
         self.to(p2.device)
         self._initialized = True
@@ -206,23 +129,19 @@ class BiFPNLayer(nn.Module):
         c2, c3, c4 = p2.shape[1], p3.shape[1], p4.shape[1]
 
         # ========== Top-Down：P4→P3, P3→P2 ==========
-        # P4 → 1x1 Conv(512→256) → Upsample → BiFPN_Add(P3, P4_up) → DWConv refine
         self.td_p4_to_p3 = Conv(c4, c3, 1, act=False)
         self.td_p3_fuse = BiFPN_Add(2)
         self.td_p3_refine = DepthwiseSeparableConv(c3) if self.use_refine else nn.Identity()
 
-        # P3_td → 1x1 Conv(256→128) → Upsample → BiFPN_Add(P2, P3_up) → DWConv refine
         self.td_p3_to_p2 = Conv(c3, c2, 1, act=False)
         self.td_p2_fuse = BiFPN_Add(2)
         self.td_p2_refine = DepthwiseSeparableConv(c2) if self.use_refine else nn.Identity()
 
         # ========== Bottom-Up：P2→P3, P3→P4 ==========
-        # P2_td → Conv(s=2, 128→256) → BiFPN_Add(P3_td, P2_down) → DWConv refine
         self.bu_p2_to_p3 = Conv(c2, c3, 3, 2)
         self.bu_p3_fuse = BiFPN_Add(2)
         self.bu_p3_refine = DepthwiseSeparableConv(c3) if self.use_refine else nn.Identity()
 
-        # P3_out → Conv(s=2, 256→512) → BiFPN_Add(P4, P3_down) → DWConv refine
         self.bu_p3_to_p4 = Conv(c3, c4, 3, 2)
         self.bu_p4_fuse = BiFPN_Add(2)
         self.bu_p4_refine = DepthwiseSeparableConv(c4) if self.use_refine else nn.Identity()
@@ -235,23 +154,19 @@ class BiFPNLayer(nn.Module):
             self._init_layers(p2_in, p3_in, p4_in)
 
         # ========== Top-Down ==========
-        # P4 → P3 融合
         p4_up = F.interpolate(self.td_p4_to_p3(p4_in), size=p3_in.shape[-2:], mode='nearest')
         p3_td = self.td_p3_fuse([p3_in, p4_up])
         p3_td = self.td_p3_refine(p3_td)
 
-        # P3 → P2 融合
         p3_up = F.interpolate(self.td_p3_to_p2(p3_td), size=p2_in.shape[-2:], mode='nearest')
         p2_td = self.td_p2_fuse([p2_in, p3_up])
         p2_td = self.td_p2_refine(p2_td)
 
         # ========== Bottom-Up ==========
-        # P2 → P3 融合
         p2_down = self.bu_p2_to_p3(p2_td)
         p3_out = self.bu_p3_fuse([p3_td, p2_down])
         p3_out = self.bu_p3_refine(p3_out)
 
-        # P3 → P4 融合
         p3_down = self.bu_p3_to_p4(p3_out)
         p4_out = self.bu_p4_fuse([p4_in, p3_down])
         p4_out = self.bu_p4_refine(p4_out)
@@ -262,7 +177,7 @@ class BiFPNLayer(nn.Module):
 class FPN_PAN_BiFPN(nn.Module):
     """
     FPN-PAN-BiFPN 组合模块
-    - FPN-PAN：与 YOLO11 默认结构完全一致（Conv + C3k2 + Upsample + Concat）
+    - FPN-PAN：C2Lite(n=2) 替代 C3k2，2-branch CSP 更轻量
     - BiFPN：P2/P3/P4 两两加权融合（BiFPN_Add），可堆叠多层
     """
     def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False):
@@ -274,7 +189,7 @@ class FPN_PAN_BiFPN(nn.Module):
 
         self.num_bifpn_layers = num_bifpn_layers
 
-        # FPN-PAN（标准 YOLO11 结构）
+        # FPN-PAN
         self.fpn_pan = FPN_PAN(channels, out_channels)
 
         # BiFPN 层
@@ -297,76 +212,3 @@ class FPN_PAN_BiFPN(nn.Module):
                 p2_out, p3_out, p4_out = layer(p2_out, p3_out, p4_out)
 
         return [p2_out, p3_out, p4_out]
-
-
-# ================== 测试 ==================
-if __name__ == "__main__":
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-
-    bs = 2
-    p2 = torch.randn(bs, 128, 160, 160).to(device)
-    p3 = torch.randn(bs, 256, 80, 80).to(device)
-    p4 = torch.randn(bs, 512, 40, 40).to(device)
-
-    channels = [128, 256, 512]
-    out_channels = [128, 256, 512]
-
-    print("\n=== Testing FPN_PAN (标准 YOLO11 结构) ===")
-    fpn_pan = FPN_PAN(channels, out_channels).to(device)
-    outs = fpn_pan([p2, p3, p4])
-    for i, (out, exp) in enumerate(zip(outs, [
-        (bs, 128, 160, 160),
-        (bs, 256, 80, 80),
-        (bs, 512, 40, 40)
-    ]), start=2):
-        status = "OK" if out.shape == exp else "FAIL"
-        print(f"  P{i}: {list(out.shape)} expected {list(exp)} [{status}]")
-    total_params = sum(p.numel() for p in fpn_pan.parameters())
-    print(f"  FPN_PAN Params: {total_params:,}")
-
-    print("\n=== Testing BiFPNLayer (两两加权融合) ===")
-    bifpn_layer = BiFPNLayer(out_channels, use_refine=True).to(device)
-    p2_out, p3_out, p4_out = bifpn_layer(p2, p3, p4)
-    for name, out, exp in [
-        ("P2", p2_out, (bs, 128, 160, 160)),
-        ("P3", p3_out, (bs, 256, 80, 80)),
-        ("P4", p4_out, (bs, 512, 40, 40))
-    ]:
-        status = "OK" if out.shape == exp else "FAIL"
-        print(f"  {name}: {list(out.shape)} expected {list(exp)} [{status}]")
-    print(f"  BiFPNLayer Params: {sum(p.numel() for p in bifpn_layer.parameters()):,}")
-
-    print("\n=== Testing FPN_PAN_BiFPN (1 BiFPN layer) ===")
-    fpn_pan_bifpn = FPN_PAN_BiFPN(
-        channels, out_channels,
-        num_bifpn_layers=1,
-        use_refine=True
-    ).to(device)
-    outs = fpn_pan_bifpn([p2, p3, p4])
-    for i, (out, exp) in enumerate(zip(outs, [
-        (bs, 128, 160, 160),
-        (bs, 256, 80, 80),
-        (bs, 512, 40, 40)
-    ]), start=2):
-        status = "OK" if out.shape == exp else "FAIL"
-        print(f"  P{i}: {list(out.shape)} expected {list(exp)} [{status}]")
-    total_params = sum(p.numel() for p in fpn_pan_bifpn.parameters())
-    print(f"  FPN_PAN_BiFPN Params: {total_params:,}")
-
-    print("\n=== Testing FPN_PAN_BiFPN (3 BiFPN layers) ===")
-    fpn_pan_bifpn3 = FPN_PAN_BiFPN(
-        channels, out_channels,
-        num_bifpn_layers=3,
-        use_refine=True
-    ).to(device)
-    outs = fpn_pan_bifpn3([p2, p3, p4])
-    for i, (out, exp) in enumerate(zip(outs, [
-        (bs, 128, 160, 160),
-        (bs, 256, 80, 80),
-        (bs, 512, 40, 40)
-    ]), start=2):
-        status = "OK" if out.shape == exp else "FAIL"
-        print(f"  P{i}: {list(out.shape)} expected {list(exp)} [{status}]")
-    total_params = sum(p.numel() for p in fpn_pan_bifpn3.parameters())
-    print(f"  FPN_PAN_BiFPN (3 layers) Params: {total_params:,}")
