@@ -30,43 +30,34 @@ class DepthwiseSeparableConv(nn.Module):
         return self.act(self.bn(self.dw(x)))
 
 
-def _channel_shuffle(x, groups):
-    """Channel shuffle operation (ShuffleNet-style) for cross-group information mixing."""
-    b, c, h, w = x.shape
-    x = x.view(b, groups, c // groups, h, w)
-    x = x.transpose(1, 2).contiguous()
-    return x.view(b, c, h, w)
+class DilatedBottleneck(nn.Module):
+    """Bottleneck(e=0.5) with dilated cv2 — identical params, larger receptive field.
 
-
-class ShuffleBlock(nn.Module):
-    """Two grouped 3×3 convs with channel shuffle — same params as Bottleneck(e=0.5) but no channel compression.
-
-    - Conv(c, c, 3, g=2) × 2 = c×(c/2)×9 × 2 = c²×9  (same as Bottleneck e=0.5)
-    - Channel shuffle between convs ensures cross-group information flow
-    - No channel compression → full channel capacity preserved
-    - 2 conv layers → same depth and 5×5 effective receptive field as Bottleneck
+    - cv1: Conv(c, c/2, 3) — standard 3×3, local feature extraction
+    - cv2: Conv(c/2, c, 3, d=2) — dilated 3×3 (5×5 effective), broader context
+    - Same parameter count as Bottleneck(e=0.5) (dilation is free)
+    - Effective RF: 7×7 (vs 5×5 in standard Bottleneck)
+    - Full cross-channel mixing preserved (standard conv, no grouping)
     """
 
-    def __init__(self, c, shortcut=True, g=2):
+    def __init__(self, c, shortcut=True, g=1):
         super().__init__()
-        self.cv1 = Conv(c, c, 3, 1, g=g)
-        self.cv2 = Conv(c, c, 3, 1, g=g)
-        self.groups = g
+        c_ = c // 2
+        self.cv1 = Conv(c, c_, 3)
+        self.cv2 = Conv(c_, c, k=3, s=1, d=2)
         self.add = shortcut
 
     def forward(self, x):
-        out = _channel_shuffle(self.cv1(x), self.groups)
-        out = _channel_shuffle(self.cv2(out), self.groups)
-        return x + out if self.add else out
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
 class C2f_Simple(nn.Module):
     """
-    C2f with ShuffleBlock — same params/FLOPs as C3k2(n=2, c3k=False) but no channel compression.
-    Replaces Bottleneck(e=0.5) with ShuffleBlock(g=2):
-    - Same parameter count (±0.03%)
-    - Same depth (2 conv layers per block) and 5×5 receptive field
-    - No channel compression → better information preservation
+    C2f with DilatedBottleneck — same params as C3k2(n=2, c3k=False), larger RF.
+    Replaces Bottleneck(e=0.5) with DilatedBottleneck:
+    - Identical parameter count (dilation adds zero params)
+    - Larger effective receptive field (7×7 vs 5×5)
+    - Full cross-channel mixing (standard conv, no grouping)
     """
 
     def __init__(self, c1, c2, n=2, shortcut=True, e=0.5, g=1):
@@ -75,7 +66,7 @@ class C2f_Simple(nn.Module):
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv((2 + n) * self.c, c2, 1)
         self.m = nn.ModuleList(
-            ShuffleBlock(self.c, shortcut) for _ in range(n)
+            DilatedBottleneck(self.c, shortcut, g) for _ in range(n)
         )
 
     def forward(self, x):
