@@ -41,6 +41,9 @@ class C2f_Simple(nn.Module):
         self.c = int(c2 * e)
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        # Consume same RNG state as C3k2 (which creates Bottleneck in C2f.__init__ then overrides)
+        for _ in range(n):
+            Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0)
         self.m = nn.ModuleList(
             Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
         )
