@@ -72,11 +72,131 @@ class CrossDilatedBottleneck(nn.Module):
         return x + out if self.add else out
 
 
+class RepConv(nn.Module):
+    """重参数化卷积 (ACNet 风格)：训练时 3×3 + 1×3 + 3×1 三分支并行，推理时融合为单个 3×3。
+
+    训练时：
+      x → 3×3 Conv + BN ──┐
+        → 1×3 Conv + BN ──┼──→ 求和 → SiLU → out
+        → 3×1 Conv + BN ──┘
+
+    推理时（调用 merge() 后）：
+      x → 3×3 Conv + BN → SiLU → out   ← 与标准 Conv 完全等价
+
+    融合原理：
+      1. 每个分支的 BN 吸收进 Conv2d（得到带 bias 的等价卷积）
+      2. 1×3 和 3×1 核 zero-pad 到 3×3
+      3. 三个 3×3 核相加 = 融合后的单核
+    """
+
+    def __init__(self, c1, c2, k=3, s=1, act=True):
+        super().__init__()
+        self.c1, self.c2, self.k, self.s = c1, c2, k, s
+        # 主分支：3×3
+        self.conv3x3 = nn.Conv2d(c1, c2, k, s, k // 2, bias=False)
+        self.bn3x3 = nn.BatchNorm2d(c2)
+        # 水平分支：1×k
+        self.conv1xk = nn.Conv2d(c1, c2, (1, k), s, (0, k // 2), bias=False)
+        self.bn1xk = nn.BatchNorm2d(c2)
+        # 垂直分支：k×1
+        self.convkx1 = nn.Conv2d(c1, c2, (k, 1), s, (k // 2, 0), bias=False)
+        self.bnkx1 = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU() if act else nn.Identity()
+        self._merged = False
+
+    def forward(self, x):
+        if self._merged:
+            return self.act(self.bn3x3(self.conv3x3(x)))
+        return self.act(
+            self.bn3x3(self.conv3x3(x)) +
+            self.bn1xk(self.conv1xk(x)) +
+            self.bnkx1(self.convkx1(x))
+        )
+
+    def merge(self):
+        """将三分支融合为单个 3×3 卷积，推理时零额外开销。"""
+        if self._merged:
+            return
+        # 1. 每个分支：Conv2d + BN → 等价的 Conv2d(with bias)
+        w3, b3 = self._fuse_bn(self.conv3x3, self.bn3x3)
+        w1k, b1k = self._fuse_bn(self.conv1xk, self.bn1xk)
+        wk1, bk1 = self._fuse_bn(self.convkx1, self.bnkx1)
+
+        # 2. Pad 1×k 和 k×1 到 k×k
+        pad = self.k // 2
+        w1k = F.pad(w1k, (0, 0, pad, pad))   # 上下补零
+        wk1 = F.pad(wk1, (pad, pad, 0, 0))   # 左右补零
+
+        # 3. 三核相加
+        w = w3 + w1k + wk1
+        b = b3 + b1k + bk1
+
+        # 4. 写回主分支，BN 设为直通（output = input + bias）
+        self.conv3x3.weight.data.copy_(w)
+        self.bn3x3.weight.data.fill_(1.0)
+        self.bn3x3.bias.data.copy_(b)
+        self.bn3x3.running_mean.zero_()
+        self.bn3x3.running_var.fill_(1.0)
+        self.bn3x3.num_batches_tracked.zero_()
+
+        # 5. 删除额外分支
+        del self.conv1xk, self.bn1xk, self.convkx1, self.bnkx1
+        self._merged = True
+
+    @staticmethod
+    def _fuse_bn(conv, bn):
+        """将 Conv2d + BatchNorm2d 融合为等价的 Conv2d(with bias)。
+
+        BN(x) = gamma * (x - mean) / sqrt(var + eps) + beta
+              = (gamma / sqrt(var + eps)) * x + (beta - gamma * mean / sqrt(var + eps))
+        """
+        w = conv.weight.data.clone()
+        gamma = bn.weight.data
+        beta = bn.bias.data
+        mean = bn.running_mean
+        var = bn.running_var
+        eps = bn.eps
+        std = (var + eps).sqrt()
+        scale = gamma / std
+        fused_w = w * scale.reshape(-1, 1, 1, 1)
+        fused_b = beta - mean * scale
+        return fused_w, fused_b
+
+
+class RepBottleneck(nn.Module):
+    """重参数化 Bottleneck：cv1/cv2 使用 RepConv (ACNet 风格)。
+
+    训练时：cv1/cv2 各有 3×3 + 1×3 + 3×1 三分支，增强水平/垂直方向特征提取。
+    调用 merge() 后：等价于标准 Bottleneck(e=0.5)，推理零额外开销。
+
+    Architecture:
+      x → cv1: RepConv(c, c/2, 3) → SiLU     (三分支：3×3 + 1×3 + 3×1)
+        → cv2: RepConv(c/2, c, 3, act=False)   (三分支：3×3 + 1×3 + 3×1)
+        → + x
+    """
+
+    def __init__(self, c, shortcut=True):
+        super().__init__()
+        c_ = c // 2
+        self.cv1 = RepConv(c, c_, 3)
+        self.cv2 = RepConv(c_, c, 3, act=False)
+        self.add = shortcut
+
+    def forward(self, x):
+        out = self.cv2(self.cv1(x))
+        return x + out if self.add else out
+
+    def merge(self):
+        """融合所有 RepConv 为标准 3×3 卷积。"""
+        self.cv1.merge()
+        self.cv2.merge()
+
+
 class C2f_Simple(nn.Module):
     """
-    C2f with n=2: m[0] = 标准 Bottleneck, m[1] = CrossDilatedBottleneck。
-    十字 DW (3×1+1×3) + 空洞 DW (d=2) 扩大空间感受野，参数增加极少。
+    C2f with n=2: m[0] = 标准 Bottleneck, m[1] = RepBottleneck (ACNet 重参数化)。
 
+    训练时 m[1] 使用三分支卷积增强特征提取，调用 merge() 后等价于标准 Bottleneck。
     RNG alignment: 先消耗与 C3k2(n=2) 相同的 RNG，再在气泡中创建 m[1]。
     """
 
@@ -88,14 +208,14 @@ class C2f_Simple(nn.Module):
         # RNG alignment: C2f.__init__ 创建 n × Bottleneck(e=1.0) 被 C3k2 丢弃
         for _ in range(n):
             Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0)
-        # m[0] = 标准 Bottleneck(e=0.5) — 消耗与 C3k2 m[0] 相同的 RNG
+        # m[0] = 标准 Bottleneck(e=0.5)
         self.m = nn.ModuleList([
             Bottleneck(self.c, self.c, shortcut, g),
         ])
-        # m[1]: 消耗与 C3k2 m[1] 相同的 RNG，然后在气泡中创建十字空洞模块
+        # m[1]: 消耗与 C3k2 m[1] 相同的 RNG，然后在气泡中创建 RepBottleneck
         dummy = Bottleneck(self.c, self.c, shortcut, g)
         rng_state = torch.random.get_rng_state()
-        self.m.append(CrossDilatedBottleneck(self.c, shortcut))
+        self.m.append(RepBottleneck(self.c, shortcut))
         torch.random.set_rng_state(rng_state)
 
     def forward(self, x):
@@ -103,10 +223,16 @@ class C2f_Simple(nn.Module):
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
 
+    def merge(self):
+        """融合所有 RepBottleneck，训练后调用一次即可。"""
+        for m in self.m:
+            if hasattr(m, 'merge'):
+                m.merge()
+
 
 class FPN_PAN(nn.Module):
     """
-    FPN-PAN with C2f_Simple (n=2: Bottleneck + CrossDilatedBottleneck).
+    FPN-PAN with C2f_Simple (n=2: Bottleneck + RepBottleneck).
     - FPN (Top-Down):   Upsample → Concat → C2f_Simple(n=2)
     - PAN (Bottom-Up):  Conv(s=2) → Concat → C2f_Simple(n=2)
     """
@@ -221,7 +347,7 @@ class BiFPNLayer(nn.Module):
 class FPN_PAN_BiFPN(nn.Module):
     """
     FPN-PAN-BiFPN 组合模块
-    - FPN-PAN：C2f_Simple(n=2, Bottleneck + CrossDilatedBottleneck) 替代 C3k2
+    - FPN-PAN：C2f_Simple(n=2, Bottleneck + RepBottleneck) 替代 C3k2
     - BiFPN：P2/P3/P4 两两加权融合（BiFPN_Add），可堆叠多层
     """
     def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False):
