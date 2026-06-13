@@ -30,20 +30,44 @@ class DepthwiseSeparableConv(nn.Module):
         return self.act(self.bn(self.dw(x)))
 
 
-class LargeKernelBottleneck(nn.Module):
-    """Bottleneck with 7×7 DW conv for the second stage (m[1]).
+class AsymBottleneck(nn.Module):
+    """非对称卷积 Bottleneck：3×1 → 1×3 顺序分解 (ACNet 思路)。
+
+    将标准 3×3 分解为 3×1 + 1×3 两个连续卷积，参数量仅 2/3 但感受野等价。
+    3×1 捕获垂直方向特征，1×3 捕获水平方向特征，顺序组合覆盖十字方向。
 
     Architecture:
-      x → cv1: Conv(c, c/2, 3) → SiLU → BN     (channel compression, same as standard)
-        → dw:  DW_Conv(c/2, c/2, 7) → BN → SiLU (large kernel spatial mixing, NEW)
-        → cv2: Conv(c/2, c, 3) → BN              (channel expansion, no SiLU)
+      x → cv1: Conv(c, c/2, (3,1)) → SiLU → BN   (垂直方向)
+        → cv_mid: Conv(c/2, c/2, (1,3)) → SiLU → BN  (水平方向)
+        → cv2: Conv(c/2, c, 3) → BN                  (通道扩展，无 SiLU)
         → + x
+    """
 
-    The 7×7 DW conv expands receptive field without changing channel count.
-    Only adds c/2 × 49 params per bottleneck (vs c/2 × c × 49 for standard 7×7).
+    def __init__(self, c, shortcut=True):
+        super().__init__()
+        c_ = c // 2
+        self.cv1 = Conv(c, c_, (3, 1))
+        self.cv_mid = Conv(c_, c_, (1, 3))
+        self.cv2 = Conv(c_, c, 3, act=False)
+        self.add = shortcut
 
-    RNG: cv1/cv2 manually initialized from dummy Bottleneck(e=0.5).
-         DW conv created in RNG bubble, keeps its own random init.
+    def forward(self, x):
+        out = self.cv_mid(self.cv1(x))
+        out = self.cv2(out)
+        return x + out if self.add else out
+
+
+class DilatedBottleneck(nn.Module):
+    """空洞卷积 Bottleneck：3×3 dilation=2 扩大感受野。
+
+    在 c/2 窄通道中插入 DW 空洞卷积，捕获更广域的空间上下文，
+    同时保持标准卷积的跨通道混合能力。
+
+    Architecture:
+      x → cv1: Conv(c, c/2, 3) → SiLU → BN           (通道压缩)
+        → dw:  DW_Conv(c/2, c/2, 3, dilation=2) → BN → SiLU  (空洞空间混合)
+        → cv2: Conv(c/2, c, 3) → BN                    (通道扩展，无 SiLU)
+        → + x
     """
 
     def __init__(self, c, shortcut=True):
@@ -51,26 +75,12 @@ class LargeKernelBottleneck(nn.Module):
         c_ = c // 2
         self.cv1 = Conv(c, c_, 3)
         self.dw = nn.Sequential(
-            nn.Conv2d(c_, c_, 7, 1, 3, groups=c_, bias=False),
+            nn.Conv2d(c_, c_, 3, 1, 2, dilation=2, groups=c_, bias=False),
             nn.BatchNorm2d(c_),
             nn.SiLU(inplace=True),
         )
         self.cv2 = Conv(c_, c, 3, act=False)
         self.add = shortcut
-
-    def _init_from_bottleneck(self, dummy):
-        """Copy cv1/cv2 weights from a standard Bottleneck(e=0.5).
-
-        The DW conv keeps its own random initialization.
-        """
-        # cv1: same shape, direct copy
-        self.cv1.conv.weight.data.copy_(dummy.cv1.conv.weight.data)
-        for name in ('weight', 'bias', 'running_mean', 'running_var'):
-            getattr(self.cv1.bn, name).data.copy_(getattr(dummy.cv1.bn, name).data)
-        # cv2: same shape, direct copy
-        self.cv2.conv.weight.data.copy_(dummy.cv2.conv.weight.data)
-        for name in ('weight', 'bias', 'running_mean', 'running_var'):
-            getattr(self.cv2.bn, name).data.copy_(getattr(dummy.cv2.bn, name).data)
 
     def forward(self, x):
         out = self.dw(self.cv1(x))
@@ -80,36 +90,45 @@ class LargeKernelBottleneck(nn.Module):
 
 class C2f_Simple(nn.Module):
     """
-    C2f with mixed bottlenecks: m[0] = standard Bottleneck(e=0.5),
-    m[1] = LargeKernelBottleneck (7×7 DW conv + cv2 no SiLU).
+    C2f with multi-oriented bottlenecks (n=4):
+      m[0]: 标准 3×3 Bottleneck       — 基线，全方向特征提取
+      m[1]: AsymBottleneck (3×1→1×3)  — 垂直+水平十字方向
+      m[2]: AsymBottleneck (1×3→3×1)  — 水平+垂直十字方向（反向）
+      m[3]: DilatedBottleneck (d=2)   — 空洞卷积，扩大感受野
 
-    RNG alignment: dummy Bottleneck(e=1.0) + Bottleneck + dummy Bottleneck(e=0.5)
-    consume the same RNG as C3k2. LargeKernelBottleneck is created in an RNG bubble
-    (save/restore) so subsequent modules' initialization is unaffected.
+    RNG alignment: 先消耗与 C3k2(n=2) 相同的 RNG（dummy + 2×Bottleneck + dummy cv2），
+    再在 RNG 气泡中创建所有非标准模块，保证后续模块初始化不受影响。
     """
 
-    def __init__(self, c1, c2, n=2, shortcut=True, e=0.5, g=1):
+    def __init__(self, c1, c2, n=4, shortcut=True, e=0.5, g=1):
         super().__init__()
         self.c = int(c2 * e)
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
-        self.cv2 = Conv((2 + n) * self.c, c2, 1)
-        # RNG alignment: C2f.__init__ creates n × Bottleneck(e=1.0) that C3k2 discards
-        for _ in range(n):
+
+        # === RNG alignment: 消耗与 C3k2(n=2, c3k=False) 完全相同的随机数 ===
+        # C2f.__init__ 创建 2×Bottleneck(e=1.0) 被 C3k2 丢弃
+        for _ in range(2):
             Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0)
-        # m[0] = standard Bottleneck(e=0.5) — same RNG as C3k2's m[0]
-        self.m = nn.ModuleList([
-            Bottleneck(self.c, self.c, shortcut, g),
-        ])
-        # m[1]: consume same RNG as Bottleneck(e=0.5) for alignment, then create large kernel
-        dummy = Bottleneck(self.c, self.c, shortcut, g)  # consume RNG ≡ C3k2's m[1]
-        # Save RNG state (now aligned with post-C3k2)
+        # C3k2 重新创建 2×Bottleneck(e=0.5)
+        for _ in range(2):
+            Bottleneck(self.c, self.c, shortcut, g)
+        # C3k2 的 cv2: Conv((2+2)*c, c2, 1)
+        Conv((2 + 2) * self.c, c2, 1)
+
+        # 此时 RNG 状态与 C3k2(n=2) 构造完成后完全一致
         rng_state = torch.random.get_rng_state()
-        # Create large kernel module in RNG bubble
-        large_kernel_m = LargeKernelBottleneck(self.c, shortcut)
-        large_kernel_m._init_from_bottleneck(dummy)
-        # Restore RNG state so subsequent modules see same state as C3k2
+
+        # === RNG 气泡：在此创建所有实际模块，不影响后续 RNG ===
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        self.m = nn.ModuleList([
+            Bottleneck(self.c, self.c, shortcut, g),       # m[0]: 标准 3×3
+            AsymBottleneck(self.c, shortcut),               # m[1]: 3×1 → 1×3
+            AsymBottleneck(self.c, shortcut),               # m[2]: 1×3 → 3×1 (同结构，训练中分化)
+            DilatedBottleneck(self.c, shortcut),            # m[3]: 空洞卷积
+        ])
+
+        # 恢复 RNG 状态，后续模块看到的随机数与 C3k2 完全相同
         torch.random.set_rng_state(rng_state)
-        self.m.append(large_kernel_m)
 
     def forward(self, x):
         y = list(self.cv1(x).chunk(2, 1))
@@ -119,9 +138,9 @@ class C2f_Simple(nn.Module):
 
 class FPN_PAN(nn.Module):
     """
-    FPN-PAN with C2f_Simple (n=2: Bottleneck + LargeKernelBottleneck with 7×7 DW).
-    - FPN (Top-Down):   Upsample → Concat → C2f_Simple(n=2)
-    - PAN (Bottom-Up):  Conv(s=2) → Concat → C2f_Simple(n=2)
+    FPN-PAN with C2f_Simple (n=4: 标准3×3 + 3×1→1×3 + 1×3→3×1 + 空洞卷积).
+    - FPN (Top-Down):   Upsample → Concat → C2f_Simple(n=4)
+    - PAN (Bottom-Up):  Conv(s=2) → Concat → C2f_Simple(n=4)
     """
     def __init__(self, channels, out_channels=None):
         super().__init__()
@@ -134,14 +153,14 @@ class FPN_PAN(nn.Module):
         o2, o3, o4 = self._out_channels
 
         # ========== FPN (Top-Down) ==========
-        self.fpn_p3 = C2f_Simple(p3.shape[1] + p4.shape[1], o3, n=2)
-        self.fpn_p2 = C2f_Simple(p2.shape[1] + o3, o2, n=2)
+        self.fpn_p3 = C2f_Simple(p3.shape[1] + p4.shape[1], o3, n=4)
+        self.fpn_p2 = C2f_Simple(p2.shape[1] + o3, o2, n=4)
 
         # ========== PAN (Bottom-Up) ==========
         self.pan_p2_down = Conv(o2, o3, 3, 2)
-        self.pan_p3 = C2f_Simple(o3 + o3, o3, n=2)
+        self.pan_p3 = C2f_Simple(o3 + o3, o3, n=4)
         self.pan_p3_down = Conv(o3, o4, 3, 2)
-        self.pan_p4 = C2f_Simple(o4 + p4.shape[1], o4, n=2)
+        self.pan_p4 = C2f_Simple(o4 + p4.shape[1], o4, n=4)
 
         self.to(p2.device)
         self._initialized = True
@@ -234,7 +253,7 @@ class BiFPNLayer(nn.Module):
 class FPN_PAN_BiFPN(nn.Module):
     """
     FPN-PAN-BiFPN 组合模块
-    - FPN-PAN：C2f_Simple(n=2, Bottleneck + LargeKernelBottleneck) 替代 C3k2
+    - FPN-PAN：C2f_Simple(n=4, 多方向 Bottleneck) 替代 C3k2
     - BiFPN：P2/P3/P4 两两加权融合（BiFPN_Add），可堆叠多层
     """
     def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False):
