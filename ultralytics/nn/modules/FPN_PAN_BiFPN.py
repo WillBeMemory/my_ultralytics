@@ -30,55 +30,50 @@ class DepthwiseSeparableConv(nn.Module):
         return self.act(self.bn(self.dw(x)))
 
 
-class StarResBlock(nn.Module):
-    """StarNet-inspired block (CVPR 2024). Element-wise multiplication for implicit high-dim features.
+class SimAM_Bottleneck(nn.Module):
+    """Bottleneck(e=0.5) + SimAM attention (ICML 2021). Same params, same RNG, same conv shapes.
 
     Architecture:
-      x → chunk(c/2, c/2) → cv_a(3×3) ↘
-                            cv_b(3×3) → multiply → cv_out(3×3) → + x
+      x → cv1: Conv(c, c/2, 3) → SiLU → SimAM(3D attention) → cv2: Conv(c/2, c, 3) → + x
 
-    Star operation (element-wise multiplication of two feature branches) generates an
-    implicit high-dimensional non-linear feature space without widening the network.
-    Each branch transforms half the channels independently, then their product creates
-    complex inter-channel interactions.
+    Difference from standard Bottleneck(e=0.5):
+      - SimAM inserts parameter-free 3D attention between the two conv layers
+      - cv1 compresses c→c/2, then SimAM highlights distinctive neurons before cv2 expands
+      - No channel splitting, no grouping, no dilation — FULL cross-channel mixing preserved
 
     RNG equivalence:
-      Branch A: Conv(c/2, c/2, 3) → weight = (c/2)²×9 = c²/4 × 9  RNG values
-      Branch B: Conv(c/2, c/2, 3) → weight = c²/4 × 9  RNG values
-      Project:  Conv(c/2, c, 3)   → weight = c²/2 × 9  RNG values
-      Total: c² × 9  ≡  Bottleneck(e=0.5)'s c×(c/2)×9 + (c/2)×c×9
+      cv1: Conv2d(c, c/2, 3) → weight = c×c/2×9 RNG values  ≡  Bottleneck(e=0.5)
+      cv2: Conv2d(c/2, c, 3) → weight = c/2×c×9 RNG values  ≡  Bottleneck(e=0.5)
+      SimAM: 0 params, 0 RNG
 
-    Params: c²×9 + 4c  (vs Bottleneck(e=0.5)'s c²×9 + 3c, diff = +c, <0.1%)
+    Params: c²×9 + 3c  ≡  Bottleneck(e=0.5)
     """
 
-    def __init__(self, c, shortcut=True):
+    def __init__(self, c, shortcut=True, e_lambda=1e-4):
         super().__init__()
-        c_half = c // 2
-        self.cv_a = Conv(c_half, c_half, 3)    # transform branch A
-        self.cv_b = Conv(c_half, c_half, 3)    # transform branch B
-        self.cv_out = Conv(c_half, c, 3)       # project back to c
+        c_ = c // 2
+        self.cv1 = Conv(c, c_, 3)             # Same shape as Bottleneck(e=0.5) cv1
+        self.cv2 = Conv(c_, c, 3)             # Same shape as Bottleneck(e=0.5) cv2
         self.add = shortcut
+        self.e_lambda = e_lambda
 
     def forward(self, x):
-        a, b = x.chunk(2, dim=1)
-        out = self.cv_out(self.cv_a(a) * self.cv_b(b))
+        out = self.cv1(x)
+        # SimAM: parameter-free energy-based 3D attention (channel + spatial)
+        n = out.shape[2] * out.shape[3] - 1
+        d = (out - out.mean(dim=(2, 3), keepdim=True)).pow(2)
+        v = d.sum(dim=(2, 3), keepdim=True) / n
+        out = out * torch.sigmoid(d / (4 * (v + self.e_lambda)) + 0.5)
+        out = self.cv2(out)
         return x + out if self.add else out
 
 
 class C2f_Simple(nn.Module):
     """
-    C2f with StarResBlock — StarNet (CVPR 2024) style feature refinement.
-    RNG consumption equivalent to C3k2(n=2, c3k=False), ensuring identical
-    initialization for all subsequent modules in the model.
+    C2f with SimAM_Bottleneck — same params/RNG as C3k2(n=2, c3k=False), with attention.
+    Preserves full cross-channel mixing (standard convs) + adds parameter-free attention.
 
-    C3k2 execution trace (n=2, c3k=False):
-      1. C2f.__init__ creates: cv1, cv2, n × Bottleneck(e=1.0)  ─── RNG
-      2. C3k2.__init__ overwrites: n × Bottleneck(e=0.5)          ─── RNG
-
-    C2f_Simple execution:
-      1. cv1, cv2 (same)
-      2. n × dummy Bottleneck(e=1.0) — discarded, RNG alignment
-      3. n × StarResBlock — actual computation, same total RNG as step 2 above
+    RNG alignment: identical to C3k2 (dummy Bottleneck(e=1.0) + SimAM_Bottleneck).
     """
 
     def __init__(self, c1, c2, n=2, shortcut=True, e=0.5, g=1):
@@ -90,7 +85,7 @@ class C2f_Simple(nn.Module):
         for _ in range(n):
             Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0)
         self.m = nn.ModuleList(
-            StarResBlock(self.c, shortcut) for _ in range(n)
+            SimAM_Bottleneck(self.c, shortcut) for _ in range(n)
         )
 
     def forward(self, x):
@@ -101,7 +96,7 @@ class C2f_Simple(nn.Module):
 
 class FPN_PAN(nn.Module):
     """
-    FPN-PAN with C2f_Simple (n=2 StarResBlock, StarNet CVPR 2024).
+    FPN-PAN with C2f_Simple (n=2 SimAM_Bottleneck, ICML 2021).
     - FPN (Top-Down):   Upsample → Concat → C2f_Simple(n=2)
     - PAN (Bottom-Up):  Conv(s=2) → Concat → C2f_Simple(n=2)
     """
