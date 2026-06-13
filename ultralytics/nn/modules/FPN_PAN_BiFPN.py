@@ -30,21 +30,53 @@ class DepthwiseSeparableConv(nn.Module):
         return self.act(self.bn(self.dw(x)))
 
 
-class DilatedBottleneck(nn.Module):
-    """Bottleneck(e=0.5) with dilated cv2 — identical params, larger receptive field.
+class GhostModule(nn.Module):
+    """GhostNet Ghost Module (CVPR 2020): primary conv + cheap DW conv to generate features.
 
-    - cv1: Conv(c, c/2, 3) — standard 3×3, local feature extraction
-    - cv2: Conv(c/2, c, 3, d=2) — dilated 3×3 (5×5 effective), broader context
-    - Same parameter count as Bottleneck(e=0.5) (dilation is free)
-    - Effective RF: 7×7 (vs 5×5 in standard Bottleneck)
-    - Full cross-channel mixing preserved (standard conv, no grouping)
+    Instead of one Conv(c_in, c_out, k), use:
+      - Primary conv: Conv(c_in, c_out//ratio, k) — full cross-channel mixing
+      - Cheap DW conv: DW(c_out//ratio, c_out//ratio, dw_k) — spatial refinement
+      - Concat primary + cheap → c_out channels
+
+    Same output channels, fewer parameters, no channel compression.
+    """
+
+    def __init__(self, c_in, c_out, k=1, ratio=2, dw_k=3, stride=1, act=True):
+        super().__init__()
+        init_c = c_out // ratio
+        new_c = init_c * (ratio - 1)
+        self.primary = nn.Sequential(
+            nn.Conv2d(c_in, init_c, k, stride, k // 2, bias=False),
+            nn.BatchNorm2d(init_c),
+            nn.SiLU(inplace=True) if act else nn.Identity(),
+        )
+        self.cheap = nn.Sequential(
+            nn.Conv2d(init_c, new_c, dw_k, 1, dw_k // 2, groups=init_c, bias=False),
+            nn.BatchNorm2d(new_c),
+            nn.SiLU(inplace=True) if act else nn.Identity(),
+        )
+
+    def forward(self, x):
+        x1 = self.primary(x)
+        x2 = self.cheap(x1)
+        return torch.cat([x1, x2], dim=1)
+
+
+class GhostBottleneck(nn.Module):
+    """GhostNet-style Bottleneck — same params as Bottleneck(e=0.5) but no channel compression.
+
+    - cv1: GhostModule(c, c, k=3, ratio=2) — 3×3 primary + DW, full c channels output
+    - cv2: GhostModule(c, c, k=3, ratio=2, act=False) — same, no activation
+    - No channel compression: c→c throughout (vs c→c/2→c in standard Bottleneck)
+    - Primary conv provides full cross-channel mixing (no grouping)
+    - Cheap DW conv adds spatial refinement for free
+    - Params: ~c²×9 + c×9 ≈ Bottleneck(e=0.5)'s c²×9 (+0.32%)
     """
 
     def __init__(self, c, shortcut=True, g=1):
         super().__init__()
-        c_ = c // 2
-        self.cv1 = Conv(c, c_, 3)
-        self.cv2 = Conv(c_, c, k=3, s=1, d=2)
+        self.cv1 = GhostModule(c, c, k=3, ratio=2, dw_k=3, act=True)
+        self.cv2 = GhostModule(c, c, k=3, ratio=2, dw_k=3, act=False)
         self.add = shortcut
 
     def forward(self, x):
@@ -53,11 +85,12 @@ class DilatedBottleneck(nn.Module):
 
 class C2f_Simple(nn.Module):
     """
-    C2f with DilatedBottleneck — same params as C3k2(n=2, c3k=False), larger RF.
-    Replaces Bottleneck(e=0.5) with DilatedBottleneck:
-    - Identical parameter count (dilation adds zero params)
-    - Larger effective receptive field (7×7 vs 5×5)
-    - Full cross-channel mixing (standard conv, no grouping)
+    C2f with GhostBottleneck — same params as C3k2(n=2, c3k=False), no channel compression.
+    Replaces Bottleneck(e=0.5) with GhostBottleneck:
+    - Nearly identical parameter count (+0.32%)
+    - No channel compression (c→c throughout vs c→c/2→c)
+    - Full cross-channel mixing in primary conv (standard conv, no grouping)
+    - DW conv adds implicit spatial refinement
     """
 
     def __init__(self, c1, c2, n=2, shortcut=True, e=0.5, g=1):
@@ -66,7 +99,7 @@ class C2f_Simple(nn.Module):
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv((2 + n) * self.c, c2, 1)
         self.m = nn.ModuleList(
-            DilatedBottleneck(self.c, shortcut, g) for _ in range(n)
+            GhostBottleneck(self.c, shortcut, g) for _ in range(n)
         )
 
     def forward(self, x):
@@ -77,7 +110,7 @@ class C2f_Simple(nn.Module):
 
 class FPN_PAN(nn.Module):
     """
-    FPN-PAN with C2f_Simple (n=2 ShuffleBlock, no PSA/C3k).
+    FPN-PAN with C2f_Simple (n=2 GhostBottleneck, no PSA/C3k).
     - FPN (Top-Down):   Upsample → Concat → C2f_Simple(n=2)
     - PAN (Bottom-Up):  Conv(s=2) → Concat → C2f_Simple(n=2)
     """
