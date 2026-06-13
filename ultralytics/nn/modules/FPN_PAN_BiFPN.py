@@ -30,50 +30,62 @@ class DepthwiseSeparableConv(nn.Module):
         return self.act(self.bn(self.dw(x)))
 
 
-class SimAM_Bottleneck(nn.Module):
-    """Bottleneck(e=0.5) + SimAM attention (ICML 2021). Same params, same RNG, same conv shapes.
+class LargeKernelBottleneck(nn.Module):
+    """Bottleneck with 7×7 DW conv for the second stage (m[1]).
 
     Architecture:
-      x → cv1: Conv(c, c/2, 3) → SiLU → SimAM(3D attention) → cv2: Conv(c/2, c, 3) → + x
+      x → cv1: Conv(c, c/2, 3) → SiLU → BN     (channel compression, same as standard)
+        → dw:  DW_Conv(c/2, c/2, 7) → BN → SiLU (large kernel spatial mixing, NEW)
+        → cv2: Conv(c/2, c, 3) → BN              (channel expansion, no SiLU)
+        → + x
 
-    Difference from standard Bottleneck(e=0.5):
-      - SimAM inserts parameter-free 3D attention between the two conv layers
-      - cv1 compresses c→c/2, then SimAM highlights distinctive neurons before cv2 expands
-      - No channel splitting, no grouping, no dilation — FULL cross-channel mixing preserved
+    The 7×7 DW conv expands receptive field without changing channel count.
+    Only adds c/2 × 49 params per bottleneck (vs c/2 × c × 49 for standard 7×7).
 
-    RNG equivalence:
-      cv1: Conv2d(c, c/2, 3) → weight = c×c/2×9 RNG values  ≡  Bottleneck(e=0.5)
-      cv2: Conv2d(c/2, c, 3) → weight = c/2×c×9 RNG values  ≡  Bottleneck(e=0.5)
-      SimAM: 0 params, 0 RNG
-
-    Params: c²×9 + 3c  ≡  Bottleneck(e=0.5)
+    RNG: cv1/cv2 manually initialized from dummy Bottleneck(e=0.5).
+         DW conv created in RNG bubble, keeps its own random init.
     """
 
-    def __init__(self, c, shortcut=True, e_lambda=1e-4):
+    def __init__(self, c, shortcut=True):
         super().__init__()
         c_ = c // 2
-        self.cv1 = Conv(c, c_, 3)             # Same shape as Bottleneck(e=0.5) cv1
-        self.cv2 = Conv(c_, c, 3)             # Same shape as Bottleneck(e=0.5) cv2
+        self.cv1 = Conv(c, c_, 3)
+        self.dw = nn.Sequential(
+            nn.Conv2d(c_, c_, 7, 1, 3, groups=c_, bias=False),
+            nn.BatchNorm2d(c_),
+            nn.SiLU(inplace=True),
+        )
+        self.cv2 = Conv(c_, c, 3, act=False)
         self.add = shortcut
-        self.e_lambda = e_lambda
+
+    def _init_from_bottleneck(self, dummy):
+        """Copy cv1/cv2 weights from a standard Bottleneck(e=0.5).
+
+        The DW conv keeps its own random initialization.
+        """
+        # cv1: same shape, direct copy
+        self.cv1.conv.weight.data.copy_(dummy.cv1.conv.weight.data)
+        for name in ('weight', 'bias', 'running_mean', 'running_var'):
+            getattr(self.cv1.bn, name).data.copy_(getattr(dummy.cv1.bn, name).data)
+        # cv2: same shape, direct copy
+        self.cv2.conv.weight.data.copy_(dummy.cv2.conv.weight.data)
+        for name in ('weight', 'bias', 'running_mean', 'running_var'):
+            getattr(self.cv2.bn, name).data.copy_(getattr(dummy.cv2.bn, name).data)
 
     def forward(self, x):
-        out = self.cv1(x)
-        # SimAM: parameter-free energy-based 3D attention (channel + spatial)
-        n = out.shape[2] * out.shape[3] - 1
-        d = (out - out.mean(dim=(2, 3), keepdim=True)).pow(2)
-        v = d.sum(dim=(2, 3), keepdim=True) / n
-        out = out * torch.sigmoid(d / (4 * (v + self.e_lambda)) + 0.5)
+        out = self.dw(self.cv1(x))
         out = self.cv2(out)
         return x + out if self.add else out
 
 
 class C2f_Simple(nn.Module):
     """
-    C2f with SimAM_Bottleneck — same params/RNG as C3k2(n=2, c3k=False), with attention.
-    Preserves full cross-channel mixing (standard convs) + adds parameter-free attention.
+    C2f with mixed bottlenecks: m[0] = standard Bottleneck(e=0.5),
+    m[1] = LargeKernelBottleneck (7×7 DW conv + cv2 no SiLU).
 
-    RNG alignment: identical to C3k2 (dummy Bottleneck(e=1.0) + SimAM_Bottleneck).
+    RNG alignment: dummy Bottleneck(e=1.0) + Bottleneck + dummy Bottleneck(e=0.5)
+    consume the same RNG as C3k2. LargeKernelBottleneck is created in an RNG bubble
+    (save/restore) so subsequent modules' initialization is unaffected.
     """
 
     def __init__(self, c1, c2, n=2, shortcut=True, e=0.5, g=1):
@@ -84,9 +96,20 @@ class C2f_Simple(nn.Module):
         # RNG alignment: C2f.__init__ creates n × Bottleneck(e=1.0) that C3k2 discards
         for _ in range(n):
             Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0)
-        self.m = nn.ModuleList(
-            SimAM_Bottleneck(self.c, shortcut) for _ in range(n)
-        )
+        # m[0] = standard Bottleneck(e=0.5) — same RNG as C3k2's m[0]
+        self.m = nn.ModuleList([
+            Bottleneck(self.c, self.c, shortcut, g),
+        ])
+        # m[1]: consume same RNG as Bottleneck(e=0.5) for alignment, then create large kernel
+        dummy = Bottleneck(self.c, self.c, shortcut, g)  # consume RNG ≡ C3k2's m[1]
+        # Save RNG state (now aligned with post-C3k2)
+        rng_state = torch.random.get_rng_state()
+        # Create large kernel module in RNG bubble
+        large_kernel_m = LargeKernelBottleneck(self.c, shortcut)
+        large_kernel_m._init_from_bottleneck(dummy)
+        # Restore RNG state so subsequent modules see same state as C3k2
+        torch.random.set_rng_state(rng_state)
+        self.m.append(large_kernel_m)
 
     def forward(self, x):
         y = list(self.cv1(x).chunk(2, 1))
@@ -96,7 +119,7 @@ class C2f_Simple(nn.Module):
 
 class FPN_PAN(nn.Module):
     """
-    FPN-PAN with C2f_Simple (n=2 SimAM_Bottleneck, ICML 2021).
+    FPN-PAN with C2f_Simple (n=2: Bottleneck + LargeKernelBottleneck with 7×7 DW).
     - FPN (Top-Down):   Upsample → Concat → C2f_Simple(n=2)
     - PAN (Bottom-Up):  Conv(s=2) → Concat → C2f_Simple(n=2)
     """
@@ -211,7 +234,7 @@ class BiFPNLayer(nn.Module):
 class FPN_PAN_BiFPN(nn.Module):
     """
     FPN-PAN-BiFPN 组合模块
-    - FPN-PAN：C2f_Simple(n=2) 替代 C3k2，去掉 PSA/C3k，2-branch CSP
+    - FPN-PAN：C2f_Simple(n=2, Bottleneck + LargeKernelBottleneck) 替代 C3k2
     - BiFPN：P2/P3/P4 两两加权融合（BiFPN_Add），可堆叠多层
     """
     def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False):
