@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ultralytics.nn.modules.block import Conv
+from ultralytics.nn.modules.block import Conv, Bottleneck
 
 
 class BiFPN_Add(nn.Module):
@@ -30,67 +30,55 @@ class DepthwiseSeparableConv(nn.Module):
         return self.act(self.bn(self.dw(x)))
 
 
-class GhostModule(nn.Module):
-    """GhostNet Ghost Module (CVPR 2020): primary conv + cheap DW conv to generate features.
+class StarResBlock(nn.Module):
+    """StarNet-inspired block (CVPR 2024). Element-wise multiplication for implicit high-dim features.
 
-    Instead of one Conv(c_in, c_out, k), use:
-      - Primary conv: Conv(c_in, c_out//ratio, k) — full cross-channel mixing
-      - Cheap DW conv: DW(c_out//ratio, c_out//ratio, dw_k) — spatial refinement
-      - Concat primary + cheap → c_out channels
+    Architecture:
+      x → chunk(c/2, c/2) → cv_a(3×3) ↘
+                            cv_b(3×3) → multiply → cv_out(3×3) → + x
 
-    Same output channels, fewer parameters, no channel compression.
+    Star operation (element-wise multiplication of two feature branches) generates an
+    implicit high-dimensional non-linear feature space without widening the network.
+    Each branch transforms half the channels independently, then their product creates
+    complex inter-channel interactions.
+
+    RNG equivalence:
+      Branch A: Conv(c/2, c/2, 3) → weight = (c/2)²×9 = c²/4 × 9  RNG values
+      Branch B: Conv(c/2, c/2, 3) → weight = c²/4 × 9  RNG values
+      Project:  Conv(c/2, c, 3)   → weight = c²/2 × 9  RNG values
+      Total: c² × 9  ≡  Bottleneck(e=0.5)'s c×(c/2)×9 + (c/2)×c×9
+
+    Params: c²×9 + 4c  (vs Bottleneck(e=0.5)'s c²×9 + 3c, diff = +c, <0.1%)
     """
 
-    def __init__(self, c_in, c_out, k=1, ratio=2, dw_k=3, stride=1, act=True):
+    def __init__(self, c, shortcut=True):
         super().__init__()
-        init_c = c_out // ratio
-        new_c = init_c * (ratio - 1)
-        self.primary = nn.Sequential(
-            nn.Conv2d(c_in, init_c, k, stride, k // 2, bias=False),
-            nn.BatchNorm2d(init_c),
-            nn.SiLU(inplace=True) if act else nn.Identity(),
-        )
-        self.cheap = nn.Sequential(
-            nn.Conv2d(init_c, new_c, dw_k, 1, dw_k // 2, groups=init_c, bias=False),
-            nn.BatchNorm2d(new_c),
-            nn.SiLU(inplace=True) if act else nn.Identity(),
-        )
-
-    def forward(self, x):
-        x1 = self.primary(x)
-        x2 = self.cheap(x1)
-        return torch.cat([x1, x2], dim=1)
-
-
-class GhostBottleneck(nn.Module):
-    """GhostNet-style Bottleneck — same params as Bottleneck(e=0.5) but no channel compression.
-
-    - cv1: GhostModule(c, c, k=3, ratio=2) — 3×3 primary + DW, full c channels output
-    - cv2: GhostModule(c, c, k=3, ratio=2, act=False) — same, no activation
-    - No channel compression: c→c throughout (vs c→c/2→c in standard Bottleneck)
-    - Primary conv provides full cross-channel mixing (no grouping)
-    - Cheap DW conv adds spatial refinement for free
-    - Params: ~c²×9 + c×9 ≈ Bottleneck(e=0.5)'s c²×9 (+0.32%)
-    """
-
-    def __init__(self, c, shortcut=True, g=1):
-        super().__init__()
-        self.cv1 = GhostModule(c, c, k=3, ratio=2, dw_k=3, act=True)
-        self.cv2 = GhostModule(c, c, k=3, ratio=2, dw_k=3, act=False)
+        c_half = c // 2
+        self.cv_a = Conv(c_half, c_half, 3)    # transform branch A
+        self.cv_b = Conv(c_half, c_half, 3)    # transform branch B
+        self.cv_out = Conv(c_half, c, 3)       # project back to c
         self.add = shortcut
 
     def forward(self, x):
-        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+        a, b = x.chunk(2, dim=1)
+        out = self.cv_out(self.cv_a(a) * self.cv_b(b))
+        return x + out if self.add else out
 
 
 class C2f_Simple(nn.Module):
     """
-    C2f with GhostBottleneck — same params as C3k2(n=2, c3k=False), no channel compression.
-    Replaces Bottleneck(e=0.5) with GhostBottleneck:
-    - Nearly identical parameter count (+0.32%)
-    - No channel compression (c→c throughout vs c→c/2→c)
-    - Full cross-channel mixing in primary conv (standard conv, no grouping)
-    - DW conv adds implicit spatial refinement
+    C2f with StarResBlock — StarNet (CVPR 2024) style feature refinement.
+    RNG consumption equivalent to C3k2(n=2, c3k=False), ensuring identical
+    initialization for all subsequent modules in the model.
+
+    C3k2 execution trace (n=2, c3k=False):
+      1. C2f.__init__ creates: cv1, cv2, n × Bottleneck(e=1.0)  ─── RNG
+      2. C3k2.__init__ overwrites: n × Bottleneck(e=0.5)          ─── RNG
+
+    C2f_Simple execution:
+      1. cv1, cv2 (same)
+      2. n × dummy Bottleneck(e=1.0) — discarded, RNG alignment
+      3. n × StarResBlock — actual computation, same total RNG as step 2 above
     """
 
     def __init__(self, c1, c2, n=2, shortcut=True, e=0.5, g=1):
@@ -98,8 +86,11 @@ class C2f_Simple(nn.Module):
         self.c = int(c2 * e)
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        # RNG alignment: C2f.__init__ creates n × Bottleneck(e=1.0) that C3k2 discards
+        for _ in range(n):
+            Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0)
         self.m = nn.ModuleList(
-            GhostBottleneck(self.c, shortcut, g) for _ in range(n)
+            StarResBlock(self.c, shortcut) for _ in range(n)
         )
 
     def forward(self, x):
@@ -110,7 +101,7 @@ class C2f_Simple(nn.Module):
 
 class FPN_PAN(nn.Module):
     """
-    FPN-PAN with C2f_Simple (n=2 GhostBottleneck, no PSA/C3k).
+    FPN-PAN with C2f_Simple (n=2 StarResBlock, StarNet CVPR 2024).
     - FPN (Top-Down):   Upsample → Concat → C2f_Simple(n=2)
     - PAN (Bottom-Up):  Conv(s=2) → Concat → C2f_Simple(n=2)
     """
