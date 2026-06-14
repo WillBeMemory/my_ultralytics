@@ -194,10 +194,20 @@ class RepBottleneck(nn.Module):
 
 class C2f_Simple(nn.Module):
     """
-    C2f with n=2: m[0] = 标准 Bottleneck, m[1] = RepBottleneck (ACNet 重参数化)。
+    C2f with cross-connection: m[0] processes split[1], m[1] processes split[0].
+    两个标准 Bottleneck(e=0.5) 各自处理不同的通道子集，提供正交特征提取。
 
-    训练时 m[1] 使用三分支卷积增强特征提取，调用 merge() 后等价于标准 Bottleneck。
-    RNG alignment: 先消耗与 C3k2(n=2) 相同的 RNG，再在气泡中创建 m[1]。
+    原始 C2f (串行):                    本方案 (交叉):
+      split[1] → m[0] → m[1]             split[1] → m[0] → y[2]
+                                           split[0] → m[1] → y[3]
+
+    优势：
+      - 每个 bottleneck 处理不同的特征子集，最大化多样性
+      - 无级联依赖，m[1] 不受 m[0] 误差影响
+      - 梯度路径更短，m[1] 直接从 cv2 获得梯度
+      - 两个标准 Bottleneck(e=0.5) 完全不变，RNG 自然对齐
+
+    RNG alignment: 与 C3k2(n=2, c3k=False) 完全一致，无需气泡。
     """
 
     def __init__(self, c1, c2, n=2, shortcut=True, e=0.5, g=1):
@@ -208,31 +218,23 @@ class C2f_Simple(nn.Module):
         # RNG alignment: C2f.__init__ 创建 n × Bottleneck(e=1.0) 被 C3k2 丢弃
         for _ in range(n):
             Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0)
-        # m[0] = 标准 Bottleneck(e=0.5)
+        # 两个标准 Bottleneck(e=0.5)，RNG 与 C3k2 完全一致
         self.m = nn.ModuleList([
             Bottleneck(self.c, self.c, shortcut, g),
+            Bottleneck(self.c, self.c, shortcut, g),
         ])
-        # m[1]: 消耗与 C3k2 m[1] 相同的 RNG，然后在气泡中创建 RepBottleneck
-        dummy = Bottleneck(self.c, self.c, shortcut, g)
-        rng_state = torch.random.get_rng_state()
-        self.m.append(RepBottleneck(self.c, shortcut))
-        torch.random.set_rng_state(rng_state)
 
     def forward(self, x):
         y = list(self.cv1(x).chunk(2, 1))
-        y.extend(m(y[-1]) for m in self.m)
+        # 交叉连接：m[0] 处理 y[1]，m[1] 处理 y[0]
+        y.append(self.m[0](y[1]))  # m[0] 处理第二个 split
+        y.append(self.m[1](y[0]))  # m[1] 处理第一个 split（交叉）
         return self.cv2(torch.cat(y, 1))
-
-    def merge(self):
-        """融合所有 RepBottleneck，训练后调用一次即可。"""
-        for m in self.m:
-            if hasattr(m, 'merge'):
-                m.merge()
 
 
 class FPN_PAN(nn.Module):
     """
-    FPN-PAN with C2f_Simple (n=2: Bottleneck + RepBottleneck).
+    FPN-PAN with C2f_Simple (n=2, cross-connection: m[0]→split[1], m[1]→split[0]).
     - FPN (Top-Down):   Upsample → Concat → C2f_Simple(n=2)
     - PAN (Bottom-Up):  Conv(s=2) → Concat → C2f_Simple(n=2)
     """
@@ -347,7 +349,7 @@ class BiFPNLayer(nn.Module):
 class FPN_PAN_BiFPN(nn.Module):
     """
     FPN-PAN-BiFPN 组合模块
-    - FPN-PAN：C2f_Simple(n=2, Bottleneck + RepBottleneck) 替代 C3k2
+    - FPN-PAN：C2f_Simple(n=2, 交叉连接) 替代 C3k2
     - BiFPN：P2/P3/P4 两两加权融合（BiFPN_Add），可堆叠多层
     """
     def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False):
