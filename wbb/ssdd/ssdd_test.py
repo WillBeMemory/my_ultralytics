@@ -6,10 +6,10 @@ from ultralytics import YOLO
 model_path = "./runs/detect/train/weights/best.pt"       # 训练好的模型权重文件
 data_yaml = "../cfg/ssdd.yaml"      # 数据集配置文件（包含验证集路径）
 imgsz = 640                              # 图像大小，需与训练一致
-batch = 16                                # 批次大小
-conf = 0.001                              # 置信度阈值（默认0.001）
-iou = 0.6                                  # IoU阈值（默认0.6）
-device = 0                                 # GPU设备（设为'cpu'使用CPU）
+# batch = 16                                # 批次大小
+# conf = 0.001                              # 置信度阈值（默认0.001）
+# iou = 0.6                                  # IoU阈值（默认0.6）
+# device = 0                                 # GPU设备（设为'cpu'使用CPU）
 
 if __name__ == '__main__':
     # 加载模型
@@ -20,11 +20,11 @@ if __name__ == '__main__':
         data=data_yaml,
         split='test', #使用测试集合验证数据A
         imgsz=imgsz,
-        batch=batch,
-        conf=conf,
-        iou=iou,
-        device=device,
-        verbose=False
+        # batch=batch,
+        # conf=conf,
+        # iou=iou,
+        # device=device,
+        # verbose=False
     )
 
     metrics = results.box
