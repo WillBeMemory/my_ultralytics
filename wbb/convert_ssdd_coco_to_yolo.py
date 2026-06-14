@@ -18,7 +18,7 @@ LOCAL_IMGS = Path(r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\datas
 DST = Path(r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\datasets\SSDD_official")
 
 # 类别映射
-CATEGORIES = {1: 0}
+CATEGORIES = {0: 0}  # SSDD official uses category_id=0
 
 
 def convert_bbox_coco_to_yolo(img_w, img_h, bbox):

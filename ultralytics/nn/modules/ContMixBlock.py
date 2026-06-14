@@ -20,10 +20,10 @@ try:
     has_natten = True
 except ImportError:
     has_natten = False
-    warnings.warn(
-        "The efficiency may be reduced since 'natten' is not installed."
-        " It is recommended to install natten for better performance."
-    )
+    # warnings.warn(
+    #     "The efficiency may be reduced since 'natten' is not installed."
+    #     " It is recommended to install natten for better performance."
+    # )
 
 
 # ================== Helper Utilities ==================
