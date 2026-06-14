@@ -194,20 +194,10 @@ class RepBottleneck(nn.Module):
 
 class C2f_Simple(nn.Module):
     """
-    C2f with cross-connection: m[0] processes split[1], m[1] processes split[0].
-    两个标准 Bottleneck(e=0.5) 各自处理不同的通道子集，提供正交特征提取。
+    C2f 等价实现：与 C3k2(n=2, c3k=False) 完全等价。
+    去掉了 PSA 和 C3k 分支，只保留实际运行的路径。
 
-    原始 C2f (串行):                    本方案 (交叉):
-      split[1] → m[0] → m[1]             split[1] → m[0] → y[2]
-                                           split[0] → m[1] → y[3]
-
-    优势：
-      - 每个 bottleneck 处理不同的特征子集，最大化多样性
-      - 无级联依赖，m[1] 不受 m[0] 误差影响
-      - 梯度路径更短，m[1] 直接从 cv2 获得梯度
-      - 两个标准 Bottleneck(e=0.5) 完全不变，RNG 自然对齐
-
-    RNG alignment: 与 C3k2(n=2, c3k=False) 完全一致，无需气泡。
+    RNG alignment: 与 C3k2(n=2, c3k=False) 完全一致。
     """
 
     def __init__(self, c1, c2, n=2, shortcut=True, e=0.5, g=1):
@@ -218,17 +208,14 @@ class C2f_Simple(nn.Module):
         # RNG alignment: C2f.__init__ 创建 n × Bottleneck(e=1.0) 被 C3k2 丢弃
         for _ in range(n):
             Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0)
-        # 两个标准 Bottleneck(e=0.5)，RNG 与 C3k2 完全一致
-        self.m = nn.ModuleList([
-            Bottleneck(self.c, self.c, shortcut, g),
-            Bottleneck(self.c, self.c, shortcut, g),
-        ])
+        # C3k2(c3k=False) 覆盖为 Bottleneck(e=0.5)
+        self.m = nn.ModuleList(
+            Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
+        )
 
     def forward(self, x):
         y = list(self.cv1(x).chunk(2, 1))
-        # 交叉连接：m[0] 处理 y[1]，m[1] 处理 y[0]
-        y.append(self.m[0](y[1]))  # m[0] 处理第二个 split
-        y.append(self.m[1](y[0]))  # m[1] 处理第一个 split（交叉）
+        y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
 
 
