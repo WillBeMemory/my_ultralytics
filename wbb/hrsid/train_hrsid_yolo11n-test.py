@@ -77,12 +77,12 @@ def train_model():
             optimizer="SGD",  # 改用 SGD
             lr0=0.01,  # 初始学习率 0.01
             lrf=0.01,  # 最终学习率 = 0.01 * 0.01 = 0.0001
-            momentum=0.937,  # SGD 动量
-            weight_decay=0.0005,  # 权重衰减
-            cos_lr=True,  # 余弦退火
-            warmup_epochs=3.0,
+            # momentum=0.937,  # SGD 动量
+            # weight_decay=0.0005,  # 权重衰减
+            # cos_lr=True,  # 余弦退火
+            # warmup_epochs=3.0,
 
-            patience=0,  # 早停耐心值
+            # patience=0,  # 早停耐心值
             save=True,
             # exist_ok=True,  # 覆盖现有训练结果
             verbose=True,
