@@ -79,16 +79,16 @@ def train_model():
             workers=0,  # Windows 下设为 0 避免多进程问题
             device=device,
             optimizer="SGD",  # 改用 SGD
-            lr0=0.02,  # 初始学习率 0.01
+            lr0=0.01,  # 初始学习率 0.01
             lrf=0.01,  # 最终学习率 = 0.01 * 0.05 = 0.0005
-            momentum=0.937,  # SGD 动量
-            weight_decay=0.0005,  # 权重衰减
-            cos_lr=True,  # 余弦退火
-            warmup_epochs=3.0,
+            # momentum=0.937,  # SGD 动量
+            # weight_decay=0.0005,  # 权重衰减
+            # cos_lr=True,  # 余弦退火
+            # warmup_epochs=3.0,
 
             patience=0,  # 早停耐心值
             save=True,
-            exist_ok=True,  # 覆盖现有训练结果
+            # exist_ok=True,  # 覆盖现有训练结果
             verbose=True,
             # 数据增强 - 针对船舶检测优化
             # degrees=5.0,  # 较小的旋转角度（船舶方向相对固定）
