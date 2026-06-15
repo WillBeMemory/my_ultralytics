@@ -1,0 +1,7 @@
+names:
+  0: ship
+nc: 1
+path: ../datasets/HRSID_YOLO_712
+train: images/train
+val: images/val
+test: images/test
