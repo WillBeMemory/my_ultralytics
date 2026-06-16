@@ -111,24 +111,30 @@ class BiFPNLayer(nn.Module):
 
     def _init_layers(self, p2, p3, p4):
         c2, c3, c4 = p2.shape[1], p3.shape[1], p4.shape[1]
+        o2, o3, o4 = self._channels  # 目标输出通道
+
+        # ========== 输入投影：backbone通道 → out_channels ==========
+        self.in_proj_p2 = Conv(c2, o2, 1, act=False) if c2 != o2 else nn.Identity()
+        self.in_proj_p3 = Conv(c3, o3, 1, act=False) if c3 != o3 else nn.Identity()
+        self.in_proj_p4 = Conv(c4, o4, 1, act=False) if c4 != o4 else nn.Identity()
 
         # ========== Top-Down：P4→P3, P3→P2 ==========
-        self.td_p4_to_p3 = Conv(c4, c3, 1, act=False)
+        self.td_p4_to_p3 = Conv(o4, o3, 1, act=False)
         self.td_p3_fuse = BiFPN_Add(2)
-        self.td_p3_refine = self._make_refine(c3)
+        self.td_p3_refine = self._make_refine(o3)
 
-        self.td_p3_to_p2 = Conv(c3, c2, 1, act=False)
+        self.td_p3_to_p2 = Conv(o3, o2, 1, act=False)
         self.td_p2_fuse = BiFPN_Add(2)
-        self.td_p2_refine = self._make_refine(c2)
+        self.td_p2_refine = self._make_refine(o2)
 
         # ========== Bottom-Up：P2→P3, P3→P4 ==========
-        self.bu_p2_to_p3 = Conv(c2, c3, 3, 2)
+        self.bu_p2_to_p3 = Conv(o2, o3, 3, 2)
         self.bu_p3_fuse = BiFPN_Add(2)
-        self.bu_p3_refine = self._make_refine(c3)
+        self.bu_p3_refine = self._make_refine(o3)
 
-        self.bu_p3_to_p4 = Conv(c3, c4, 3, 2)
+        self.bu_p3_to_p4 = Conv(o3, o4, 3, 2)
         self.bu_p4_fuse = BiFPN_Add(2)
-        self.bu_p4_refine = self._make_refine(c4)
+        self.bu_p4_refine = self._make_refine(o4)
 
         self.to(p2.device)
         self._initialized = True
@@ -137,26 +143,27 @@ class BiFPNLayer(nn.Module):
         if not self._initialized:
             self._init_layers(p2_in, p3_in, p4_in)
 
+        # 输入投影
+        p2 = self.in_proj_p2(p2_in)
+        p3 = self.in_proj_p3(p3_in)
+        p4 = self.in_proj_p4(p4_in)
+
         # ========== Top-Down ==========
-        # P4 → P3 融合
-        p4_up = F.interpolate(self.td_p4_to_p3(p4_in), size=p3_in.shape[-2:], mode='nearest')
-        p3_td = self.td_p3_fuse([p3_in, p4_up])
+        p4_up = F.interpolate(self.td_p4_to_p3(p4), size=p3.shape[-2:], mode='nearest')
+        p3_td = self.td_p3_fuse([p3, p4_up])
         p3_td = self.td_p3_refine(p3_td)
 
-        # P3 → P2 融合
-        p3_up = F.interpolate(self.td_p3_to_p2(p3_td), size=p2_in.shape[-2:], mode='nearest')
-        p2_td = self.td_p2_fuse([p2_in, p3_up])
+        p3_up = F.interpolate(self.td_p3_to_p2(p3_td), size=p2.shape[-2:], mode='nearest')
+        p2_td = self.td_p2_fuse([p2, p3_up])
         p2_td = self.td_p2_refine(p2_td)
 
         # ========== Bottom-Up ==========
-        # P2 → P3 融合
         p2_down = self.bu_p2_to_p3(p2_td)
         p3_out = self.bu_p3_fuse([p3_td, p2_down])
         p3_out = self.bu_p3_refine(p3_out)
 
-        # P3 → P4 融合
         p3_down = self.bu_p3_to_p4(p3_out)
-        p4_out = self.bu_p4_fuse([p4_in, p3_down])
+        p4_out = self.bu_p4_fuse([p4, p3_down])
         p4_out = self.bu_p4_refine(p4_out)
 
         return p2_td, p3_out, p4_out
@@ -274,3 +281,20 @@ if __name__ == "__main__":
         channels, out_channels, num_bifpn_layers=2, use_refine=True,
         use_fpn_pan=False, refine_type='c3k2'
     ).to(device), [p2, p3, p4])
+
+    # 模拟实际 YOLO11s 场景：backbone [128,256,256] → out_channels [64,128,256]
+    print("\n=== 8. 纯 BiFPN (通道不匹配场景, C3k2精炼) ===")
+    p2_real = torch.randn(bs, 128, 160, 160).to(device)
+    p3_real = torch.randn(bs, 256, 80, 80).to(device)
+    p4_real = torch.randn(bs, 256, 40, 40).to(device)
+    real_channels = [128, 256, 256]
+    real_out = [64, 128, 256]
+    model_real = FPN_PAN_BiFPN(
+        real_channels, real_out, num_bifpn_layers=1, use_refine=True,
+        use_fpn_pan=False, refine_type='c3k2'
+    ).to(device)
+    outs = model_real([p2_real, p3_real, p4_real])
+    for i, (out, exp_ch) in enumerate(zip(outs, real_out), start=2):
+        status = "OK" if out.shape[1] == exp_ch else "FAIL"
+        print(f"  P{i}: {list(out.shape)} expected channels={exp_ch} [{status}]")
+    print(f"  Params: {sum(p.numel() for p in model_real.parameters()):,}")
