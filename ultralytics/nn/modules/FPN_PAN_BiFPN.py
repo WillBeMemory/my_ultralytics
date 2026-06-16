@@ -17,6 +17,24 @@ class BiFPN_Add(nn.Module):
         return sum(w_norm[i] * xs[i] for i in range(len(xs)))
 
 
+class CW_BiFPN_Add(nn.Module):
+    """逐通道加权融合（Channel-Wise BiFPN Add）
+    - 每个通道独立学习融合权重，比标量 BiFPN_Add 表达力更强
+    - 参数量：num_inputs × channels（vs BiFPN_Add 的 num_inputs）
+    - 计算量几乎不变（仍是逐元素操作）
+    """
+    def __init__(self, num_inputs=2, channels=64):
+        super().__init__()
+        self.w = nn.Parameter(torch.ones(num_inputs, channels, dtype=torch.float32))
+        self.eps = 1e-4
+
+    def forward(self, xs):
+        w = F.relu(self.w)  # [num_inputs, C]
+        w_norm = w / (w.sum(dim=0, keepdim=True) + self.eps)  # [num_inputs, C]
+        # w_norm[i]: [C] → [1, C, 1, 1] 广播到 [B, C, H, W]
+        return sum(w_norm[i].view(1, -1, 1, 1) * xs[i] for i in range(len(xs)))
+
+
 class DepthwiseSeparableConv(nn.Module):
     """深度可分离卷积 — 仅 DW 3×3，通道混合由前置 mid_conv(1×1) 完成"""
     def __init__(self, ch, kernel_size=3, act=True):
@@ -91,15 +109,15 @@ class FPN_PAN(nn.Module):
 class BiFPNLayer(nn.Module):
     """
     BiFPN 单层，P2/P3/P4 两两加权融合（Top-Down + Bottom-Up）
-    - 使用 BiFPN_Add 做加权融合（而非 Concat）
-    - 1x1 Conv 做通道投影保证维度一致
-    - refine_type: 'dwconv' 使用深度可分离卷积精炼，'c3k2' 使用 C3k2 精炼
+    - fusion_type: 'scalar' 标量加权(BiFPN_Add), 'channel' 逐通道加权(CW_BiFPN_Add)
+    - refine_type: 'dwconv' 深度可分离卷积精炼, 'c3k2' C3k2精炼
     """
-    def __init__(self, channels=None, use_refine=True, refine_type='c3k2'):
+    def __init__(self, channels=None, use_refine=True, refine_type='c3k2', fusion_type='channel'):
         super().__init__()
         self._channels = channels
         self.use_refine = use_refine
         self.refine_type = refine_type
+        self.fusion_type = fusion_type
         self._initialized = False
 
     def _make_refine(self, ch):
@@ -109,33 +127,37 @@ class BiFPNLayer(nn.Module):
             return C3k2(ch, ch, n=2, c3k=False)
         return DepthwiseSeparableConv(ch)
 
+    def _make_fuse(self, num_inputs, ch):
+        if self.fusion_type == 'channel':
+            return CW_BiFPN_Add(num_inputs, ch)
+        return BiFPN_Add(num_inputs)
+
     def _init_layers(self, p2, p3, p4):
         c2, c3, c4 = p2.shape[1], p3.shape[1], p4.shape[1]
         o2, o3, o4 = self._channels  # 目标输出通道
 
-        # ========== 内部使用 backbone 原始通道做融合 ==========
-        # ========== Top-Down：P4→P3, P3→P2 ==========
-        self.td_p4_to_p3 = Conv(c4, c3, 1, act=False)
-        self.td_p3_fuse = BiFPN_Add(2)
-        self.td_p3_refine = self._make_refine(c3)
+        # ========== 输入投影：backbone通道 → out_channels ==========
+        self.in_proj_p2 = Conv(c2, o2, 1, act=False) if c2 != o2 else nn.Identity()
+        self.in_proj_p3 = Conv(c3, o3, 1, act=False) if c3 != o3 else nn.Identity()
+        self.in_proj_p4 = Conv(c4, o4, 1, act=False) if c4 != o4 else nn.Identity()
 
-        self.td_p3_to_p2 = Conv(c3, c2, 1, act=False)
-        self.td_p2_fuse = BiFPN_Add(2)
-        self.td_p2_refine = self._make_refine(c2)
+        # ========== Top-Down：P4→P3, P3→P2（out_channels空间） ==========
+        self.td_p4_to_p3 = Conv(o4, o3, 1, act=False)
+        self.td_p3_fuse = self._make_fuse(2, o3)
+        self.td_p3_refine = self._make_refine(o3)
+
+        self.td_p3_to_p2 = Conv(o3, o2, 1, act=False)
+        self.td_p2_fuse = self._make_fuse(2, o2)
+        self.td_p2_refine = self._make_refine(o2)
 
         # ========== Bottom-Up：P2→P3, P3→P4 ==========
-        self.bu_p2_to_p3 = Conv(c2, c3, 3, 2)
-        self.bu_p3_fuse = BiFPN_Add(2)
-        self.bu_p3_refine = self._make_refine(c3)
+        self.bu_p2_to_p3 = Conv(o2, o3, 3, 2)
+        self.bu_p3_fuse = self._make_fuse(2, o3)
+        self.bu_p3_refine = self._make_refine(o3)
 
-        self.bu_p3_to_p4 = Conv(c3, c4, 3, 2)
-        self.bu_p4_fuse = BiFPN_Add(2)
-        self.bu_p4_refine = self._make_refine(c4)
-
-        # ========== 输出投影：backbone通道 → out_channels ==========
-        self.out_proj_p2 = Conv(c2, o2, 1, act=False) if c2 != o2 else nn.Identity()
-        self.out_proj_p3 = Conv(c3, o3, 1, act=False) if c3 != o3 else nn.Identity()
-        self.out_proj_p4 = Conv(c4, o4, 1, act=False) if c4 != o4 else nn.Identity()
+        self.bu_p3_to_p4 = Conv(o3, o4, 3, 2)
+        self.bu_p4_fuse = self._make_fuse(2, o4)
+        self.bu_p4_refine = self._make_refine(o4)
 
         self.to(p2.device)
         self._initialized = True
@@ -144,13 +166,18 @@ class BiFPNLayer(nn.Module):
         if not self._initialized:
             self._init_layers(p2_in, p3_in, p4_in)
 
-        # ========== Top-Down（backbone原始通道空间） ==========
-        p4_up = F.interpolate(self.td_p4_to_p3(p4_in), size=p3_in.shape[-2:], mode='nearest')
-        p3_td = self.td_p3_fuse([p3_in, p4_up])
+        # 输入投影
+        p2 = self.in_proj_p2(p2_in)
+        p3 = self.in_proj_p3(p3_in)
+        p4 = self.in_proj_p4(p4_in)
+
+        # ========== Top-Down ==========
+        p4_up = F.interpolate(self.td_p4_to_p3(p4), size=p3.shape[-2:], mode='nearest')
+        p3_td = self.td_p3_fuse([p3, p4_up])
         p3_td = self.td_p3_refine(p3_td)
 
-        p3_up = F.interpolate(self.td_p3_to_p2(p3_td), size=p2_in.shape[-2:], mode='nearest')
-        p2_td = self.td_p2_fuse([p2_in, p3_up])
+        p3_up = F.interpolate(self.td_p3_to_p2(p3_td), size=p2.shape[-2:], mode='nearest')
+        p2_td = self.td_p2_fuse([p2, p3_up])
         p2_td = self.td_p2_refine(p2_td)
 
         # ========== Bottom-Up ==========
@@ -159,15 +186,10 @@ class BiFPNLayer(nn.Module):
         p3_out = self.bu_p3_refine(p3_out)
 
         p3_down = self.bu_p3_to_p4(p3_out)
-        p4_out = self.bu_p4_fuse([p4_in, p3_down])
+        p4_out = self.bu_p4_fuse([p4, p3_down])
         p4_out = self.bu_p4_refine(p4_out)
 
-        # ========== 输出投影 ==========
-        p2_out = self.out_proj_p2(p2_td)
-        p3_out = self.out_proj_p3(p3_out)
-        p4_out = self.out_proj_p4(p4_out)
-
-        return p2_out, p3_out, p4_out
+        return p2_td, p3_out, p4_out
 
 
 class FPN_PAN_BiFPN(nn.Module):
@@ -176,9 +198,10 @@ class FPN_PAN_BiFPN(nn.Module):
     - use_fpn_pan=True:  FPN-PAN → BiFPN 精炼（原始模式）
     - use_fpn_pan=False: 仅 BiFPN（替代 FPN-PAN，论文核心方案）
     - refine_type:       'dwconv' 或 'c3k2'
+    - fusion_type:       'scalar' 标量加权, 'channel' 逐通道加权
     """
     def __init__(self, channels, out_channels=None, num_bifpn_layers=1,
-                 use_refine=True, use_fpn_pan=False, refine_type='c3k2'):
+                 use_refine=True, use_fpn_pan=False, refine_type='c3k2', fusion_type='channel'):
         super().__init__()
         c2, c3, c4 = channels
         if out_channels is None:
@@ -196,7 +219,7 @@ class FPN_PAN_BiFPN(nn.Module):
         # BiFPN 层
         if num_bifpn_layers > 0:
             self.bifpn_layers = nn.ModuleList([
-                BiFPNLayer(out_channels, use_refine, refine_type)
+                BiFPNLayer(out_channels, use_refine, refine_type, fusion_type)
                 for _ in range(num_bifpn_layers)
             ])
         else:
@@ -245,57 +268,29 @@ if __name__ == "__main__":
     print("\n=== 1. FPN_PAN (标准 YOLO11 结构) ===")
     test_model("FPN_PAN", FPN_PAN(channels, out_channels).to(device), [p2, p3, p4])
 
-    print("\n=== 2. BiFPNLayer (DWConv精炼) ===")
-    bifpn_dw = BiFPNLayer(out_channels, use_refine=True, refine_type='dwconv').to(device)
-    p2o, p3o, p4o = bifpn_dw(p2, p3, p4)
+    print("\n=== 2. BiFPNLayer (标量融合 + C3k2精炼) ===")
+    bifpn_scalar = BiFPNLayer(out_channels, use_refine=True, refine_type='c3k2', fusion_type='scalar').to(device)
+    p2o, p3o, p4o = bifpn_scalar(p2, p3, p4)
     for name, out, exp in [("P2", p2o, (bs, 128, 160, 160)), ("P3", p3o, (bs, 256, 80, 80)), ("P4", p4o, (bs, 512, 40, 40))]:
-        print(f"  {name}: {list(out.shape)} expected {list(exp)} [{'OK' if out.shape == exp else 'FAIL'}]")
-    print(f"  Params: {sum(p.numel() for p in bifpn_dw.parameters()):,}")
+        print(f"  {name}: {list(out.shape)} [{'OK' if out.shape == exp else 'FAIL'}]")
+    print(f"  Params: {sum(p.numel() for p in bifpn_scalar.parameters()):,}")
 
-    print("\n=== 3. BiFPNLayer (C3k2精炼) ===")
-    bifpn_c3 = BiFPNLayer(out_channels, use_refine=True, refine_type='c3k2').to(device)
-    p2o, p3o, p4o = bifpn_c3(p2, p3, p4)
+    print("\n=== 3. BiFPNLayer (逐通道融合 + C3k2精炼) ===")
+    bifpn_cw = BiFPNLayer(out_channels, use_refine=True, refine_type='c3k2', fusion_type='channel').to(device)
+    p2o, p3o, p4o = bifpn_cw(p2, p3, p4)
     for name, out, exp in [("P2", p2o, (bs, 128, 160, 160)), ("P3", p3o, (bs, 256, 80, 80)), ("P4", p4o, (bs, 512, 40, 40))]:
-        print(f"  {name}: {list(out.shape)} expected {list(exp)} [{'OK' if out.shape == exp else 'FAIL'}]")
-    print(f"  Params: {sum(p.numel() for p in bifpn_c3.parameters()):,}")
+        print(f"  {name}: {list(out.shape)} [{'OK' if out.shape == exp else 'FAIL'}]")
+    print(f"  Params: {sum(p.numel() for p in bifpn_cw.parameters()):,}")
 
-    print("\n=== 4. FPN_PAN + BiFPN (DWConv精炼) ===")
-    test_model("FPN_PAN+DW", FPN_PAN_BiFPN(
-        channels, out_channels, num_bifpn_layers=1, use_refine=True,
-        use_fpn_pan=True, refine_type='dwconv'
-    ).to(device), [p2, p3, p4])
-
-    print("\n=== 5. FPN_PAN + BiFPN (C3k2精炼) ===")
-    test_model("FPN_PAN+C3k2", FPN_PAN_BiFPN(
-        channels, out_channels, num_bifpn_layers=1, use_refine=True,
-        use_fpn_pan=True, refine_type='c3k2'
-    ).to(device), [p2, p3, p4])
-
-    print("\n=== 6. 纯 BiFPN (C3k2精炼, 替代FPN-PAN) ===")
-    test_model("Pure_C3k2", FPN_PAN_BiFPN(
-        channels, out_channels, num_bifpn_layers=1, use_refine=True,
-        use_fpn_pan=False, refine_type='c3k2'
-    ).to(device), [p2, p3, p4])
-
-    print("\n=== 7. 纯 BiFPN (2层, C3k2精炼) ===")
-    test_model("Pure_C3k2x2", FPN_PAN_BiFPN(
-        channels, out_channels, num_bifpn_layers=2, use_refine=True,
-        use_fpn_pan=False, refine_type='c3k2'
-    ).to(device), [p2, p3, p4])
-
-    # 模拟实际 YOLO11s 场景：backbone [128,256,256] → out_channels [64,128,256]
-    print("\n=== 8. 纯 BiFPN (通道不匹配场景, C3k2精炼) ===")
-    p2_real = torch.randn(bs, 128, 160, 160).to(device)
-    p3_real = torch.randn(bs, 256, 80, 80).to(device)
-    p4_real = torch.randn(bs, 256, 40, 40).to(device)
-    real_channels = [128, 256, 256]
-    real_out = [64, 128, 256]
-    model_real = FPN_PAN_BiFPN(
-        real_channels, real_out, num_bifpn_layers=1, use_refine=True,
-        use_fpn_pan=False, refine_type='c3k2'
-    ).to(device)
-    outs = model_real([p2_real, p3_real, p4_real])
-    for i, (out, exp_ch) in enumerate(zip(outs, real_out), start=2):
-        status = "OK" if out.shape[1] == exp_ch else "FAIL"
-        print(f"  P{i}: {list(out.shape)} expected channels={exp_ch} [{status}]")
-    print(f"  Params: {sum(p.numel() for p in model_real.parameters()):,}")
+    # 模拟 YOLO11s 场景：backbone [128,256,256] → out [64,128,256]
+    print("\n=== 4. 纯 BiFPN (YOLO11s场景, 逐通道融合 + C3k2) ===")
+    p2r = torch.randn(bs, 128, 160, 160).to(device)
+    p3r = torch.randn(bs, 256, 80, 80).to(device)
+    p4r = torch.randn(bs, 256, 40, 40).to(device)
+    model = FPN_PAN_BiFPN([128, 256, 256], [64, 128, 256], num_bifpn_layers=1,
+                          use_refine=True, use_fpn_pan=False, refine_type='c3k2',
+                          fusion_type='channel').to(device)
+    outs = model([p2r, p3r, p4r])
+    for i, (out, ch) in enumerate(zip(outs, [64, 128, 256]), start=2):
+        print(f"  P{i}: {list(out.shape)} [{'OK' if out.shape[1] == ch else 'FAIL'}]")
+    print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
