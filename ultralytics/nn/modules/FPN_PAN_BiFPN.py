@@ -87,133 +87,48 @@ class FPN_PAN(nn.Module):
         return [p2_fpn, p3_pan, p4_pan]
 
 
-class DualStreamBiFPNLayer(nn.Module):
-    """
-    双流并行 BiFPN Layer（改进版）
-    - Top-Down 流：从原始特征出发，融合高层语义
-    - Bottom-Up 流：从原始特征出发，融合底层细节
-    - 最终融合：TD/BU 双流融合 + 原始特征残差
-    """
-    def __init__(self, channels=None, use_refine=True):
-        super().__init__()
-        self._channels = channels
-        self.use_refine = use_refine
-        self._initialized = False
-
-    def _init_layers(self, p2, p3, p4):
-        c2, c3, c4 = p2.shape[1], p3.shape[1], p4.shape[1]
-
-        # ========== Top-Down 流投影（上采样方向） ==========
-        # P4 → 1x1 Conv(512→256) → Upsample
-        self.td_p4_to_p3 = Conv(c4, c3, 1, act=False)
-        # P3_td → 1x1 Conv(256→128) → Upsample
-        self.td_p3_to_p2 = Conv(c3, c2, 1, act=False)
-
-        # ========== Bottom-Up 流投影（下采样方向） ==========
-        # P2 → 3x3 Conv(s=2, 128→256)，可学习下采样
-        self.bu_p2_to_p3 = Conv(c2, c3, 3, 2)
-        # P3_bu → 3x3 Conv(s=2, 256→512)，可学习下采样
-        self.bu_p3_to_p4 = Conv(c3, c4, 3, 2)
-
-        # ========== 加权融合层 ==========
-        # TD 流
-        self.td_p4_fuse = BiFPN_Add(2)  # P3_in + P4_up
-        self.td_p3_fuse = BiFPN_Add(2)  # P2_in + P3_up
-
-        # BU 流
-        self.bu_p3_fuse = BiFPN_Add(2)  # P3_in + P2_down
-        self.bu_p4_fuse = BiFPN_Add(2)  # P4_in + P3_down
-
-        # 最终融合（双流 + 原始）
-        self.fuse_p2 = BiFPN_Add(2)  # TD_out + P2_in
-        self.fuse_p3 = BiFPN_Add(3)  # TD_out + BU_out + P3_in
-        self.fuse_p4 = BiFPN_Add(2)  # BU_out + P4_in
-
-        # ========== 精炼层 ==========
-        self.td_refine_p3 = DepthwiseSeparableConv(c3) if self.use_refine else nn.Identity()
-        self.td_refine_p2 = DepthwiseSeparableConv(c2) if self.use_refine else nn.Identity()
-        self.bu_refine_p3 = DepthwiseSeparableConv(c3) if self.use_refine else nn.Identity()
-        self.bu_refine_p4 = DepthwiseSeparableConv(c4) if self.use_refine else nn.Identity()
-
-        self.to(p2.device)
-        self._initialized = True
-
-    def forward(self, p2_in, p3_in, p4_in):
-        if not self._initialized:
-            self._init_layers(p2_in, p3_in, p4_in)
-
-        # ========== Top-Down 流（上采样） ==========
-        # P4 → P3: P3_in + P4_up → P3_td
-        p4_up = F.interpolate(self.td_p4_to_p3(p4_in), size=p3_in.shape[-2:], mode='nearest')
-        p3_td = self.td_p4_fuse([p3_in, p4_up])
-        p3_td = self.td_refine_p3(p3_td)
-
-        # P3_td → P2: P2_in + P3_up → P2_td
-        p3_up = F.interpolate(self.td_p3_to_p2(p3_td), size=p2_in.shape[-2:], mode='nearest')
-        p2_td = self.td_p3_fuse([p2_in, p3_up])
-        p2_td = self.td_refine_p2(p2_td)
-
-        # ========== Bottom-Up 流（下采样，独立于 TD） ==========
-        # P2 → P3: P3_in + P2_down → P3_bu
-        p2_down = self.bu_p2_to_p3(p2_in)
-        p3_bu = self.bu_p3_fuse([p3_in, p2_down])
-        p3_bu = self.bu_refine_p3(p3_bu)
-
-        # P3_bu → P4: P4_in + P3_down → P4_bu
-        p3_down = self.bu_p3_to_p4(p3_bu)
-        p4_bu = self.bu_p4_fuse([p4_in, p3_down])
-        p4_bu = self.bu_refine_p4(p4_bu)
-
-        # ========== 最终双流融合 ==========
-        # P2: TD输出 + 原始P2
-        p2_out = self.fuse_p2([p2_td, p2_in])
-
-        # P3: TD输出 + BU输出 + 原始P3（三输入）
-        p3_out = self.fuse_p3([p3_td, p3_bu, p3_in])
-
-        # P4: BU输出 + 原始P4
-        p4_out = self.fuse_p4([p4_bu, p4_in])
-
-        return p2_out, p3_out, p4_out
-
 
 class BiFPNLayer(nn.Module):
     """
     BiFPN 单层，P2/P3/P4 两两加权融合（Top-Down + Bottom-Up）
     - 使用 BiFPN_Add 做加权融合（而非 Concat）
     - 1x1 Conv 做通道投影保证维度一致
-    - DWConv 做融合后精炼
+    - refine_type: 'dwconv' 使用深度可分离卷积精炼，'c3k2' 使用 C3k2 精炼
     """
-    def __init__(self, channels=None, use_refine=True):
+    def __init__(self, channels=None, use_refine=True, refine_type='c3k2'):
         super().__init__()
         self._channels = channels
         self.use_refine = use_refine
+        self.refine_type = refine_type
         self._initialized = False
+
+    def _make_refine(self, ch):
+        if not self.use_refine:
+            return nn.Identity()
+        if self.refine_type == 'c3k2':
+            return C3k2(ch, ch, n=2, c3k=False)
+        return DepthwiseSeparableConv(ch)
 
     def _init_layers(self, p2, p3, p4):
         c2, c3, c4 = p2.shape[1], p3.shape[1], p4.shape[1]
 
         # ========== Top-Down：P4→P3, P3→P2 ==========
-        # P4 → 1x1 Conv(512→256) → Upsample → BiFPN_Add(P3, P4_up) → DWConv refine
         self.td_p4_to_p3 = Conv(c4, c3, 1, act=False)
         self.td_p3_fuse = BiFPN_Add(2)
-        self.td_p3_refine = DepthwiseSeparableConv(c3) if self.use_refine else nn.Identity()
+        self.td_p3_refine = self._make_refine(c3)
 
-        # P3_td → 1x1 Conv(256→128) → Upsample → BiFPN_Add(P2, P3_up) → DWConv refine
         self.td_p3_to_p2 = Conv(c3, c2, 1, act=False)
         self.td_p2_fuse = BiFPN_Add(2)
-        self.td_p2_refine = DepthwiseSeparableConv(c2) if self.use_refine else nn.Identity()
+        self.td_p2_refine = self._make_refine(c2)
 
         # ========== Bottom-Up：P2→P3, P3→P4 ==========
-        # P2_td → Conv(s=2, 128→256) → BiFPN_Add(P3_td, P2_down) → DWConv refine
         self.bu_p2_to_p3 = Conv(c2, c3, 3, 2)
         self.bu_p3_fuse = BiFPN_Add(2)
-        self.bu_p3_refine = DepthwiseSeparableConv(c3) if self.use_refine else nn.Identity()
+        self.bu_p3_refine = self._make_refine(c3)
 
-        # P3_out → Conv(s=2, 256→512) → BiFPN_Add(P4, P3_down) → DWConv refine
         self.bu_p3_to_p4 = Conv(c3, c4, 3, 2)
         self.bu_p4_fuse = BiFPN_Add(2)
-        self.bu_p4_refine = DepthwiseSeparableConv(c4) if self.use_refine else nn.Identity()
+        self.bu_p4_refine = self._make_refine(c4)
 
         self.to(p2.device)
         self._initialized = True
@@ -250,61 +165,49 @@ class BiFPNLayer(nn.Module):
 class FPN_PAN_BiFPN(nn.Module):
     """
     FPN-PAN-BiFPN 组合模块
-    - FPN-PAN：与 YOLO11 默认结构完全一致（Conv + C3k2 + Upsample + Concat）
-    - BiFPN：P2/P3/P4 两两加权融合（BiFPN_Add），可堆叠多层
-    - DualStreamBiFPN：双流并行融合（TD + BU 独立，从原始特征出发）
+    - use_fpn_pan=True:  FPN-PAN → BiFPN 精炼（原始模式）
+    - use_fpn_pan=False: 仅 BiFPN（替代 FPN-PAN，论文核心方案）
+    - refine_type:       'dwconv' 或 'c3k2'
     """
-    def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False, use_dual_stream=False):
+    def __init__(self, channels, out_channels=None, num_bifpn_layers=1,
+                 use_refine=True, use_fpn_pan=False, refine_type='c3k2'):
         super().__init__()
         c2, c3, c4 = channels
         if out_channels is None:
             out_channels = [c2, c3, c4]
-        o2, o3, o4 = out_channels
 
         self.num_bifpn_layers = num_bifpn_layers
-        self.use_dual_stream = use_dual_stream
+        self.use_fpn_pan = use_fpn_pan
 
-        # FPN-PAN（标准 YOLO11 结构）
-        self.fpn_pan = FPN_PAN(channels, out_channels)
+        # FPN-PAN（可选）
+        if use_fpn_pan:
+            self.fpn_pan = FPN_PAN(channels, out_channels)
+        else:
+            self.fpn_pan = None
 
         # BiFPN 层
         if num_bifpn_layers > 0:
-            if use_dual_stream:
-                self.bifpn_layers = nn.ModuleList([
-                    DualStreamBiFPNLayer(out_channels, use_refine) for _ in range(num_bifpn_layers)
-                ])
-            else:
-                self.bifpn_layers = nn.ModuleList([
-                    BiFPNLayer(out_channels, use_refine) for _ in range(num_bifpn_layers)
-                ])
-            # 可学习残差门控（per-scale，初始化为 0 → 起步即恒等 = 纯 FPN-PAN）。
-            # 训练中网络自己学最优混合强度 α：out = f + α·(r − f)。
-            # 修复“BiFPN 50/50 混合从 ep0 即稀释 loose-match 信号、拖慢收敛且封顶更低”的问题。
-            self.alpha = nn.Parameter(torch.zeros(3))
+            self.bifpn_layers = nn.ModuleList([
+                BiFPNLayer(out_channels, use_refine, refine_type)
+                for _ in range(num_bifpn_layers)
+            ])
         else:
             self.bifpn_layers = None
 
     def forward(self, features):
         p2, p3, p4 = features
 
-        # FPN-PAN（干净特征 f：loose-match 友好）
-        p2_f, p3_f, p4_f = self.fpn_pan([p2, p3, p4])
-
-        # 无 BiFPN 层：直接返回干净特征（= bifpn=0 路径）
-        if self.bifpn_layers is None:
-            return [p2_f, p3_f, p4_f]
-
-        # BiFPN 精炼（r：跨尺度精炼后特征，高 IoU 友好）
-        p2_r, p3_r, p4_r = p2_f, p3_f, p4_f
-        for layer in self.bifpn_layers:
-            p2_r, p3_r, p4_r = layer(p2_r, p3_r, p4_r)
-
-        # 可学习残差门控：out = f + α·(r − f)
-        # α=0 起步 = 纯 FPN-PAN（恒等，最差也不输 bifpn=0）；训练中逐步引入精炼，
-        # 保留干净 loose-match 信号，同时拿到跨尺度精炼带来的高 IoU 增益。
-        p2_out = p2_f + self.alpha[0] * (p2_r - p2_f)
-        p3_out = p3_f + self.alpha[1] * (p3_r - p3_f)
-        p4_out = p4_f + self.alpha[2] * (p4_r - p4_f)
+        if self.fpn_pan is not None:
+            # FPN-PAN + BiFPN 精炼模式
+            p2_out, p3_out, p4_out = self.fpn_pan([p2, p3, p4])
+            if self.bifpn_layers is not None:
+                for layer in self.bifpn_layers:
+                    p2_out, p3_out, p4_out = layer(p2_out, p3_out, p4_out)
+        else:
+            # 纯 BiFPN 模式（替代 FPN-PAN）
+            p2_out, p3_out, p4_out = p2, p3, p4
+            for layer in self.bifpn_layers:
+                p2_out, p3_out, p4_out = layer(p2_out, p3_out, p4_out)
 
         return [p2_out, p3_out, p4_out]
 
@@ -322,109 +225,52 @@ if __name__ == "__main__":
     channels = [128, 256, 512]
     out_channels = [128, 256, 512]
 
-    print("\n=== Testing FPN_PAN (标准 YOLO11 结构) ===")
-    fpn_pan = FPN_PAN(channels, out_channels).to(device)
-    outs = fpn_pan([p2, p3, p4])
-    for i, (out, exp) in enumerate(zip(outs, [
-        (bs, 128, 160, 160),
-        (bs, 256, 80, 80),
-        (bs, 512, 40, 40)
-    ]), start=2):
-        status = "OK" if out.shape == exp else "FAIL"
-        print(f"  P{i}: {list(out.shape)} expected {list(exp)} [{status}]")
-    total_params = sum(p.numel() for p in fpn_pan.parameters())
-    print(f"  FPN_PAN Params: {total_params:,}")
+    def test_model(name, model, inputs):
+        outs = model(inputs)
+        expected = [(bs, 128, 160, 160), (bs, 256, 80, 80), (bs, 512, 40, 40)]
+        for i, (out, exp) in enumerate(zip(outs, expected), start=2):
+            status = "OK" if out.shape == exp else "FAIL"
+            print(f"  P{i}: {list(out.shape)} expected {list(exp)} [{status}]")
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"  Params: {total_params:,}")
 
-    print("\n=== Testing BiFPNLayer (单向依赖版本) ===")
-    bifpn_layer = BiFPNLayer(out_channels, use_refine=True).to(device)
-    p2_out, p3_out, p4_out = bifpn_layer(p2, p3, p4)
-    for name, out, exp in [
-        ("P2", p2_out, (bs, 128, 160, 160)),
-        ("P3", p3_out, (bs, 256, 80, 80)),
-        ("P4", p4_out, (bs, 512, 40, 40))
-    ]:
-        status = "OK" if out.shape == exp else "FAIL"
-        print(f"  {name}: {list(out.shape)} expected {list(exp)} [{status}]")
-    print(f"  BiFPNLayer Params: {sum(p.numel() for p in bifpn_layer.parameters()):,}")
+    print("\n=== 1. FPN_PAN (标准 YOLO11 结构) ===")
+    test_model("FPN_PAN", FPN_PAN(channels, out_channels).to(device), [p2, p3, p4])
 
-    print("\n=== Testing DualStreamBiFPNLayer (双流并行版本) ===")
-    dualstream_layer = DualStreamBiFPNLayer(out_channels, use_refine=True).to(device)
-    p2_out, p3_out, p4_out = dualstream_layer(p2, p3, p4)
-    for name, out, exp in [
-        ("P2", p2_out, (bs, 128, 160, 160)),
-        ("P3", p3_out, (bs, 256, 80, 80)),
-        ("P4", p4_out, (bs, 512, 40, 40))
-    ]:
-        status = "OK" if out.shape == exp else "FAIL"
-        print(f"  {name}: {list(out.shape)} expected {list(exp)} [{status}]")
-    print(f"  DualStreamBiFPNLayer Params: {sum(p.numel() for p in dualstream_layer.parameters()):,}")
+    print("\n=== 2. BiFPNLayer (DWConv精炼) ===")
+    bifpn_dw = BiFPNLayer(out_channels, use_refine=True, refine_type='dwconv').to(device)
+    p2o, p3o, p4o = bifpn_dw(p2, p3, p4)
+    for name, out, exp in [("P2", p2o, (bs, 128, 160, 160)), ("P3", p3o, (bs, 256, 80, 80)), ("P4", p4o, (bs, 512, 40, 40))]:
+        print(f"  {name}: {list(out.shape)} expected {list(exp)} [{'OK' if out.shape == exp else 'FAIL'}]")
+    print(f"  Params: {sum(p.numel() for p in bifpn_dw.parameters()):,}")
 
-    print("\n=== Testing FPN_PAN_BiFPN (1 BiFPN layer) ===")
-    fpn_pan_bifpn = FPN_PAN_BiFPN(
-        channels, out_channels,
-        num_bifpn_layers=1,
-        use_refine=True
-    ).to(device)
-    outs = fpn_pan_bifpn([p2, p3, p4])
-    for i, (out, exp) in enumerate(zip(outs, [
-        (bs, 128, 160, 160),
-        (bs, 256, 80, 80),
-        (bs, 512, 40, 40)
-    ]), start=2):
-        status = "OK" if out.shape == exp else "FAIL"
-        print(f"  P{i}: {list(out.shape)} expected {list(exp)} [{status}]")
-    total_params = sum(p.numel() for p in fpn_pan_bifpn.parameters())
-    print(f"  FPN_PAN_BiFPN Params: {total_params:,}")
+    print("\n=== 3. BiFPNLayer (C3k2精炼) ===")
+    bifpn_c3 = BiFPNLayer(out_channels, use_refine=True, refine_type='c3k2').to(device)
+    p2o, p3o, p4o = bifpn_c3(p2, p3, p4)
+    for name, out, exp in [("P2", p2o, (bs, 128, 160, 160)), ("P3", p3o, (bs, 256, 80, 80)), ("P4", p4o, (bs, 512, 40, 40))]:
+        print(f"  {name}: {list(out.shape)} expected {list(exp)} [{'OK' if out.shape == exp else 'FAIL'}]")
+    print(f"  Params: {sum(p.numel() for p in bifpn_c3.parameters()):,}")
 
-    print("\n=== Testing FPN_PAN_DualStreamBiFPN (1 DualStream layer) ===")
-    fpn_pan_dual = FPN_PAN_BiFPN(
-        channels, out_channels,
-        num_bifpn_layers=1,
-        use_refine=True,
-        use_dual_stream=True
-    ).to(device)
-    outs = fpn_pan_dual([p2, p3, p4])
-    for i, (out, exp) in enumerate(zip(outs, [
-        (bs, 128, 160, 160),
-        (bs, 256, 80, 80),
-        (bs, 512, 40, 40)
-    ]), start=2):
-        status = "OK" if out.shape == exp else "FAIL"
-        print(f"  P{i}: {list(out.shape)} expected {list(exp)} [{status}]")
-    total_params = sum(p.numel() for p in fpn_pan_dual.parameters())
-    print(f"  FPN_PAN_DualStreamBiFPN Params: {total_params:,}")
+    print("\n=== 4. FPN_PAN + BiFPN (DWConv精炼) ===")
+    test_model("FPN_PAN+DW", FPN_PAN_BiFPN(
+        channels, out_channels, num_bifpn_layers=1, use_refine=True,
+        use_fpn_pan=True, refine_type='dwconv'
+    ).to(device), [p2, p3, p4])
 
-    print("\n=== Testing FPN_PAN_BiFPN (3 BiFPN layers) ===")
-    fpn_pan_bifpn3 = FPN_PAN_BiFPN(
-        channels, out_channels,
-        num_bifpn_layers=3,
-        use_refine=True
-    ).to(device)
-    outs = fpn_pan_bifpn3([p2, p3, p4])
-    for i, (out, exp) in enumerate(zip(outs, [
-        (bs, 128, 160, 160),
-        (bs, 256, 80, 80),
-        (bs, 512, 40, 40)
-    ]), start=2):
-        status = "OK" if out.shape == exp else "FAIL"
-        print(f"  P{i}: {list(out.shape)} expected {list(exp)} [{status}]")
-    total_params = sum(p.numel() for p in fpn_pan_bifpn3.parameters())
-    print(f"  FPN_PAN_BiFPN (3 layers) Params: {total_params:,}")
+    print("\n=== 5. FPN_PAN + BiFPN (C3k2精炼) ===")
+    test_model("FPN_PAN+C3k2", FPN_PAN_BiFPN(
+        channels, out_channels, num_bifpn_layers=1, use_refine=True,
+        use_fpn_pan=True, refine_type='c3k2'
+    ).to(device), [p2, p3, p4])
 
-    print("\n=== Testing FPN_PAN_DualStreamBiFPN (3 DualStream layers) ===")
-    fpn_pan_dual3 = FPN_PAN_BiFPN(
-        channels, out_channels,
-        num_bifpn_layers=3,
-        use_refine=True,
-        use_dual_stream=True
-    ).to(device)
-    outs = fpn_pan_dual3([p2, p3, p4])
-    for i, (out, exp) in enumerate(zip(outs, [
-        (bs, 128, 160, 160),
-        (bs, 256, 80, 80),
-        (bs, 512, 40, 40)
-    ]), start=2):
-        status = "OK" if out.shape == exp else "FAIL"
-        print(f"  P{i}: {list(out.shape)} expected {list(exp)} [{status}]")
-    total_params = sum(p.numel() for p in fpn_pan_dual3.parameters())
-    print(f"  FPN_PAN_DualStreamBiFPN (3 layers) Params: {total_params:,}")
+    print("\n=== 6. 纯 BiFPN (C3k2精炼, 替代FPN-PAN) ===")
+    test_model("Pure_C3k2", FPN_PAN_BiFPN(
+        channels, out_channels, num_bifpn_layers=1, use_refine=True,
+        use_fpn_pan=False, refine_type='c3k2'
+    ).to(device), [p2, p3, p4])
+
+    print("\n=== 7. 纯 BiFPN (2层, C3k2精炼) ===")
+    test_model("Pure_C3k2x2", FPN_PAN_BiFPN(
+        channels, out_channels, num_bifpn_layers=2, use_refine=True,
+        use_fpn_pan=False, refine_type='c3k2'
+    ).to(device), [p2, p3, p4])
