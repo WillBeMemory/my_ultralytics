@@ -109,8 +109,10 @@ class FPN_PAN(nn.Module):
 class BiFPNLayer(nn.Module):
     """
     BiFPN 单层，P2/P3/P4 两两加权融合（Top-Down + Bottom-Up）
-    - fusion_type: 'scalar' 标量加权(BiFPN_Add), 'channel' 逐通道加权(CW_BiFPN_Add)
-    - refine_type: 'dwconv' 深度可分离卷积精炼, 'c3k2' C3k2精炼
+    - 融合在 backbone 原始通道空间做（保留完整信息）
+    - C3k2 精炼在 out_channels 空间做（控制计算量）
+    - fusion_type: 'scalar' 标量加权, 'channel' 逐通道加权
+    - refine_type: 'dwconv' 深度可分离卷积, 'c3k2' C3k2
     """
     def __init__(self, channels=None, use_refine=True, refine_type='c3k2', fusion_type='channel'):
         super().__init__()
@@ -136,28 +138,28 @@ class BiFPNLayer(nn.Module):
         c2, c3, c4 = p2.shape[1], p3.shape[1], p4.shape[1]
         o2, o3, o4 = self._channels  # 目标输出通道
 
-        # ========== 输入投影：backbone通道 → out_channels ==========
-        self.in_proj_p2 = Conv(c2, o2, 1, act=False) if c2 != o2 else nn.Identity()
-        self.in_proj_p3 = Conv(c3, o3, 1, act=False) if c3 != o3 else nn.Identity()
-        self.in_proj_p4 = Conv(c4, o4, 1, act=False) if c4 != o4 else nn.Identity()
+        # ========== Top-Down 融合（backbone通道空间） ==========
+        self.td_p4_to_p3 = Conv(c4, c3, 1, act=False)
+        self.td_p3_fuse = self._make_fuse(2, c3)
 
-        # ========== Top-Down：P4→P3, P3→P2（out_channels空间） ==========
-        self.td_p4_to_p3 = Conv(o4, o3, 1, act=False)
-        self.td_p3_fuse = self._make_fuse(2, o3)
-        self.td_p3_refine = self._make_refine(o3)
+        self.td_p3_to_p2 = Conv(c3, c2, 1, act=False)
+        self.td_p2_fuse = self._make_fuse(2, c2)
 
-        self.td_p3_to_p2 = Conv(o3, o2, 1, act=False)
-        self.td_p2_fuse = self._make_fuse(2, o2)
-        self.td_p2_refine = self._make_refine(o2)
+        # ========== Bottom-Up 融合（backbone通道空间） ==========
+        self.bu_p2_to_p3 = Conv(c2, c3, 3, 2)
+        self.bu_p3_fuse = self._make_fuse(2, c3)
 
-        # ========== Bottom-Up：P2→P3, P3→P4 ==========
-        self.bu_p2_to_p3 = Conv(o2, o3, 3, 2)
-        self.bu_p3_fuse = self._make_fuse(2, o3)
-        self.bu_p3_refine = self._make_refine(o3)
+        self.bu_p3_to_p4 = Conv(c3, c4, 3, 2)
+        self.bu_p4_fuse = self._make_fuse(2, c4)
 
-        self.bu_p3_to_p4 = Conv(o3, o4, 3, 2)
-        self.bu_p4_fuse = self._make_fuse(2, o4)
-        self.bu_p4_refine = self._make_refine(o4)
+        # ========== 投影 + 精炼（out_channels空间） ==========
+        self.proj_p2 = Conv(c2, o2, 1, act=False) if c2 != o2 else nn.Identity()
+        self.proj_p3 = Conv(c3, o3, 1, act=False) if c3 != o3 else nn.Identity()
+        self.proj_p4 = Conv(c4, o4, 1, act=False) if c4 != o4 else nn.Identity()
+
+        self.refine_p2 = self._make_refine(o2)
+        self.refine_p3 = self._make_refine(o3)
+        self.refine_p4 = self._make_refine(o4)
 
         self.to(p2.device)
         self._initialized = True
@@ -166,30 +168,26 @@ class BiFPNLayer(nn.Module):
         if not self._initialized:
             self._init_layers(p2_in, p3_in, p4_in)
 
-        # 输入投影
-        p2 = self.in_proj_p2(p2_in)
-        p3 = self.in_proj_p3(p3_in)
-        p4 = self.in_proj_p4(p4_in)
+        # ========== Top-Down 融合（backbone通道空间，保留完整信息） ==========
+        p4_up = F.interpolate(self.td_p4_to_p3(p4_in), size=p3_in.shape[-2:], mode='nearest')
+        p3_td = self.td_p3_fuse([p3_in, p4_up])
 
-        # ========== Top-Down ==========
-        p4_up = F.interpolate(self.td_p4_to_p3(p4), size=p3.shape[-2:], mode='nearest')
-        p3_td = self.td_p3_fuse([p3, p4_up])
-        p3_td = self.td_p3_refine(p3_td)
+        p3_up = F.interpolate(self.td_p3_to_p2(p3_td), size=p2_in.shape[-2:], mode='nearest')
+        p2_td = self.td_p2_fuse([p2_in, p3_up])
 
-        p3_up = F.interpolate(self.td_p3_to_p2(p3_td), size=p2.shape[-2:], mode='nearest')
-        p2_td = self.td_p2_fuse([p2, p3_up])
-        p2_td = self.td_p2_refine(p2_td)
-
-        # ========== Bottom-Up ==========
+        # ========== Bottom-Up 融合（backbone通道空间） ==========
         p2_down = self.bu_p2_to_p3(p2_td)
-        p3_out = self.bu_p3_fuse([p3_td, p2_down])
-        p3_out = self.bu_p3_refine(p3_out)
+        p3_bu = self.bu_p3_fuse([p3_td, p2_down])
 
-        p3_down = self.bu_p3_to_p4(p3_out)
-        p4_out = self.bu_p4_fuse([p4, p3_down])
-        p4_out = self.bu_p4_refine(p4_out)
+        p3_down = self.bu_p3_to_p4(p3_bu)
+        p4_bu = self.bu_p4_fuse([p4_in, p3_down])
 
-        return p2_td, p3_out, p4_out
+        # ========== 投影到 out_channels + 精炼 ==========
+        p2_out = self.refine_p2(self.proj_p2(p2_td))
+        p3_out = self.refine_p3(self.proj_p3(p3_bu))
+        p4_out = self.refine_p4(self.proj_p4(p4_bu))
+
+        return p2_out, p3_out, p4_out
 
 
 class FPN_PAN_BiFPN(nn.Module):
