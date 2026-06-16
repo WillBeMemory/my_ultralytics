@@ -254,7 +254,7 @@ class FPN_PAN_BiFPN(nn.Module):
     - BiFPN：P2/P3/P4 两两加权融合（BiFPN_Add），可堆叠多层
     - DualStreamBiFPN：双流并行融合（TD + BU 独立，从原始特征出发）
     """
-    def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False, use_dual_stream=True):
+    def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False, use_dual_stream=False):
         super().__init__()
         c2, c3, c4 = channels
         if out_channels is None:
@@ -277,19 +277,34 @@ class FPN_PAN_BiFPN(nn.Module):
                 self.bifpn_layers = nn.ModuleList([
                     BiFPNLayer(out_channels, use_refine) for _ in range(num_bifpn_layers)
                 ])
+            # 可学习残差门控（per-scale，初始化为 0 → 起步即恒等 = 纯 FPN-PAN）。
+            # 训练中网络自己学最优混合强度 α：out = f + α·(r − f)。
+            # 修复“BiFPN 50/50 混合从 ep0 即稀释 loose-match 信号、拖慢收敛且封顶更低”的问题。
+            self.alpha = nn.Parameter(torch.zeros(3))
         else:
             self.bifpn_layers = None
 
     def forward(self, features):
         p2, p3, p4 = features
 
-        # FPN-PAN
-        p2_out, p3_out, p4_out = self.fpn_pan([p2, p3, p4])
+        # FPN-PAN（干净特征 f：loose-match 友好）
+        p2_f, p3_f, p4_f = self.fpn_pan([p2, p3, p4])
 
-        # BiFPN 精炼
-        if self.bifpn_layers:
-            for layer in self.bifpn_layers:
-                p2_out, p3_out, p4_out = layer(p2_out, p3_out, p4_out)
+        # 无 BiFPN 层：直接返回干净特征（= bifpn=0 路径）
+        if self.bifpn_layers is None:
+            return [p2_f, p3_f, p4_f]
+
+        # BiFPN 精炼（r：跨尺度精炼后特征，高 IoU 友好）
+        p2_r, p3_r, p4_r = p2_f, p3_f, p4_f
+        for layer in self.bifpn_layers:
+            p2_r, p3_r, p4_r = layer(p2_r, p3_r, p4_r)
+
+        # 可学习残差门控：out = f + α·(r − f)
+        # α=0 起步 = 纯 FPN-PAN（恒等，最差也不输 bifpn=0）；训练中逐步引入精炼，
+        # 保留干净 loose-match 信号，同时拿到跨尺度精炼带来的高 IoU 增益。
+        p2_out = p2_f + self.alpha[0] * (p2_r - p2_f)
+        p3_out = p3_f + self.alpha[1] * (p3_r - p3_f)
+        p4_out = p4_f + self.alpha[2] * (p4_r - p4_f)
 
         return [p2_out, p3_out, p4_out]
 
