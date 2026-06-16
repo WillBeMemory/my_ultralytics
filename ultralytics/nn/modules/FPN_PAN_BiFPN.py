@@ -103,34 +103,28 @@ class DualStreamBiFPNLayer(nn.Module):
     def _init_layers(self, p2, p3, p4):
         c2, c3, c4 = p2.shape[1], p3.shape[1], p4.shape[1]
 
-        # ========== Top-Down 流投影 ==========
+        # ========== Top-Down 流投影（上采样方向） ==========
         # P4 → 1x1 Conv(512→256) → Upsample
         self.td_p4_to_p3 = Conv(c4, c3, 1, act=False)
         # P3_td → 1x1 Conv(256→128) → Upsample
         self.td_p3_to_p2 = Conv(c3, c2, 1, act=False)
-        # P2 → 1x1 Conv(128→256) → Downsample
-        self.td_p2_to_p3 = Conv(c2, c3, 1, act=False)
 
-        # ========== Bottom-Up 流投影 ==========
-        # P2 → 1x1 Conv(128→256) → Upsample（不依赖 TD）
-        self.bu_p2_to_p3 = Conv(c2, c3, 1, act=False)
-        # P3_bu → 1x1 Conv(256→512) → Downsample
-        self.bu_p3_to_p4 = Conv(c3, c4, 1, act=False)
-        # P4 → 1x1 Conv(512→256) → Upsample
-        self.bu_p4_to_p3 = Conv(c4, c3, 1, act=False)
+        # ========== Bottom-Up 流投影（下采样方向） ==========
+        # P2 → 3x3 Conv(s=2, 128→256)，可学习下采样
+        self.bu_p2_to_p3 = Conv(c2, c3, 3, 2)
+        # P3_bu → 3x3 Conv(s=2, 256→512)，可学习下采样
+        self.bu_p3_to_p4 = Conv(c3, c4, 3, 2)
 
         # ========== 加权融合层 ==========
         # TD 流
         self.td_p4_fuse = BiFPN_Add(2)  # P3_in + P4_up
         self.td_p3_fuse = BiFPN_Add(2)  # P2_in + P3_up
-        self.td_p2_fuse = BiFPN_Add(2)  # P2_in + P2_up
 
         # BU 流
-        self.bu_p3_fuse = BiFPN_Add(2)  # P3_in + P2_up
-        self.bu_p4_fuse = BiFPN_Add(2)  # P4_in + P3_up
+        self.bu_p3_fuse = BiFPN_Add(2)  # P3_in + P2_down
+        self.bu_p4_fuse = BiFPN_Add(2)  # P4_in + P3_down
 
         # 最终融合（双流 + 原始）
-        self.fuse_p2 = BiFPN_Add(3)  # TD_out + P2_in + P2_up（但 P2_up 来自 BU，这里简化）
         self.fuse_p2 = BiFPN_Add(2)  # TD_out + P2_in
         self.fuse_p3 = BiFPN_Add(3)  # TD_out + BU_out + P3_in
         self.fuse_p4 = BiFPN_Add(2)  # BU_out + P4_in
@@ -148,7 +142,7 @@ class DualStreamBiFPNLayer(nn.Module):
         if not self._initialized:
             self._init_layers(p2_in, p3_in, p4_in)
 
-        # ========== Top-Down 流 ==========
+        # ========== Top-Down 流（上采样） ==========
         # P4 → P3: P3_in + P4_up → P3_td
         p4_up = F.interpolate(self.td_p4_to_p3(p4_in), size=p3_in.shape[-2:], mode='nearest')
         p3_td = self.td_p4_fuse([p3_in, p4_up])
@@ -159,25 +153,25 @@ class DualStreamBiFPNLayer(nn.Module):
         p2_td = self.td_p3_fuse([p2_in, p3_up])
         p2_td = self.td_refine_p2(p2_td)
 
-        # ========== Bottom-Up 流（独立于 TD） ==========
-        # P2 → P3: P3_in + P2_up → P3_bu
-        p2_up = F.interpolate(self.bu_p2_to_p3(p2_in), size=p3_in.shape[-2:], mode='nearest')
-        p3_bu = self.bu_p3_fuse([p3_in, p2_up])
+        # ========== Bottom-Up 流（下采样，独立于 TD） ==========
+        # P2 → P3: P3_in + P2_down → P3_bu
+        p2_down = self.bu_p2_to_p3(p2_in)
+        p3_bu = self.bu_p3_fuse([p3_in, p2_down])
         p3_bu = self.bu_refine_p3(p3_bu)
 
-        # P3_bu → P4: P4_in + P3_up → P4_bu
-        p3_up_bu = F.interpolate(self.bu_p3_to_p4(p3_bu), size=p4_in.shape[-2:], mode='nearest')
-        p4_bu = self.bu_p4_fuse([p4_in, p3_up_bu])
+        # P3_bu → P4: P4_in + P3_down → P4_bu
+        p3_down = self.bu_p3_to_p4(p3_bu)
+        p4_bu = self.bu_p4_fuse([p4_in, p3_down])
         p4_bu = self.bu_refine_p4(p4_bu)
 
         # ========== 最终双流融合 ==========
-        # P2: TD输出 + 原始P2（残差）
+        # P2: TD输出 + 原始P2
         p2_out = self.fuse_p2([p2_td, p2_in])
 
         # P3: TD输出 + BU输出 + 原始P3（三输入）
         p3_out = self.fuse_p3([p3_td, p3_bu, p3_in])
 
-        # P4: BU输出 + 原始P4（残差）
+        # P4: BU输出 + 原始P4
         p4_out = self.fuse_p4([p4_bu, p4_in])
 
         return p2_out, p3_out, p4_out
