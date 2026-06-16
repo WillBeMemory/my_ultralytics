@@ -260,7 +260,7 @@ class FPN_PAN_BiFPN(nn.Module):
     - BiFPN：P2/P3/P4 两两加权融合（BiFPN_Add），可堆叠多层
     - DualStreamBiFPN：双流并行融合（TD + BU 独立，从原始特征出发）
     """
-    def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False, use_dual_stream=False):
+    def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False, use_dual_stream=True):
         super().__init__()
         c2, c3, c4 = channels
         if out_channels is None:
