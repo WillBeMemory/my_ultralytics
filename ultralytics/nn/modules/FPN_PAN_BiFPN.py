@@ -93,45 +93,37 @@ class DepthwiseSeparableConv(nn.Module):
 
 class FPN_PAN(nn.Module):
     """
-    FPN-PAN，使用加权融合（CW_Add/像素加权）替代 Concat：
-    - FPN (Top-Down):   Upsample → 1×1投影 → Fuse → C3k2
-    - PAN (Bottom-Up):  Conv(s=2) → Fuse → C3k2
+    标准 YOLO11 FPN-PAN，使用 Concat 融合（与 YOLO11 默认 neck 一致）：
+    - FPN (Top-Down):   Upsample → Concat → C3k2
+    - PAN (Bottom-Up):  Conv(s=2) → Concat → C3k2
 
-    fuse_type ∈ {'scalar','channel','pixel'} 控制融合权重的粒度。
+    本类固定使用 Concat，不参与 fuse_type 切换；逐像素/逐通道加权融合
+    只用于后续串联的 BiFPNLayer（见 FPN_PAN_BiFPN）。
     """
-    def __init__(self, channels, out_channels=None, fuse_type='channel'):
+    def __init__(self, channels, out_channels=None):
         super().__init__()
         if out_channels is None:
             out_channels = channels
         self._out_channels = out_channels
-        self.fuse_type = fuse_type
         self._initialized = False
 
     def _init_layers(self, p2, p3, p4):
         c2, c3, c4 = p2.shape[1], p3.shape[1], p4.shape[1]
         o2, o3, o4 = self._out_channels
 
-        # ========== FPN (Top-Down): 加权融合 ==========
-        # P4 → 1×1投影 → Upsample → Fuse(P3) → C3k2
-        self.td_p4_to_p3 = Conv(c4, c3, 1, act=False)
-        self.td_p3_fuse = _make_fuse(self.fuse_type, 2, c3)
-        self.fpn_p3 = C3k2(c3, o3, n=2, c3k=False)
+        # ========== FPN (Top-Down): Concat 融合 ==========
+        # P4 → Upsample → Concat(P3) → C3k2     输入通道 = c3 + c4
+        self.fpn_p3 = C3k2(c3 + c4, o3, n=2, c3k=False)
+        # P3_fpn → Upsample → Concat(P2) → C3k2  输入通道 = c2 + o3
+        self.fpn_p2 = C3k2(c2 + o3, o2, n=2, c3k=False)
 
-        # P3_fpn → 1×1投影 → Upsample → Fuse(P2) → C3k2
-        self.td_p3_to_p2 = Conv(o3, c2, 1, act=False)
-        self.td_p2_fuse = _make_fuse(self.fuse_type, 2, c2)
-        self.fpn_p2 = C3k2(c2, o2, n=2, c3k=False)
-
-        # ========== PAN (Bottom-Up): 加权融合 ==========
-        # P2_fpn → Conv(s=2) → Fuse(P3_fpn) → C3k2
+        # ========== PAN (Bottom-Up): Concat 融合 ==========
+        # P2_fpn → Conv(s=2) → Concat(P3_fpn) → C3k2  输入通道 = o3 + o3
         self.bu_p2_to_p3 = Conv(o2, o3, 3, 2)
-        self.bu_p3_fuse = _make_fuse(self.fuse_type, 2, o3)
-        self.pan_p3 = C3k2(o3, o3, n=2, c3k=False)
-
-        # P3_pan → Conv(s=2) → Fuse(P4) → C3k2
+        self.pan_p3 = C3k2(o3 * 2, o3, n=2, c3k=False)
+        # P3_pan → Conv(s=2) → Concat(P4) → C3k2       输入通道 = c4 + o4
         self.bu_p3_to_p4 = Conv(o3, o4, 3, 2)
-        self.bu_p4_fuse = _make_fuse(self.fuse_type, 2, o4)
-        self.pan_p4 = C3k2(o4, o4, n=2, c3k=False)
+        self.pan_p4 = C3k2(c4 + o4, o4, n=2, c3k=False)
 
         self.to(p2.device)
         self._initialized = True
@@ -143,22 +135,18 @@ class FPN_PAN(nn.Module):
             self._init_layers(p2, p3, p4)
 
         # ========== FPN (Top-Down) ==========
-        p4_up = F.interpolate(self.td_p4_to_p3(p4), size=p3.shape[-2:], mode='nearest')
-        p3_fused = self.td_p3_fuse([p3, p4_up])
-        p3_fpn = self.fpn_p3(p3_fused)
+        p4_up = F.interpolate(p4, size=p3.shape[-2:], mode='nearest')
+        p3_fpn = self.fpn_p3(torch.cat([p3, p4_up], dim=1))
 
-        p3_up = F.interpolate(self.td_p3_to_p2(p3_fpn), size=p2.shape[-2:], mode='nearest')
-        p2_fused = self.td_p2_fuse([p2, p3_up])
-        p2_fpn = self.fpn_p2(p2_fused)
+        p3_up = F.interpolate(p3_fpn, size=p2.shape[-2:], mode='nearest')
+        p2_fpn = self.fpn_p2(torch.cat([p2, p3_up], dim=1))
 
         # ========== PAN (Bottom-Up) ==========
         p2_down = self.bu_p2_to_p3(p2_fpn)
-        p3_fused = self.bu_p3_fuse([p3_fpn, p2_down])
-        p3_pan = self.pan_p3(p3_fused)
+        p3_pan = self.pan_p3(torch.cat([p3_fpn, p2_down], dim=1))
 
         p3_down = self.bu_p3_to_p4(p3_pan)
-        p4_fused = self.bu_p4_fuse([p4, p3_down])
-        p4_pan = self.pan_p4(p4_fused)
+        p4_pan = self.pan_p4(torch.cat([p4, p3_down], dim=1))
 
         return [p2_fpn, p3_pan, p4_pan]
 
@@ -235,13 +223,14 @@ class BiFPNLayer(nn.Module):
 class FPN_PAN_BiFPN(nn.Module):
     """
     FPN-PAN-BiFPN 组合模块
-    - FPN-PAN：与 YOLO11 默认结构完全一致（Conv + C3k2 + Upsample + 加权融合）
-    - BiFPN：P2/P3/P4 两两加权融合，可堆叠多层
+    - FPN-PAN：与 YOLO11 默认结构完全一致（Conv + C3k2 + Upsample + Concat）。
+    - BiFPN：在 FPN-PAN 之后串联若干层 BiFPNLayer 做精炼，可堆叠多层。
 
-    fuse_type ∈ {'scalar','channel','pixel'}：融合权重的粒度。
-      - 'channel'（默认，逐通道权重）与历史版本行为一致，向后兼容。
+    fuse_type 只作用于 BiFPNLayer 部分（FPN-PAN 固定为 Concat）：
+      - 'channel'（默认，逐通道权重）。
       - 'pixel' 启用 ASFF 风格的逐像素加权融合（Liu et al. 2019）。
       - 'scalar' 回退到 BiFPN 全局标量权重，用于消融下界对照。
+    num_bifpn_layers=0 时退化为纯 FPN-PAN（不含加权融合）。
     """
     def __init__(self, channels, out_channels=None, num_bifpn_layers=1,
                  use_refine=False, fuse_type='channel'):
@@ -254,10 +243,10 @@ class FPN_PAN_BiFPN(nn.Module):
         self.num_bifpn_layers = num_bifpn_layers
         self.fuse_type = fuse_type
 
-        # FPN-PAN（标准 YOLO11 结构）
-        self.fpn_pan = FPN_PAN(channels, out_channels, fuse_type=fuse_type)
+        # FPN-PAN（标准 YOLO11 结构，固定 Concat）
+        self.fpn_pan = FPN_PAN(channels, out_channels)
 
-        # BiFPN 层
+        # BiFPN 层（fuse_type 仅在此生效）
         if num_bifpn_layers > 0:
             self.bifpn_layers = nn.ModuleList([
                 BiFPNLayer(out_channels, use_refine, fuse_type=fuse_type)
@@ -302,34 +291,52 @@ if __name__ == "__main__":
             print(f"    {name}: {list(out.shape)} expected {list(exp)} [{status}]")
         return ok
 
-    # ---- 对比三种融合粒度：scalar / channel / pixel ----
-    for fuse in ['scalar', 'channel', 'pixel']:
-        print(f"\n=== fuse_type = {fuse} ===")
-        model = FPN_PAN_BiFPN(
-            channels, out_channels,
-            num_bifpn_layers=1, use_refine=True, fuse_type=fuse
-        ).to(device)
-        outs = model([p2, p3, p4])
-        all_ok = check("FPN_PAN_BiFPN", outs, expected)
-        # 反向传播
-        loss = sum(o.float().sum() for o in outs)
-        loss.backward()
-        n_params = sum(p.numel() for p in model.parameters())
-        print(f"    backward: OK | params: {n_params:,}")
-        if not all_ok:
-            raise SystemExit(f"[FAIL] fuse_type={fuse} shape mismatch")
+    FUSE_CLASSES = (BiFPN_Add, CW_BiFPN_Add, Pixel_BiFPN_Add)
 
-    # ---- 单独验证单层算子的逐像素权重（用 B=3 防止 batch 维与 inputs 维混淆）----
+    def count(mod, cls):
+        return sum(1 for m in mod.modules() if isinstance(m, cls))
+
+    # ---- 1) FPN_PAN 单独：应为纯 Concat，不含任何加权融合算子 ----
+    print("\n=== FPN_PAN 单独 (应为纯 Concat) ===")
+    fpn_pan = FPN_PAN(channels, out_channels).to(device)
+    outs = fpn_pan([p2, p3, p4])
+    assert check("FPN_PAN", outs, expected)
+    n_fuse = sum(count(fpn_pan, c) for c in FUSE_CLASSES)
+    print(f"    加权融合算子总数 (应为 0): {n_fuse} | params: {sum(p.numel() for p in fpn_pan.parameters()):,}")
+    assert n_fuse == 0, "FPN_PAN 不应包含任何加权融合算子"
+    loss = sum(o.float().sum() for o in outs); loss.backward()
+
+    # ---- 2) FPN_PAN_BiFPN: 加权融合只出现在 BiFPNLayer ----
+    for n_layers, fuse, exp_cls in [(0, 'pixel', None),
+                                    (1, 'scalar', BiFPN_Add),
+                                    (1, 'channel', CW_BiFPN_Add),
+                                    (1, 'pixel', Pixel_BiFPN_Add)]:
+        model = FPN_PAN_BiFPN(channels, out_channels,
+                              num_bifpn_layers=n_layers, use_refine=True,
+                              fuse_type=fuse).to(device)
+        outs = model([p2, p3, p4])
+        ok = check(f"layers={n_layers},{fuse}", outs, expected)
+        # FPN_PAN 部分始终 0 个加权算子
+        n_in_fpnp = sum(count(model.fpn_pan, c) for c in FUSE_CLASSES)
+        # BiFPNLayer 部分: layers=1 → 4 个对应算子; layers=0 → 0
+        n_active = count(model, exp_cls) if exp_cls else 0
+        loss = sum(o.float().sum() for o in outs); loss.backward()
+        print(f"    layers={n_layers} {fuse:7s} | FPN_PAN 内加权算子={n_in_fpnp} "
+              f"| {exp_cls.__name__ if exp_cls else '-':16s}={n_active} "
+              f"| params={sum(p.numel() for p in model.parameters()):,}")
+        assert ok and n_in_fpnp == 0, "FPN_PAN 部分必须为纯 Concat"
+        assert n_active == (4 if n_layers == 1 else 0), f"BiFPN 融合点计数错误: {n_active}"
+
+    # ---- 3) Pixel_BiFPN_Add 单算子权重检查 (B=3 防 batch/inputs 维混淆) ----
     print("\n=== Pixel_BiFPN_Add 单算子权重检查 (B=3) ===")
     add = Pixel_BiFPN_Add(2, 64).to(device)
     a = torch.randn(3, 64, 16, 16, device=device)
     b = torch.randn(3, 64, 16, 16, device=device)
-    y = add([a, b])                                   # 不应越界
-    w = F.softmax(add.weight_predictor(torch.cat([a, b], dim=1)), dim=1)  # [3,2,16,16]
-    s = w.sum(dim=1)                                  # 每个像素两权重之和
+    y = add([a, b])
+    w = F.softmax(add.weight_predictor(torch.cat([a, b], dim=1)), dim=1)
+    s = w.sum(dim=1)
     assert w.shape == (3, 2, 16, 16), f"weight shape {w.shape}"
     assert torch.allclose(s, torch.ones_like(s), atol=1e-4), "像素权重未在 inputs 维归一化为 1"
-    # 像素权重应随内容变化（std>0），否则退化为常量
     assert w.std() > 1e-3, f"像素权重退化为常量, std={w.std().item():.2e}"
     print(f"    out {tuple(y.shape)} | per-pixel weights {tuple(w.shape)} | "
           f"sum≈1: {s.mean().item():.4f} | std={w.std().item():.4f}")
