@@ -44,38 +44,31 @@ class CAA(nn.Module):
         return attn * x
 
 
-class CAABottleneck(Bottleneck):
-    """Bottleneck + CAA：在第二个 conv 之后接 CAA 注意力（对标 LSKBottleneck）。"""
-
-    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=1.0,
-                 h_kernel_size=11, v_kernel_size=11):
-        super().__init__(c1, c2, shortcut, g, k, e)
-        self.caa = CAA(c2, h_kernel_size, v_kernel_size)
-
-    def forward(self, x):
-        identity = x
-        out = self.cv2(self.cv1(x))
-        out = self.caa(out)
-        return identity + out if self.add else out
-
-
 class C3k2_CAA(C2f):
-    """C3k2 with CAA attention in bottlenecks（对标 C3k2_LSK）。
+    """C3k2 + 输出级 CAA 注意力（忠实 PKINet 的 stage-attention 定位）。
 
-    继承 C2f，将每个分支的 Bottleneck 替换为 CAABottleneck（c3k=True 时则用 C3k）。
-    yaml 用法与 C3k2 完全一致，仅模块名不同：
-        [-1, 2, C3k2_CAA, [256, False, 0.25]]
+    设计依据：CAA 在 PKINet 中是 block 级注意力，接在主卷积处理之后对整块输出
+    做门控，而非嵌进每个内部 bottleneck。因此本类保持标准 C3k2 的 CSP 结构
+    （Bottleneck 链 + cv2）完全不变，仅在最终输出 (cv2 之后) 接一个 CAA。
+    每个 C3k2_CAA 只含 1 个 CAA（与 n 无关），且 Bottleneck 用标准 e=0.5 不膨胀。
+
+    yaml 用法与 C3k2 一致：[-1, 2, C3k2_CAA, [256, False, 0.25]]
     """
 
     def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True,
                  h_kernel_size=11, v_kernel_size=11):
         super().__init__(c1, c2, n, shortcut, g, e)
+        # 标准 C3k2 分支构建（c3k=True 用 C3k，否则标准 Bottleneck e=0.5），不改动
         self.m = nn.ModuleList(
             C3k(self.c, self.c, 2, shortcut, g) if c3k else
-            CAABottleneck(self.c, self.c, shortcut, g, e=1.0,
-                          h_kernel_size=h_kernel_size, v_kernel_size=v_kernel_size)
+            Bottleneck(self.c, self.c, shortcut, g, e=0.5)
             for _ in range(n)
         )
+        # CAA 作为 stage-level 注意力，门控 cv2 输出（c2 通道）
+        self.caa = CAA(c2, h_kernel_size, v_kernel_size)
+
+    def forward(self, x):
+        return self.caa(super().forward(x))
 
 
 # ================== 测试 ==================
