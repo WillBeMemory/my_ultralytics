@@ -77,7 +77,6 @@ from ultralytics.nn.modules.AddModules.GoldNeck_P234 import GoldNeck_P234
 from ultralytics.nn.modules.AddModules.EFCFusion import EFCFusion
 from ultralytics.nn.modules.AddModules.C3k2_Sparse import C3k2_Sparse
 from ultralytics.nn.modules.AddModules.StarC3k2 import StarC3k2
-from ultralytics.nn.modules.AddModules.ASFF import ASFF
 from ultralytics.nn.modules.AddModules.SPDWTConv import SPDWTConv
 from ultralytics.nn.modules.AddModules.C3k2WT import C3k2WT
 from ultralytics.nn.modules.ASGF_Neck import ASGFNeck
@@ -1915,8 +1914,7 @@ def parse_model(d, ch, verbose=True):
             CCFPN,
             EFC_FPN,
             PRN,
-            GoldNeck_P234,
-            ASFF
+            GoldNeck_P234
         ):
             raw_channels = args[0]
             extra_args = args[2:]
