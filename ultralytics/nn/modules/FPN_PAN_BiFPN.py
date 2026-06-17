@@ -172,7 +172,7 @@ class BiFPNLayer(nn.Module):
 
     fuse_type ∈ {'scalar','channel','pixel'} 控制融合权重的粒度。
     """
-    def __init__(self, channels=None, use_refine=True, fuse_type='channel'):
+    def __init__(self, channels=None, use_refine=False, fuse_type='channel'):
         super().__init__()
         self._channels = channels
         self.use_refine = use_refine
