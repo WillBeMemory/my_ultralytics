@@ -51,6 +51,13 @@ class Pixel_BiFPN_Add(nn.Module):
             nn.Conv2d(mid, num_inputs, 1),   # 输出 [B, num_inputs, H, W]
         )
         self.num_inputs = num_inputs
+        # 恒等初始化：把最后一层置零 → 初始 softmax([0,...,0]) = 均匀分布，
+        # 即初始融合 = 均匀平均（与 CW_BiFPN_Add 的初始行为一致）。
+        # 这样 BiFPNLayer 在训练初期对 FPN-PAN 已输出的特征只做"无害的平均"，
+        # 避免随机权重扰乱特征分布、导致前若干 epoch 性能先变差再恢复。
+        last = self.weight_predictor[-1]
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
 
     def forward(self, xs):
         stacked = torch.cat(xs, dim=1)                 # [B, num_inputs*C, H, W]
