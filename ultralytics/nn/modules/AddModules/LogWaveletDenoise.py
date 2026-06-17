@@ -4,7 +4,8 @@ import torch.nn.functional as F
 import math
 
 class LogWaveletDenoise(nn.Module):
-    def __init__(self, c1, c2, level=1, downsample=True, kernel_size=3):
+    def __init__(self, c1, c2, level=1, downsample=True, kernel_size=3,
+                 per_pixel=False, gate_pool=5, **kwargs):
         super().__init__()
         self.downsample = downsample
         self.level = level
@@ -33,6 +34,22 @@ class LogWaveletDenoise(nn.Module):
         # ---------- 噪声估计基值 ----------
         self.register_buffer('noise_sigma', torch.ones(level, c1) * 0.1)
         self.register_buffer('noise_initialized', torch.tensor(False))
+
+        # ---------- 逐像素空间自适应阈值（可选） ----------
+        # 阈值在逐通道基底 tau_base 上乘 (1 + λ·g)，g 由各子带自身局部能量生成。
+        # 高局部能量区 g→1→τ↑（杂波区去噪更激进）；低能量区 g→0→τ=tau_base（暗目标保持温和）。
+        self.per_pixel = per_pixel
+        self.gate_pool = gate_pool
+        if self.per_pixel:
+            # 每 level 一组共享标量（三子带 LH/HL/HH 共享），log-space + softplus/exp 还原
+            self.log_gate_gamma = nn.ParameterList(
+                [nn.Parameter(torch.tensor(math.log(5.0))) for _ in range(level)])  # gate 锐度 γ
+            self.gate_beta = nn.ParameterList(
+                [nn.Parameter(torch.tensor(0.0)) for _ in range(level)])            # gate 偏置 β
+            self.log_lambda = nn.ParameterList(
+                [nn.Parameter(torch.tensor(-0.541)) for _ in range(level)])        # softplus→0.5，增益幅度 λ
+            self.register_buffer('_step', torch.tensor(0, dtype=torch.long))        # warmup 计步
+            self.warmup_steps = 1000
 
         # ---------- 可选下采样 ----------
         if self.downsample:
@@ -75,6 +92,19 @@ class LogWaveletDenoise(nn.Module):
         sigma = sorted_abs[:, :, k] / 0.6745
         return sigma * math.sqrt(2.0 * math.log(N + 1e-6))  # (B, C)
 
+    def _spatial_gate(self, D, lvl):
+        """逐像素空间增益门控 g∈(0,1)，shape (B,1,h,w)。
+
+        用子带系数 |D| 的局部平均能量 E（跨通道均值）经 sigmoid 映射：
+        g = sigmoid(γ·(E - μ - β))，高局部能量区 g→1。
+        """
+        p = self.gate_pool // 2
+        energy = F.avg_pool2d(D.abs(), self.gate_pool, stride=1, padding=p)  # (B,C,h,w) 局部能量
+        energy = energy.mean(dim=1, keepdim=True)                            # (B,1,h,w) 跨通道均值
+        mu = energy.mean(dim=[2, 3], keepdim=True) + 1e-6                    # 全局归一化基准
+        gamma = torch.exp(self.log_gate_gamma[lvl])
+        return torch.sigmoid(gamma * (energy - mu - self.gate_beta[lvl]))    # (B,1,h,w)
+
     def _multilevel_denoise(self, x_log):
         B, C, H, W = x_log.shape
         detail_coeffs = []
@@ -94,9 +124,19 @@ class LogWaveletDenoise(nn.Module):
             scale_hh = F.softplus(self.thresh_scale_HH[lvl].float())
             noise = self.noise_sigma[lvl].float().view(1, -1, 1, 1)
 
+            # 逐通道基底阈值（与原实现一致）
             tau_lh = scale_lh * noise
             tau_hl = scale_hl * noise
             tau_hh = scale_hh * noise
+
+            # 逐像素空间自适应：tau *= (1 + λ·g)，g 由各子带自身局部能量生成
+            # warmup 期 λ 线性 ramp，前期等价原逐通道行为，防训练初期发散
+            if self.per_pixel:
+                warmup = torch.clamp(self._step.float() / max(self.warmup_steps, 1), max=1.0)
+                lam = F.softplus(self.log_lambda[lvl]) * warmup
+                tau_lh = tau_lh * (1.0 + lam * self._spatial_gate(LH, lvl))
+                tau_hl = tau_hl * (1.0 + lam * self._spatial_gate(HL, lvl))
+                tau_hh = tau_hh * (1.0 + lam * self._spatial_gate(HH, lvl))
 
             LH = self._soft_threshold(LH, tau_lh)
             HL = self._soft_threshold(HL, tau_hl)
@@ -125,6 +165,8 @@ class LogWaveletDenoise(nn.Module):
                     self.noise_initialized.copy_(torch.tensor(True))
 
             rec_log = self._multilevel_denoise(x_log)
+            if self.training and self.per_pixel:
+                self._step += 1
             rec_log = torch.clamp(rec_log, max=20.0)
             out = torch.exp(rec_log)
 
