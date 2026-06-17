@@ -22,6 +22,15 @@ class CAA(nn.Module):
 
     def __init__(self, ch, h_kernel_size=11, v_kernel_size=11):
         super().__init__()
+        # --- RNG 解耦：保存 → 构建 → 恢复，使 CAA 对全局 torch RNG 净消耗为 0 ---
+        # 关键：Conv2d 在构造时即调用 reset_parameters()→kaiming_uniform_，消耗全局 RNG。
+        # 若不隔离，插入 CAA 会让排在它之后的层（同一 backbone/neck 里后构建的层）初始权重
+        # 序列整体后移，与「模块前向作用」混在一起，无法干净归因 ΔmAP（seed coupling）。
+        # save/restore 后，CAA 之后的层初值与「未插 CAA 的基线」逐比特一致。
+        # 这是 PyTorch 官方 reproducibility 文档推荐的隔离模式，且不影响跨 seed 的整体随机性。
+        _cpu_rng = torch.get_rng_state()
+        _cuda_rng = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+
         self.avg_pool = nn.AvgPool2d(kernel_size=7, stride=1, padding=3)
         self.conv1 = nn.Conv2d(ch, ch, kernel_size=1, stride=1, padding=0)
         self.act = nn.GELU()
@@ -31,6 +40,16 @@ class CAA(nn.Module):
                                 padding=(v_kernel_size // 2, 0), groups=ch)
         self.conv2 = nn.Conv2d(ch, ch, kernel_size=1, stride=1, padding=0)
         self.sigmoid = nn.Sigmoid()
+        # Identity 初始化：conv2 权重置零 + 正偏置，使初始 sigmoid(bias) ≈ 1（≈ identity）。
+        # 否则随机初始化下初始 attn ≈ 0.5，会把特征整体缩放/不均匀加权，扰乱 backbone
+        # 输出，导致前若干 epoch 性能先变差再恢复（同理于 Pixel_BiFPN_Add 的零初始化）。
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.constant_(self.conv2.bias, 4.0)   # sigmoid(4) ≈ 0.982 ≈ 1
+
+        # 恢复全局 RNG —— CAA 之后的层初始化序列回到「没插 CAA」时的原位
+        torch.set_rng_state(_cpu_rng)
+        if _cuda_rng is not None:
+            torch.cuda.set_rng_state(_cuda_rng)
 
     def forward(self, x):
         attn = self.avg_pool(x)
