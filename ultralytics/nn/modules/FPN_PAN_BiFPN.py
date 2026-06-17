@@ -47,10 +47,9 @@ class DepthwiseSeparableConv(nn.Module):
 
 class FPN_PAN(nn.Module):
     """
-    标准 FPN-PAN，与 YOLO11 默认 Neck 结构完全一致：
-    - FPN (Top-Down):   Upsample → Concat → C3k2
-    - PAN (Bottom-Up):  Conv(s=2) → Concat → C3k2
-    - C3k2 内部 n=1（YOLO11 默认，n 控制 Bottleneck 数量）
+    FPN-PAN，使用 CW_BiFPN_Add 替代 Concat：
+    - FPN (Top-Down):   Upsample → 1×1投影 → CW_Add → C3k2
+    - PAN (Bottom-Up):  Conv(s=2) → CW_Add → C3k2
     """
     def __init__(self, channels, out_channels=None):
         super().__init__()
@@ -60,21 +59,30 @@ class FPN_PAN(nn.Module):
         self._initialized = False
 
     def _init_layers(self, p2, p3, p4):
+        c2, c3, c4 = p2.shape[1], p3.shape[1], p4.shape[1]
         o2, o3, o4 = self._out_channels
 
-        # ========== FPN (Top-Down) ==========
-        # P4 → Upsample → Concat(P3) → C3k2 → P3_fpn
-        self.fpn_p3 = C3k2(p3.shape[1] + p4.shape[1], o3, n=2, c3k=False)
-        # P3_fpn → Upsample → Concat(P2) → C3k2 → P2_fpn
-        self.fpn_p2 = C3k2(p2.shape[1] + o3, o2, n=2, c3k=False)
+        # ========== FPN (Top-Down): CW_Add 融合 ==========
+        # P4 → 1×1投影 → Upsample → CW_Add(P3) → C3k2
+        self.td_p4_to_p3 = Conv(c4, c3, 1, act=False)
+        self.td_p3_fuse = CW_BiFPN_Add(2, c3)
+        self.fpn_p3 = C3k2(c3, o3, n=2, c3k=False)
 
-        # ========== PAN (Bottom-Up) ==========
-        # P2_fpn → Conv(s=2) → Concat(P3_fpn) → C3k2 → P3_pan
-        self.pan_p2_down = Conv(o2, o3, 3, 2)
-        self.pan_p3 = C3k2(o3 + o3, o3, n=2, c3k=False)
-        # P3_pan → Conv(s=2) → Concat(P4) → C3k2 → P4_pan
-        self.pan_p3_down = Conv(o3, o4, 3, 2)
-        self.pan_p4 = C3k2(o4 + p4.shape[1], o4, n=2, c3k=False)
+        # P3_fpn → 1×1投影 → Upsample → CW_Add(P2) → C3k2
+        self.td_p3_to_p2 = Conv(o3, c2, 1, act=False)
+        self.td_p2_fuse = CW_BiFPN_Add(2, c2)
+        self.fpn_p2 = C3k2(c2, o2, n=2, c3k=False)
+
+        # ========== PAN (Bottom-Up): CW_Add 融合 ==========
+        # P2_fpn → Conv(s=2) → CW_Add(P3_fpn) → C3k2
+        self.bu_p2_to_p3 = Conv(o2, o3, 3, 2)
+        self.bu_p3_fuse = CW_BiFPN_Add(2, o3)
+        self.pan_p3 = C3k2(o3, o3, n=2, c3k=False)
+
+        # P3_pan → Conv(s=2) → CW_Add(P4) → C3k2
+        self.bu_p3_to_p4 = Conv(o3, o4, 3, 2)
+        self.bu_p4_fuse = CW_BiFPN_Add(2, o4)
+        self.pan_p4 = C3k2(o4, o4, n=2, c3k=False)
 
         self.to(p2.device)
         self._initialized = True
@@ -86,18 +94,22 @@ class FPN_PAN(nn.Module):
             self._init_layers(p2, p3, p4)
 
         # ========== FPN (Top-Down) ==========
-        p4_up = F.interpolate(p4, size=p3.shape[-2:], mode='nearest')
-        p3_fpn = self.fpn_p3(torch.cat([p3, p4_up], dim=1))
+        p4_up = F.interpolate(self.td_p4_to_p3(p4), size=p3.shape[-2:], mode='nearest')
+        p3_fused = self.td_p3_fuse([p3, p4_up])
+        p3_fpn = self.fpn_p3(p3_fused)
 
-        p3_up = F.interpolate(p3_fpn, size=p2.shape[-2:], mode='nearest')
-        p2_fpn = self.fpn_p2(torch.cat([p2, p3_up], dim=1))
+        p3_up = F.interpolate(self.td_p3_to_p2(p3_fpn), size=p2.shape[-2:], mode='nearest')
+        p2_fused = self.td_p2_fuse([p2, p3_up])
+        p2_fpn = self.fpn_p2(p2_fused)
 
         # ========== PAN (Bottom-Up) ==========
-        p2_down = self.pan_p2_down(p2_fpn)
-        p3_pan = self.pan_p3(torch.cat([p3_fpn, p2_down], dim=1))
+        p2_down = self.bu_p2_to_p3(p2_fpn)
+        p3_fused = self.bu_p3_fuse([p3_fpn, p2_down])
+        p3_pan = self.pan_p3(p3_fused)
 
-        p3_down = self.pan_p3_down(p3_pan)
-        p4_pan = self.pan_p4(torch.cat([p4, p3_down], dim=1))
+        p3_down = self.bu_p3_to_p4(p3_pan)
+        p4_fused = self.bu_p4_fuse([p4, p3_down])
+        p4_pan = self.pan_p4(p4_fused)
 
         return [p2_fpn, p3_pan, p4_pan]
 
