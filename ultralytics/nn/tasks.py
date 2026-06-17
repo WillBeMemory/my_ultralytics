@@ -15,6 +15,7 @@ import torch.nn as nn
 from ultralytics.nn.modules import A2C2f_MobileMQA
 from ultralytics.nn.modules.hwd import HWD
 from ultralytics.nn.modules.lsknet import C3k2_LSK
+from ultralytics.nn.modules.CAA import CAA,C3k2_CAA
 from ultralytics.nn.modules.simam import SimAM,C3k2_SimAM
 from ultralytics.nn.modules.coordatt import CoordAtt, C3k2_CA
 
@@ -1655,6 +1656,7 @@ def parse_model(d, ch, verbose=True):
 
             HWD,
             C3k2_LSK,
+            C3k2_CAA,
             SimAM,
             C3k2_SimAM,
             CoordAtt,
@@ -1763,6 +1765,7 @@ def parse_model(d, ch, verbose=True):
     repeat_modules = frozenset(  # modules with 'repeat' arguments
         {
             C3k2_LSK,
+            C3k2_CAA,
             SimAM,
             C3k2_SimAM,
             CoordAtt,

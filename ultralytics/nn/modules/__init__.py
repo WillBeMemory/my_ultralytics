@@ -22,6 +22,7 @@ from .seNet import SEAttention
 from .CPFNet import EVCBlock
 from ultralytics.nn.modules.hwd import HWD
 from .lsknet import LSK,C3k2_LSK
+from .CAA import CAA,C3k2_CAA
 from ultralytics.nn.modules.fmb import FMB
 from ultralytics.nn.modules.simam import SimAM,C3k2_SimAM
 from ultralytics.nn.modules.coordatt import CoordAtt, C3k2_CA
