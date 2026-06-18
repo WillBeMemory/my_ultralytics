@@ -134,9 +134,12 @@ class LogWaveletDenoise(nn.Module):
             if self.per_pixel:
                 warmup = torch.clamp(self._step.float() / max(self.warmup_steps, 1), max=1.0)
                 lam = F.softplus(self.log_lambda[lvl]) * warmup
-                tau_lh = tau_lh * (1.0 + lam * self._spatial_gate(LH, lvl))
-                tau_hl = tau_hl * (1.0 + lam * self._spatial_gate(HL, lvl))
-                tau_hh = tau_hh * (1.0 + lam * self._spatial_gate(HH, lvl))
+                # 反转方向（原正向 τ↑ 已验证误砍船边缘掉点）：
+                # 高能量区(g→1) τ↓ 保护边缘/小目标，低能量区(g→0) τ≈tau_base 去噪。
+                # clamp(min=0.1) 保证 τ>0，防 τ≤0 时软阈值放大系数、数值发散。
+                tau_lh = tau_lh * torch.clamp(1.0 - lam * self._spatial_gate(LH, lvl), min=0.1)
+                tau_hl = tau_hl * torch.clamp(1.0 - lam * self._spatial_gate(HL, lvl), min=0.1)
+                tau_hh = tau_hh * torch.clamp(1.0 - lam * self._spatial_gate(HH, lvl), min=0.1)
 
             LH = self._soft_threshold(LH, tau_lh)
             HL = self._soft_threshold(HL, tau_hl)
