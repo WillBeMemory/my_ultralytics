@@ -124,7 +124,8 @@ from ultralytics.nn.modules import (
     DWConvTranspose2d,
     DWC3k2,
     # LightweightFPN_PAN,
-    FPN_PAN_BiFPN,
+    FPN_PAN_WRF,
+    FPN_PAN_BiFPN,  # deprecated alias = FPN_PAN_WRF; 保留以使旧 .pt(内嵌旧 yaml)经 globals() 仍可加载
     ASGFNeck,
     Focus,
     GhostBottleneck,
@@ -1912,7 +1913,7 @@ def parse_model(d, ch, verbose=True):
         elif m in (
             BiFPN,
             # LightweightFPN_PAN,
-            FPN_PAN_BiFPN,
+            FPN_PAN_WRF,
             ASGFNeck,
             CCFPN,
             EFC_FPN,

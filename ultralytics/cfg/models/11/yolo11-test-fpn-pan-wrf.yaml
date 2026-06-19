@@ -1,6 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-# YOLO11 with FPN-PAN-BiFPN (all internal refine modules use depthwise separable convolution)
+# YOLO11 with FPN-PAN + WRF (all internal refine modules use depthwise separable convolution)
 # Parameters
 nc: 80 # number of classes
 scales: # model compound scaling constants
@@ -26,16 +26,16 @@ backbone:
   - [-1, 1, SPPF, [512, 5]] # 9
   - [-1, 2, C2PSA, [512]] # 10
 
-# YOLO11 head: FPN-PAN-BiFPN replaces traditional FPN-PAN
+# YOLO11 head: FPN-PAN + WRF replaces traditional FPN-PAN
 head:
-  # FPN-PAN-BiFPN takes backbone features P2, P3, P4 and returns refined P2, P3, P4
-  # args: [ [c2, c3, c4], [o2, o3, o4], num_bifpn_layers, use_refine, expand_ch ]
-  - [[2, 4, 10], 1, FPN_PAN_BiFPN, [ [128, 256, 512], [128, 256, 512], 1, True ]] # 11
-  
-  # Split the FPN_PAN_BiFPN output list into separate layers
+  # FPN_PAN_WRF takes backbone features P2, P3, P4 and returns refined P2, P3, P4
+  # args: [ [c2, c3, c4], [o2, o3, o4], num_wrf_layers, use_refine, expand_ch ]
+  - [[2, 4, 10], 1, FPN_PAN_WRF, [ [128, 256, 512], [128, 256, 512], 1, True ]] # 11
+
+  # Split the FPN_PAN_WRF output list into separate layers
   - [11, 1, SplitList, [128, 0]]  # 12, P2_out
   - [11, 1, SplitList, [256, 1]]  # 13, P3_out
   - [11, 1, SplitList, [512, 2]]  # 14, P4_out
-  
+
   # Detect head
   - [[12, 13, 14], 1, Detect, [nc]]
