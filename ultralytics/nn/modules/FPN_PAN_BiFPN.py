@@ -169,7 +169,8 @@ class AlignFuseBroadcast(nn.Module):
         broadcast=False 时退化：out_P2=P2_orig、out_P3=F_mid、out_P4=P4_orig（仅共识）。
 
     设计约束（与既有消融结论对齐）：
-      - 全程加权融合（BiFPN_Add），初始=均匀平均；不上 C3k2/refine（避免过平滑小目标边缘）；
+      - 全程加权融合（BiFPN_Add），初始=均匀平均；不上 C3k2（避免过平滑小目标边缘）；
+      - 可选残差式 1×1 精炼共识 F_mid（refine 开关，零初始化→identity，保边不空间平滑）；
       - Stage2 保留原始 P2/P4 作残差一路（保定位精度，out_P2/out_P4 都有原始特征）；
       - out_P3 直接用 F_mid，不再二次融合（避免冗余，对应“加 3rd-path hurt”教训）。
     新建随机初始化 Conv 时做 RNG 隔离（见记忆 rng-isolation-on-module-edit）。
@@ -178,10 +179,11 @@ class AlignFuseBroadcast(nn.Module):
     BiFPN_Add 是全局均匀（非随机剧烈扰动），不会触发“随机权重→≈0.5x”的失真，
     但仍建议跑满 >100ep 再判方向（见记忆 dont-judge-modules-early）。
     """
-    def __init__(self, channels=None, broadcast=True):
+    def __init__(self, channels=None, broadcast=True, refine=False):
         super().__init__()
         self._channels = channels
         self.broadcast = broadcast
+        self.refine = refine
         self._initialized = False
 
     def _init_layers(self, p2, p3, p4):
@@ -198,6 +200,17 @@ class AlignFuseBroadcast(nn.Module):
             self.s1_p4_up_proj = Conv(c4, c3, 1, act=False)
             # 三路加权融合：[P3, P2↓, P4↑]，BiFPN_Add 初始 ones→均匀平均
             self.s1_fuse = BiFPN_Add(3)
+
+            if self.refine:
+                # ---------- Stage 1.5：对共识 F_mid 残差精炼 ----------
+                # f_mid_refined = f_mid + SiLU(Conv1x1(f_mid))；Conv 零初始化 → 初始 Δ=0 = identity。
+                # 1x1 只做通道重组、不空间平滑 → 保小目标边缘（避开 use_refine/C3k2 过平滑前科）；
+                # 残差 + 零初始化 → 训练前期对 F_mid 及其广播输出零扰动（见 attention-module-integration-design）。
+                self.s15_refine = nn.Sequential(
+                    nn.Conv2d(c3, c3, 1, bias=False),
+                    nn.SiLU(),
+                )
+                nn.init.zeros_(self.s15_refine[0].weight)   # 初始 Δ=0 → f_mid_refined == f_mid
 
             if self.broadcast:
                 # ---------- Stage 2：把共识 F_mid 广播回 P2/P4，与原始特征加权融合 ----------
@@ -224,6 +237,10 @@ class AlignFuseBroadcast(nn.Module):
         p2_down = self.s1_p2_down(p2)                                                # → P3 尺度, c3
         p4_up = F.interpolate(self.s1_p4_up_proj(p4), size=p3.shape[-2:], mode='nearest')  # → P3 尺度, c3
         f_mid = self.s1_fuse([p3, p2_down, p4_up])                                    # P3 尺度, c3
+
+        if self.refine:
+            # Stage 1.5：残差精炼共识（零初始化 → 初始 = identity，不扰动）
+            f_mid = f_mid + self.s15_refine(f_mid)
 
         if not self.broadcast:
             # 退化：仅输出共识，P2/P4 保持原始
@@ -255,7 +272,7 @@ class FPN_PAN_BiFPN(nn.Module):
     透传，不受 width/depth 通道缩放影响。
     """
     def __init__(self, channels, out_channels=None, num_bifpn_layers=1, use_refine=False,
-                 fuse_mode='bifpn', broadcast=True):
+                 fuse_mode='bifpn', broadcast=True, refine=False):
         super().__init__()
         c2, c3, c4 = channels
         if out_channels is None:
@@ -266,13 +283,14 @@ class FPN_PAN_BiFPN(nn.Module):
         self.use_refine = use_refine
         self.fuse_mode = fuse_mode
         self.broadcast = broadcast
+        self.refine = refine
 
         # FPN-PAN（标准 YOLO11 结构）
         self.fpn_pan = FPN_PAN(channels, out_channels)
 
         # 后接融合层
         if fuse_mode == 'afb':
-            self.fuse_layer = AlignFuseBroadcast(out_channels, broadcast=broadcast)
+            self.fuse_layer = AlignFuseBroadcast(out_channels, broadcast=broadcast, refine=refine)
             self.bifpn_layers = None
         else:
             self.fuse_layer = None
