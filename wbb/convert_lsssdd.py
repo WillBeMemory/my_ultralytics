@@ -51,7 +51,10 @@ def voc_to_yolo(xml_path, img_w=800, img_h=800):
     return lines
 
 
-def process(img_dir, split):
+def process(img_subdir, split):
+    # Kaggle 解压后 JPEGImages_sub_train/JPEGImages_sub_train/ 有嵌套,自动适配
+    nested = img_subdir / img_subdir.name
+    img_dir = nested if nested.is_dir() else img_subdir
     dst_img = DST / "images" / split
     dst_lbl = DST / "labels" / split
     dst_img.mkdir(parents=True, exist_ok=True)
