@@ -1,59 +1,44 @@
+import argparse
+import os
 from ultralytics import YOLO
 
-# 配置参数
-model_path = r"D:\Study\PostGraduate\YOLO_ultralytics\ultralytics\wbb\hrsid\runs\detect\train143\weights\best.pt"
-data_yaml = "../cfg/ls_ssdd.yaml"      # 数据集配置文件（包含验证集路径）
-imgsz = 640                              # 图像大小，需与训练一致
-# batch = 16                                # 批次大小
-# conf = 0.001                              # 置信度阈值（默认0.001）
-# iou = 0.6                                  # IoU阈值（默认0.6）
-# device = 0                                 # GPU设备（设为'cpu'使用CPU）
+DATA_YAML = "../cfg/ls_ssdd.yaml"
+IMGSZ = 640
+RUNS_DIR = "./runs/detect"
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="SSDD(official) WEF-YOLO 测试/评估脚本")
+    p.add_argument("--run_name", type=str, required=True,
+                   help="训练时的 run 名;权重自动取 ./runs/detect/<run_name>/weights/best.pt")
+    p.add_argument("--data", type=str, default=DATA_YAML,
+                   help=f"数据集 yaml(默认:{DATA_YAML})")
+    p.add_argument("--imgsz", type=int, default=IMGSZ,
+                   help=f"输入尺寸(默认:{IMGSZ})")
+    return p.parse_args()
+
 
 if __name__ == '__main__':
-    # 加载模型
+    args = parse_args()
+    model_path = os.path.join(RUNS_DIR, args.run_name, "weights", "best.pt")
+    print(f"权重路径: {model_path}")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"找不到权重文件 {model_path},请确认 --run_name 与训练时的 name 一致。")
+
     model = YOLO(model_path)
-
-    # 运行验证
-    results = model.val(
-        data=data_yaml,
-        split = 'test', # 使用测试集
-        imgsz=imgsz,
-        # batch=batch,
-        # conf=conf,
-        # iou=iou,
-        # device=device,
-        verbose=False
-    )
-
+    results = model.val(data=args.data, split='test', imgsz=args.imgsz,
+                        name=args.run_name, verbose=False)
     metrics = results.box
 
-
-    # 辅助函数：确保值是标量
     def to_scalar(x):
-        if hasattr(x, 'item'):  # 如果是 NumPy 数组或 PyTorch 张量
-            return x.item()
-        return x
+        return x.item() if hasattr(x, 'item') else x
 
-
-    # 提取指标并转换为标量
-    map50 = to_scalar(metrics.map50)
-    map95 = to_scalar(metrics.map)  # map 是 mAP@0.5:0.95
-    mp = to_scalar(metrics.mp)  # 平均精确率
-    mr = to_scalar(metrics.mr)  # 平均召回率
-    f1 = to_scalar(metrics.f1)  # 平均 F1 分数
-
-    # 打印结果
     print("\n========== Validation Results ==========")
-    print(f"mAP@0.5:          {map50:.4f}")
-    print(f"mAP@0.5:0.95:     {map95:.4f}")
-    print(f"Average Precision: {mp:.4f}")
-    print(f"Average Recall:    {mr:.4f}")
-    print(f"Average F1-score:  {f1:.4f}")
+    print(f"run_name:          {args.run_name}")
+    print(f"model:             {model_path}")
+    print(f"mAP@0.5:           {to_scalar(metrics.map50):.4f}")
+    print(f"mAP@0.5:0.95:      {to_scalar(metrics.map):.4f}")
+    print(f"Average Precision: {to_scalar(metrics.mp):.4f}")
+    print(f"Average Recall:    {to_scalar(metrics.mr):.4f}")
+    print(f"Average F1-score:  {to_scalar(metrics.f1):.4f}")
     print("=========================================")
-
-    # 可选：输出每个类别的 AP
-    if hasattr(metrics, 'maps') and metrics.maps is not None:
-        print("\nPer-class AP@0.5:0.95:")
-        for i, ap in enumerate(metrics.maps):
-            ap_scalar = to_scalar(ap)
-            print(f"Class {i}: {ap_scalar:.4f}")
