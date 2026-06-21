@@ -3,7 +3,7 @@
 from ultralytics import YOLO
 import os, torch
 
-MODEL_NAME = "yolo12s.yaml"
+MODEL_NAME = "yolo11s.yaml"
 DATASET_PATH = "../cfg/ssdd_official.yaml"
 RUN_NAME = "ssdd_yolo12s"
 
