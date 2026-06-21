@@ -6,7 +6,7 @@ from ultralytics import YOLO
 import os, torch
 
 MODEL_NAME = "yolo11s-ablation-WEF.yaml"
-DATASET_PATH = "../cfg/ls_ssdd.yaml"
+DATASET_PATH = "../cfg/hrsid_official.yaml"
 RUN_NAME = "hrsid_official_WEF"
 
 def setup_environment():
