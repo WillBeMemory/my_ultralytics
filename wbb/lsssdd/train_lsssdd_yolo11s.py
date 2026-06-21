@@ -5,7 +5,7 @@ import torch
 
 
 
-MODEL_NAME = "yolo11s-test.yaml"
+MODEL_NAME = "yolo11s.yaml"
 DATASET_PATH = "../cfg/ls_ssdd.yaml"
 
 
