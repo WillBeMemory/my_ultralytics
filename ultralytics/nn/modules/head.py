@@ -319,24 +319,33 @@ class DecoupledDetect(Detect):
 
 
 class DetectP2DW(Detect):
-    """YOLO Detect head with large-kernel DWConv for P2 level to lower computation.
+    """YOLO Detect head with LSKA-style large separable kernel for P2 level.
 
     For the P2 detection layer (highest resolution feature map), the box regression
-    branch (cv2) replaces the first 3x3 standard Conv with a 5x5 depthwise separable
-    convolution (DWConv 5x5 + 1x1 Conv) to enlarge receptive field, while keeping the
-    second 3x3 standard Conv for full cross-channel interaction. This reduces FLOPs
-    while providing a larger effective receptive field (5x5 vs 3x3) on P2.
+    branch (cv2) replaces the first 3x3 standard Conv with LSKA-style decomposition:
+    depthwise 5x1 + 1x5 convs (large RF, minimal FLOPs) followed by 1x1 Conv
+    (cross-channel mixing). The second 3x3 standard Conv is kept unchanged.
+    Effective RF enlarged from 3x3 to 5x5 with reduced computation.
     """
 
     def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
         super().__init__(nc, reg_max, end2end, ch)
-        # Override cv2 for P2 (index 0): large-kernel DWConv + standard Conv
+        # Override cv2 for P2 (index 0): LSKA-style large separable kernel
         # Original: Conv(ch[0],c2,3) -> Conv(c2,c2,3) -> Conv2d(c2,4*reg_max,1)
-        # P2:       DWConv(ch[0],c2,5) + Conv(c2,c2,1) -> Conv(c2,c2,3) -> Conv2d(c2,4*reg_max,1)
-        # 5x5 DWConv: larger RF with minimal FLOPs; 3x3 Conv: cross-channel mixing
+        # P2:       DWConv(ch[0],ch[0],(5,1)) + DWConv(ch[0],ch[0],(1,5)) + Conv(ch[0],c2,1)
+        #         -> Conv(c2,c2,3) -> Conv2d(c2,4*reg_max,1)
+        # LSKA: DW 5x1+1x5 for large RF, 1x1 Conv for channel mixing
         c2 = max((16, ch[0] // 4, self.reg_max * 4))
         self.cv2[0] = nn.Sequential(
-            nn.Sequential(DWConv(ch[0], c2, 5), Conv(c2, c2, 1)),
+            nn.Sequential(
+                nn.Conv2d(ch[0], ch[0], (5, 1), padding=(2, 0), groups=ch[0], bias=False),
+                nn.BatchNorm2d(ch[0]),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(ch[0], ch[0], (1, 5), padding=(0, 2), groups=ch[0], bias=False),
+                nn.BatchNorm2d(ch[0]),
+                nn.SiLU(inplace=True),
+                Conv(ch[0], c2, 1),
+            ),
             Conv(c2, c2, 3),
             nn.Conv2d(c2, 4 * self.reg_max, 1),
         )
