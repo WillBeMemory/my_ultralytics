@@ -319,23 +319,25 @@ class DecoupledDetect(Detect):
 
 
 class DetectP2DW(Detect):
-    """YOLO Detect head with reduced layers for P2 level to lower computation.
+    """YOLO Detect head with large-kernel DWConv for P2 level to lower computation.
 
     For the P2 detection layer (highest resolution feature map), the box regression
-    branch (cv2) uses only 1 Conv layer instead of 2, reducing FLOPs by ~1.5G while
-    keeping standard convolutions (full cross-channel interaction) and output dimensions
-    identical to the original Detect head.
+    branch (cv2) uses a 5x5 depthwise separable convolution (DWConv 5x5 + 1x1 Conv)
+    followed by a 1x1 Conv for channel mixing, instead of two 3x3 standard Convs.
+    The 5x5 DWConv provides a larger receptive field (5x5 vs 3x3) with minimal FLOPs,
+    and the 1x1 Conv provides cross-channel interaction. This reduces FLOPs by ~2G.
     """
 
     def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
         super().__init__(nc, reg_max, end2end, ch)
-        # Override cv2 for P2 (index 0): remove one 3x3 Conv layer
+        # Override cv2 for P2 (index 0): large-kernel DWConv + pointwise mixing
         # Original: Conv(ch[0],c2,3) -> Conv(c2,c2,3) -> Conv2d(c2,4*reg_max,1)
-        # P2:       Conv(ch[0],c2,3) -> Conv2d(c2,4*reg_max,1)
-        # Saves ~1.5 GFLOPs on 160x160 feature map while keeping standard conv
+        # P2:       DWConv(ch[0],c2,5) + Conv(c2,c2,1) -> Conv(c2,c2,1) -> Conv2d(c2,4*reg_max,1)
+        # 5x5 DWConv: larger RF with minimal FLOPs; 1x1 Conv: cross-channel mixing
         c2 = max((16, ch[0] // 4, self.reg_max * 4))
         self.cv2[0] = nn.Sequential(
-            Conv(ch[0], c2, 3),
+            nn.Sequential(DWConv(ch[0], c2, 5), Conv(c2, c2, 1)),
+            Conv(c2, c2, 1),
             nn.Conv2d(c2, 4 * self.reg_max, 1),
         )
 
