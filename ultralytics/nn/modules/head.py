@@ -365,7 +365,7 @@ class DetectP2DW(Detect):
         super().__init__(nc, reg_max, end2end, ch)
         # Override cv2 for P2 (index 0): use fewer intermediate channels to reduce computation
         # FLOPs scale with c2², so halving c2 reduces computation by ~4x with minimal accuracy loss
-        c2 = max((16, ch[0] // 8, self.reg_max * 4))
+        c2 = max((16, ch[0] // 8))
         self.cv2[0] = nn.Sequential(
             Conv(ch[0], c2, 3),
             Conv(c2, c2, 3),
