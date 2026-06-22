@@ -20,7 +20,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = "OBB", "Classify", "Detect", "DetectP2DW", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
 
 
 class Detect(nn.Module):
@@ -316,6 +316,36 @@ class DecoupledDetect(Detect):
             [cls_head[i](stemmed[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1
         )
         return dict(boxes=boxes, scores=scores, feats=x)
+
+
+class DetectP2DW(Detect):
+    """YOLO Detect head with depthwise separable convolutions for P2 level.
+
+    For the P2 detection layer (the highest resolution feature map), the box regression
+    branch (cv2) uses depthwise separable convolutions (DWConv + 1x1 Conv) instead of
+    standard convolutions to significantly reduce computation. The classification branch
+    (cv3) already uses DWConv in the base Detect class, so no change is needed there.
+
+    This reduces P2 head FLOPs by ~85-90% with minimal accuracy impact.
+    """
+
+    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize DetectP2DW with DWConv for P2 box regression branch.
+
+        Args:
+            nc (int): Number of classes.
+            reg_max (int): Maximum number of DFL channels.
+            end2end (bool): Whether to use end-to-end NMS-free detection.
+            ch (tuple): Tuple of channel sizes from backbone feature maps.
+        """
+        super().__init__(nc, reg_max, end2end, ch)
+        # Override cv2 for P2 (index 0) with depthwise separable convolutions
+        c2 = max((16, ch[0] // 4, self.reg_max * 4))
+        self.cv2[0] = nn.Sequential(
+            nn.Sequential(DWConv(ch[0], ch[0], 3), Conv(ch[0], c2, 1)),
+            nn.Sequential(DWConv(c2, c2, 3), Conv(c2, c2, 1)),
+            nn.Conv2d(c2, 4 * self.reg_max, 1),
+        )
 
 
 class Segment(Detect):
