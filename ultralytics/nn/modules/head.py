@@ -363,11 +363,12 @@ class DetectP2DW(Detect):
             ch (tuple): Tuple of channel sizes from backbone feature maps.
         """
         super().__init__(nc, reg_max, end2end, ch)
-        # Override cv2 for P2 (index 0): first layer DWConv+SE, second layer standard Conv
-        c2 = max((16, ch[0] // 4, self.reg_max * 4))
+        # Override cv2 for P2 (index 0): use fewer intermediate channels to reduce computation
+        # FLOPs scale with c2², so halving c2 reduces computation by ~4x with minimal accuracy loss
+        c2 = max((16, ch[0] // 8, self.reg_max * 4))
         self.cv2[0] = nn.Sequential(
-            nn.Sequential(DWConv(ch[0], ch[0], 3), Conv(ch[0], c2, 1), _SE(c2)),
-            nn.Sequential(Conv(c2, c2, 3), Conv(c2, c2, 1)),
+            Conv(ch[0], c2, 3),
+            Conv(c2, c2, 3),
             nn.Conv2d(c2, 4 * self.reg_max, 1),
         )
 
