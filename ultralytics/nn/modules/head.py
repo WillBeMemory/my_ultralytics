@@ -337,7 +337,7 @@ class DetectP2DW(Detect):
         # Standard Conv (not DW): full cross-channel interaction at every layer
         # 5x1+1x5: factored 5x5 RF; c2/2 channels: reduced computation
         c2 = max((16, ch[0] // 4, self.reg_max * 4))
-        c2h = max(16, c2 // 2)  # half channels for P2
+        c2h = max(16, c2 * 3 // 4)  # 3/4 channels: balance between FLOPs and precision
         self.cv2[0] = nn.Sequential(
             nn.Sequential(Conv(ch[0], c2h, (5, 1)), Conv(c2h, c2h, (1, 5))),
             Conv(c2h, c2h, 3),
