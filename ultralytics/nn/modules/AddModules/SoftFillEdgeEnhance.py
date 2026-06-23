@@ -3,7 +3,31 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..conv import Conv
-from ..block import Bottleneck
+
+
+# ================== SoftFill 专用 Bottleneck（残差后激活） ==================
+class Bottleneck(nn.Module):
+    """Bottleneck with post-activation residual: SiLU is applied AFTER the skip connection.
+
+    Unlike the standard YOLO Bottleneck (which activates before the add and has no
+    activation after), this version applies SiLU after the residual addition, which
+    is critical for SoftFillEdgeEnhance's feature refinement behavior.
+    """
+
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, k[0], 1)
+        self.cv2 = nn.Sequential(
+            nn.Conv2d(c_, c2, k[1], 1, padding=k[1] // 2, bias=False),
+            nn.BatchNorm2d(c2),
+        )
+        self.act = nn.SiLU(inplace=True)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        out = self.cv2(self.cv1(x))
+        return self.act(x + out) if self.add else self.act(out)
 
 
 # ================== 背景填充模块（软填充） ==================
@@ -85,7 +109,7 @@ class SoftFillEdgeEnhance(nn.Module):
         self.attn = ChannelAwareEdgeEnhance_Attn(c1, pool_size, ch_sharp, ch_thresh, edge_sharp, edge_thresh)
 
         self.bottlenecks = nn.Sequential(*[
-            Bottleneck(c1, c1, shortcut=bottleneck_shortcut, e=bottleneck_e)
+            Bottleneck(c1, c1, shortcut=False, e=bottleneck_e)
             for _ in range(n)
         ])
 
