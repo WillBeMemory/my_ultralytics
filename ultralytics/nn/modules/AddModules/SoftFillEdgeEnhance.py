@@ -2,28 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# ================== 标准 Bottleneck ==================
-class Bottleneck(nn.Module):
-    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
-        super().__init__()
-        c_ = int(c2 * e)
-        self.cv1 = nn.Conv2d(c1, c_, k[0], 1, padding=k[0] // 2, bias=False)
-        self.cv2 = nn.Conv2d(c_, c2, k[1], 1, padding=k[1] // 2, bias=False)
-        self.bn1 = nn.BatchNorm2d(c_)
-        self.bn2 = nn.BatchNorm2d(c2)
-        self.act = nn.SiLU(inplace=True)
-        self.add = shortcut and c1 == c2
-
-    def forward(self, x):
-        identity = x
-        out = self.act(self.bn1(self.cv1(x)))
-        out = self.bn2(self.cv2(out))
-        if self.add:
-            out = self.act(out + identity)
-        else:
-            out = self.act(out)
-        return out
+from ..conv import Conv
+from ..block import Bottleneck
 
 
 # ================== 背景填充模块（软填充） ==================
@@ -112,13 +92,6 @@ class SoftFillEdgeEnhance(nn.Module):
         self.proj = nn.Conv2d(c1, c2, 1, bias=False) if c1 != c2 else nn.Identity()
 
     def forward(self, x):
-        # 关键：将输入 x 对齐到 Bottleneck 权重的 dtype（AMP 下为 float16），避免类型冲突
-        if len(self.bottlenecks) > 0:
-            target_dtype = self.bottlenecks[0].cv1.weight.dtype
-        else:
-            target_dtype = x.dtype
-        x = x.to(target_dtype)
-
         out = self.bg_fill(x)
         out = self.attn(out)
         out = self.bottlenecks(out)
