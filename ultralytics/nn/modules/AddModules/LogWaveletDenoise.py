@@ -5,10 +5,11 @@ import math
 
 class LogWaveletDenoise(nn.Module):
     def __init__(self, c1, c2, level=1, downsample=True, kernel_size=3,
-                 per_pixel=False, gate_pool=5, **kwargs):
+                 per_pixel=False, gate_pool=5, shortcut=True, **kwargs):
         super().__init__()
         self.downsample = downsample
         self.level = level
+        self.shortcut = shortcut
 
         # ---------- Haar 小波滤波器 ----------
         lo = torch.tensor([1.0, 1.0]) / math.sqrt(2)
@@ -173,8 +174,10 @@ class LogWaveletDenoise(nn.Module):
             rec_log = torch.clamp(rec_log, max=20.0)
             out = torch.exp(rec_log)
 
-            # 残差融合
-            if out.shape == x.shape:
+            # 残差融合（可配置）
+            # shortcut=False: 去噪结果直接输出，不混合原始输入
+            # shortcut=True: 0.5*denoised + 0.5*original
+            if self.shortcut and out.shape == x.shape:
                 out = 0.5 * out + 0.5 * x
 
             if self.downsample:
