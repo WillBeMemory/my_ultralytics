@@ -220,3 +220,4 @@ wbb/paper_sections_draft.md
 wbb/test_align_fuse_broadcast.py
 wbb/test_logwavelet_perpixel.py
 wbb/verify_caa_rng_isolation.py
+/wbb/hrsid_official/result
