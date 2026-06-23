@@ -174,11 +174,9 @@ class LogWaveletDenoise(nn.Module):
             rec_log = torch.clamp(rec_log, max=20.0)
             out = torch.exp(rec_log)
 
-            # 残差融合（可配置）
-            # shortcut=False: 去噪结果直接输出，不混合原始输入
-            # shortcut=True: 0.5*denoised + 0.5*original
+            # 残差融合
             if self.shortcut and out.shape == x.shape:
-                out = 0.5 * out + 0.5 * x
+                out = out + x
 
             if self.downsample:
                 # 下采样分支：匹配卷积权重类型
