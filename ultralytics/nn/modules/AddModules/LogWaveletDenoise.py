@@ -176,7 +176,7 @@ class LogWaveletDenoise(nn.Module):
 
             # 残差融合
             if self.shortcut and out.shape == x.shape:
-                out = out + x
+                out = 0.5 * out + 0.5 * x
 
             if self.downsample:
                 # 下采样分支：匹配卷积权重类型
