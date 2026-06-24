@@ -174,13 +174,14 @@ def main():
             json.dump(coco_gt_dict, f)
 
         # Step 2: Run val with save_json to get COCO-format predictions
+        coco_eval_name = f"_coco_eval_{args.run_name}"
         print("Running val with save_json for COCO eval...")
         val_results = model.val(data=args.data, split=args.split, imgsz=args.imgsz,
-                                save_json=True, verbose=False, name="_coco_eval_tmp")
+                                save_json=True, verbose=False, name=coco_eval_name)
 
         # Step 3: Find the saved predictions JSON
         pred_json = None
-        val_dir = Path(RUNS_DIR) / "_coco_eval_tmp"
+        val_dir = Path(RUNS_DIR) / coco_eval_name
         if val_dir.exists():
             candidates = list(val_dir.rglob("*.json"))
             for c in sorted(candidates):
