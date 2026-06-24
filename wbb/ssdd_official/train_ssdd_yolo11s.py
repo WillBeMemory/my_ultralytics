@@ -19,7 +19,7 @@ def train_model():
     model = YOLO(MODEL_NAME)
     try:
         results = model.train(
-            data=DATASET_PATH, epochs=300, imgsz=640, batch=16, workers=0,
+            data=DATASET_PATH, epochs=300, imgsz=512, batch=16, workers=0,
             device=device, optimizer="SGD", lr0=0.01, lrf=0.01,
             save=True, verbose=True, name=RUN_NAME,
         )

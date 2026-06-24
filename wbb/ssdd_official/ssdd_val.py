@@ -3,7 +3,7 @@ from ultralytics import YOLO
 # 配置参数
 model_path = "./runs/detect/train/weights/best.pt"       # 训练好的模型权重文件
 data_yaml = "../cfg/ssdd_official.yaml"      # 数据集配置文件（包含验证集路径）
-# imgsz = 640                              # 图像大小，需与训练一致
+# imgsz = 512                              # 图像大小，需与训练一致
 # batch = 16                                # 批次大小
 # conf = 0.001                              # 置信度阈值（默认0.001）
 # iou = 0.6                                  # IoU阈值（默认0.6）

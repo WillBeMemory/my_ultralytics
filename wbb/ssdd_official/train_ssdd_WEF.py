@@ -1,6 +1,6 @@
 # train_ssdd_WEF.py — WEF-YOLO (yolo11s-ablation-WEF.yaml), SSDD 官方划分
 # 数据集: SSDD_official  928 train / 232 test(val=test)
-# 训练配方与 HRSID(712rand)完全一致:300ep / SGD / lr0=0.01 / imgsz640 / batch16 / 从零训练
+# 训练配方与 HRSID(712rand)完全一致:300ep / SGD / lr0=0.01 / imgsz512 / batch16 / 从零训练
 
 from ultralytics import YOLO
 import os
@@ -43,7 +43,7 @@ def train_model():
     try:
         results = model.train(
             data=DATASET_PATH,
-            epochs=300, imgsz=640, batch=16, workers=0,
+            epochs=300, imgsz=512, batch=16, workers=0,
             device=device, optimizer="SGD", lr0=0.01, lrf=0.01,
             save=True, verbose=True, name=RUN_NAME,
         )
