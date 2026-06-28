@@ -1,11 +1,11 @@
-# train_hrsid_yolo11s.py — YOLO11s baseline, HRSID official
+# train_hrsid_yolo26s.py — YOLO26s baseline, HRSID official
 
 from ultralytics import YOLO
 import os, torch
 
-MODEL_NAME = "yolo11s.yaml"
+MODEL_NAME = "yolo26s.yaml"
 DATASET_PATH = "../cfg/hrsid_official.yaml"
-RUN_NAME = "hrsid_yolo11s"
+RUN_NAME = "hrsid_yolo26s"
 
 def setup_environment():
     os.environ['OMP_NUM_THREADS'] = '1'
