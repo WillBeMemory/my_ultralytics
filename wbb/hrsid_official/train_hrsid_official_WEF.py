@@ -40,7 +40,7 @@ def train_model():
         results = model.train(
             data=DATASET_PATH, epochs=300, imgsz=640, batch=16, workers=0,
             device=device, optimizer="SGD", lr0=0.01, lrf=0.01,
-            save=True, verbose=True, name=RUN_NAME,
+            save=True, verbose=True, patience=0, name=RUN_NAME,
         )
         print("训练完成!")
         return results
